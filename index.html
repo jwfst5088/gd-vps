@@ -1,0 +1,1120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>掼蛋游戏 - Guandan v2.1</title>
+    <script>
+      (function(){
+        console.log('[learn-ui] init');
+
+        var learnPanel = null;
+        var statusInterval = null;
+        var currentMode = 'selfplay';
+        var currentAiType = 'advanced-bot';
+        var lobbyInterval = null;
+
+        function createLearnPanel() {
+          if (learnPanel && learnPanel.parentNode) return;
+
+          learnPanel = document.createElement('div');
+          learnPanel.id = 'ai-learn-panel';
+          learnPanel.style.cssText = `
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 44px;
+            background: linear-gradient(180deg, rgba(21,90,68,0.95) 0%, rgba(14,61,46,0.97) 100%);
+            color: #fff;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            z-index: 9999;
+            border-top: 1px solid rgba(200,150,46,0.2);
+            display: flex;
+            align-items: center;
+            padding: 0 16px;
+            gap: 10px;
+            font-size: 12px;
+            box-shadow: 0 -2px 12px rgba(0,0,0,0.25);
+          `;
+
+          learnPanel.innerHTML = `
+            <span style="color:#f0d060;font-weight:700;white-space:nowrap;font-size:13px;">🤖 AI学习</span>
+
+            <div style="display:flex;gap:3px;background:rgba(255,255,255,0.08);border-radius:5px;padding:2px;">
+              <button id="mode-selfplay" style="padding:3px 8px;border:none;border-radius:3px;background:rgba(200,150,46,0.25);color:#f0d060;font-size:11px;font-weight:500;cursor:pointer;white-space:nowrap;">自对弈</button>
+              <button id="mode-genetic" style="padding:3px 8px;border:none;border-radius:3px;background:transparent;color:rgba(255,255,255,0.5);font-size:11px;font-weight:500;cursor:pointer;white-space:nowrap;">遗传算法</button>
+              <button id="mode-record" style="padding:3px 8px;border:none;border-radius:3px;background:transparent;color:rgba(255,255,255,0.5);font-size:11px;font-weight:500;cursor:pointer;white-space:nowrap;">真人对局</button>
+            </div>
+
+            <div style="display:flex;gap:3px;background:rgba(255,255,255,0.08);border-radius:5px;padding:2px;margin-top:3px;">
+              <button id="ai-advanced" style="padding:3px 8px;border:none;border-radius:3px;background:rgba(59,130,246,0.25);color:#3b82f6;font-size:11px;font-weight:500;cursor:pointer;white-space:nowrap;">高级AI</button>
+            </div>
+
+            <span id="learn-status" style="color:rgba(255,255,255,0.55);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">点击开始训练 AI</span>
+
+            <div id="learn-progress" style="display:none;flex:0 0 100px;height:4px;background:rgba(255,255,255,0.12);border-radius:2px;overflow:hidden;">
+              <div id="progress-bar" style="height:100%;background:linear-gradient(90deg,#f0d060,#c8962e);width:0%;transition:width 0.5s ease-out;"></div>
+            </div>
+            <span id="progress-text" style="display:none;color:#f0d060;font-size:11px;white-space:nowrap;">0%</span>
+
+            <span id="iter-info" style="display:none;color:rgba(255,255,255,0.7);font-size:11px;white-space:nowrap;">0/0</span>
+            <span id="score-info" style="display:none;color:#f0d060;font-size:11px;white-space:nowrap;">0.0000</span>
+            <span id="best-info" style="display:none;color:#f0d060;font-size:11px;white-space:nowrap;">0.0000</span>
+            <span id="time-info" style="display:none;color:rgba(255,255,255,0.7);font-size:11px;white-space:nowrap;">0s</span>
+
+            <button id="learn-btn" style="padding:4px 12px;border:none;border-radius:5px;background:linear-gradient(180deg,#f0d060,#c8962e);color:#2a1a00;font-weight:700;cursor:pointer;font-size:12px;white-space:nowrap;box-shadow:0 1px 6px rgba(200,150,46,0.3);">开始训练</button>
+            <button id="stop-btn" style="padding:4px 12px;border:1px solid rgba(232,68,78,0.4);border-radius:5px;background:rgba(204,34,51,0.15);color:#e8444e;font-weight:600;cursor:pointer;font-size:12px;white-space:nowrap;">停止</button>
+
+            <button id="learn-close-btn" style="background:none;border:none;color:rgba(255,255,255,0.3);cursor:pointer;font-size:15px;line-height:1;padding:0 2px;flex-shrink:0;">&times;</button>
+          `;
+
+          document.body.appendChild(learnPanel);
+
+          // Bind event listeners via JS (not inline onclick)
+          document.getElementById('learn-close-btn').addEventListener('click', closeLearnPanel);
+          document.getElementById('learn-btn').addEventListener('click', startLearning);
+          document.getElementById('stop-btn').addEventListener('click', stopLearning);
+          document.getElementById('mode-selfplay').addEventListener('click', function(){ setMode('selfplay'); });
+          document.getElementById('mode-genetic').addEventListener('click', function(){ setMode('genetic'); });
+          document.getElementById('mode-record').addEventListener('click', function(){ setMode('record'); });
+          document.getElementById('ai-advanced').addEventListener('click', function(){ setAiType('advanced-bot'); });
+
+          // Restore training state if a task was running before refresh
+          restoreTrainingState();
+        }
+
+        function setMode(mode) {
+          currentMode = mode;
+          var selfplayBtn = document.getElementById('mode-selfplay');
+          var geneticBtn = document.getElementById('mode-genetic');
+          var recordBtn = document.getElementById('mode-record');
+
+          if (!selfplayBtn || !geneticBtn || !recordBtn) return;
+
+          selfplayBtn.style.background = 'transparent';
+          selfplayBtn.style.color = 'rgba(255,255,255,0.5)';
+          geneticBtn.style.background = 'transparent';
+          geneticBtn.style.color = 'rgba(255,255,255,0.5)';
+          recordBtn.style.background = 'transparent';
+          recordBtn.style.color = 'rgba(255,255,255,0.5)';
+
+          var st = document.getElementById('learn-status');
+
+          if (mode === 'selfplay') {
+            selfplayBtn.style.background = 'rgba(200,150,46,0.25)';
+            selfplayBtn.style.color = '#f0d060';
+            if (st) st.textContent = 'AI 自对弈训练模式';
+          } else if (mode === 'genetic') {
+            geneticBtn.style.background = 'rgba(168,85,247,0.25)';
+            geneticBtn.style.color = '#a855f7';
+            if (st) st.textContent = '遗传算法优化模式';
+          } else {
+            recordBtn.style.background = 'rgba(42,111,196,0.25)';
+            recordBtn.style.color = '#4a8fe4';
+            if (st) st.textContent = '从真人对局记录学习';
+          }
+        }
+
+        function setAiType(type) {
+          currentAiType = type;
+          var advBtn = document.getElementById('ai-advanced');
+          if (!advBtn) return;
+          if (type === 'advanced-bot') {
+            advBtn.style.background = 'rgba(59,130,246,0.25)';
+            advBtn.style.color = '#3b82f6';
+          }
+        }
+
+        function closeLearnPanel() {
+          if (learnPanel && learnPanel.parentNode) {
+            learnPanel.parentNode.removeChild(learnPanel);
+            learnPanel = null;
+          }
+          if (statusInterval) {
+            clearInterval(statusInterval);
+            statusInterval = null;
+          }
+        }
+
+        function restoreTrainingState() {
+          fetch('/api/v1/learn/status')
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            if (!data.isRunning) return;
+            console.log('[learn-ui] Restoring running training task');
+
+            var statusEl = document.getElementById('learn-status');
+            var btnEl = document.getElementById('learn-btn');
+            if (btnEl) btnEl.style.display = 'none';
+            if (statusEl) {
+              statusEl.textContent = '🚀 ' + (data.statusMessage || '训练中...');
+              statusEl.style.color = '#3fb950';
+            }
+
+            var els = ['learn-progress','progress-text','iter-info','score-info','best-info','time-info'];
+            for (var i = 0; i < els.length; i++) {
+              var el = document.getElementById(els[i]);
+              if (el) el.style.display = '';
+            }
+
+            var pt = document.getElementById('progress-text');
+            var pb = document.getElementById('progress-bar');
+            var ii = document.getElementById('iter-info');
+            var si = document.getElementById('score-info');
+            var bi = document.getElementById('best-info');
+            var ti = document.getElementById('time-info');
+            if (pt) pt.textContent = Math.round(data.progress * 100) + '%';
+            if (pb) pb.style.width = (data.progress * 100) + '%';
+            if (ii) ii.textContent = data.currentIteration + '/' + data.totalIterations;
+            if (si) si.textContent = (data.currentEvalScore || 0).toFixed(4);
+            if (bi) bi.textContent = (data.bestScore || 0).toFixed(4);
+            if (ti) ti.textContent = formatTime(data.elapsedSeconds || 0);
+
+            startStatusPolling();
+          })
+          .catch(function(e) {
+            console.log('[learn-ui] No running task to restore');
+          });
+        }
+
+        function startLearning() {
+          var btn = document.getElementById('learn-btn');
+          var stopBtn = document.getElementById('stop-btn');
+          if (btn) btn.style.display = 'none';
+          if (stopBtn) stopBtn.style.opacity = '1';
+
+          var statusEl = document.getElementById('learn-status');
+          if (!statusEl) return;
+          statusEl.textContent = '正在启动训练...';
+          statusEl.style.color = '#f0d060';
+
+          var payload;
+          if (currentMode === 'selfplay') {
+            payload = { matchesPerEval: 200, iterations: 100, mode: 'selfplay', aiType: currentAiType };
+          } else if (currentMode === 'genetic') {
+            payload = { matchesPerEval: 30, iterations: 10, populationSize: 20, mode: 'genetic', aiType: currentAiType };
+          } else {
+            payload = { iterations: 20, mode: 'record', aiType: currentAiType };
+          }
+
+          var url = '/api/v1/learn';
+          console.log('[learn-ui] Starting learning:', currentMode, payload);
+
+          fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            credentials: 'same-origin'
+          })
+          .then(function(response) {
+            console.log('[learn-ui] Response status:', response.status);
+            if (!response.ok) {
+              throw new Error('HTTP error: ' + response.status);
+            }
+            return response.json();
+          })
+          .then(function(data) {
+            console.log('[learn-ui] Response data:', data);
+            if (data.ok) {
+              statusEl.textContent = '训练已启动';
+              statusEl.style.color = '#3fb950';
+              var els = ['learn-progress','progress-text','iter-info','score-info','best-info','time-info'];
+              for (var i = 0; i < els.length; i++) {
+                var el = document.getElementById(els[i]);
+                if (el) el.style.display = '';
+              }
+              startStatusPolling();
+            } else {
+              statusEl.textContent = '❌ ' + data.message;
+              statusEl.style.color = '#e8444e';
+              if (btn) btn.style.display = '';
+            }
+          })
+          .catch(function(e) {
+            console.error('[learn-ui] Error:', e);
+            statusEl.textContent = '❌ 请求失败: ' + e.message;
+            statusEl.style.color = '#e8444e';
+            if (btn) btn.style.display = '';
+          });
+        }
+
+        function stopLearning() {
+          var statusEl = document.getElementById('learn-status');
+          if (statusEl) {
+            statusEl.textContent = '正在停止训练...';
+            statusEl.style.color = '#f0d060';
+          }
+          var stopBtn = document.getElementById('stop-btn');
+          if (stopBtn) stopBtn.style.opacity = '0.4';
+
+          fetch('/api/v1/learn/stop', { method: 'POST' })
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            if (statusEl) {
+              statusEl.textContent = data.message;
+              statusEl.style.color = 'rgba(255,255,255,0.5)';
+            }
+          });
+        }
+
+        function startStatusPolling() {
+          if (statusInterval) clearInterval(statusInterval);
+          statusInterval = setInterval(function() {
+            fetch('/api/v1/learn/status')
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+              var statusEl = document.getElementById('learn-status');
+              if (!statusEl) return;
+
+              if (!data.isRunning) {
+                clearInterval(statusInterval);
+                var btnEl = document.getElementById('learn-btn');
+                if (btnEl) btnEl.style.display = '';
+
+                var msg = data.statusMessage || '';
+                if (msg.indexOf('completed') >= 0) {
+                  statusEl.textContent = '✅ ' + msg;
+                  statusEl.style.color = '#3fb950';
+                } else if (msg.indexOf('stopped') >= 0) {
+                  statusEl.textContent = '⏹️ ' + msg;
+                  statusEl.style.color = '#f0d060';
+                } else {
+                  statusEl.textContent = '❌ ' + (msg || 'Unknown');
+                  statusEl.style.color = '#e8444e';
+                }
+              } else {
+                statusEl.textContent = '🚀 ' + (data.statusMessage || '训练中...');
+                statusEl.style.color = '#3fb950';
+              }
+
+              var pt = document.getElementById('progress-text');
+              var pb = document.getElementById('progress-bar');
+              var ii = document.getElementById('iter-info');
+              var si = document.getElementById('score-info');
+              var bi = document.getElementById('best-info');
+              var ti = document.getElementById('time-info');
+              if (pt) pt.textContent = Math.round(data.progress * 100) + '%';
+              if (pb) pb.style.width = (data.progress * 100) + '%';
+              if (ii) ii.textContent = data.currentIteration + '/' + data.totalIterations;
+              if (si) si.textContent = (data.currentEvalScore || 0).toFixed(4);
+              if (bi) bi.textContent = (data.bestScore || 0).toFixed(4);
+              if (ti) ti.textContent = formatTime(data.elapsedSeconds || 0);
+            })
+            .catch(function(e) {
+              console.error('Polling error:', e);
+            });
+          }, 1500);
+        }
+
+        function formatTime(seconds) {
+          var mins = Math.floor(seconds / 60);
+          var secs = seconds % 60;
+          if (mins > 0) {
+            return mins + '分' + secs + '秒';
+          }
+          return secs + '秒';
+        }
+
+        function isInGameRoom() {
+          // Primary: URL path check
+          if (window.location.pathname.indexOf('/tables/') >= 0) return true;
+          // Secondary: requires BOTH sessionStorage AND DOM evidence
+          var tableId = sessionStorage.getItem('td');
+          var hasGameContainer = document.querySelector('.game-container, [class*="game-container"], #game-container');
+          var hasSeatCard = document.querySelector('.seat-card, [class*="seat-card"]');
+          // Only consider in-room if sessionStorage has td AND DOM has game elements
+          return (tableId && tableId.length > 0) && !!(hasGameContainer || hasSeatCard);
+        }
+
+        var closeTimeout = null;
+
+        function checkLobby() {
+          var inRoom = isInGameRoom();
+          if (inRoom && learnPanel) {
+            // Debounce: wait 800ms to confirm before closing (prevents flicker during SPA transitions)
+            if (!closeTimeout) {
+              closeTimeout = setTimeout(function() {
+                if (isInGameRoom() && learnPanel) {
+                  console.log('[learn-ui] Closing panel (in game room)');
+                  closeLearnPanel();
+                }
+                closeTimeout = null;
+              }, 800);
+            }
+          } else if (!inRoom && !learnPanel) {
+            if (closeTimeout) {
+              clearTimeout(closeTimeout);
+              closeTimeout = null;
+            }
+            console.log('[learn-ui] Creating panel (in lobby)');
+            createLearnPanel();
+          }
+        }
+
+        // Initial checks with staggered timing
+        setTimeout(checkLobby, 300);
+        setTimeout(checkLobby, 800);
+        setTimeout(checkLobby, 1500);
+        setTimeout(checkLobby, 3000);
+
+        // Continuous monitoring every 2 seconds
+        lobbyInterval = setInterval(checkLobby, 2000);
+
+        console.log('[learn-ui] ready');
+      })();
+    </script>
+    <script>
+      (function(){
+        console.log('[guard] init');
+        var _gsLastResponse=Date.now(),_gsUnstickCount=0,_gsGameClosed=false,_gsCleanedUp=false;
+        var _gsOrigFetch=window.fetch;
+        window.fetch=function(){
+          var p=_gsOrigFetch.apply(this,arguments);
+          var url=typeof arguments[0]==='string'?arguments[0]:arguments[0]&&arguments[0].url||'';
+          if(url.indexOf('/nextstate')>=0||url.indexOf('/tables')>=0){
+            var m=url.match(/\/tables\/([^\/\?]+)/);
+            if(m){
+              var tid=m[1];
+              _gsLastResponse=Date.now();
+              _gsGameClosed=false;
+              _gsCleanedUp=false;
+              sessionStorage.setItem('td',tid);
+              console.log('[guard] tableId stored:',tid);
+            } else {
+              _gsLastResponse=Date.now();
+              _gsUnstickCount=0;
+            }
+            p.then(function(){_gsLastResponse=Date.now();_gsUnstickCount=0}).catch(function(){});
+          }
+          return p;
+        };
+
+        function onGameClosed(){
+          var tid=sessionStorage.getItem('td');
+          if(!tid||_gsCleanedUp)return;
+          _gsGameClosed=true;
+          console.log('[guard] game closed, will cleanup table:',tid);
+        }
+
+        function doCleanup(tid){
+          if(_gsCleanedUp)return;
+          _gsCleanedUp=true;
+          console.log('[guard] cleaning up table:',tid);
+          fetch('/kb.php?table_id='+encodeURIComponent(tid),{keepalive:true}).catch(function(){});
+          sessionStorage.removeItem('td');
+        }
+
+        function checkStuck(){
+          var tid=sessionStorage.getItem('td');
+          if(!tid||_gsCleanedUp)return;
+          var now=Date.now();
+          if(_gsGameClosed && now-_gsLastResponse>5000){
+            doCleanup(tid);
+            return;
+          }
+          if(now-_gsLastResponse>15000){
+            _gsUnstickCount++;
+            console.warn('[guard] stuck #'+_gsUnstickCount);
+            fetch('/unstick.php?table_id='+encodeURIComponent(tid)).then(function(r){return r.json()}).then(function(d){if(d&&d.ok)_gsLastResponse=Date.now()}).catch(function(){});
+            if(_gsUnstickCount>=5){console.warn('[guard] reload');location.reload()}
+          }
+        }
+        setInterval(checkStuck,3000);
+
+        new MutationObserver(function(muts){
+          for(var i=0;i<muts.length;i++){
+            var removed=muts[i].removedNodes;
+            if(removed.length>0){
+              for(var j=0;j<removed.length;j++){
+                var node=removed[j];
+                if(node.nodeType===1){
+                  var html=node.outerHTML||node.textContent||'';
+                  if(html.indexOf('game-container')>=0||html.indexOf('seat-card')>=0){
+                    console.log('[guard] game component removed from DOM');
+                    setTimeout(onGameClosed,800);
+                    return;
+                  }
+                }
+              }
+            }
+          }
+        }).observe(document.getElementById('root')||document.body,{childList:true,subtree:true});
+
+        window.addEventListener('beforeunload',function(){
+          var tid=sessionStorage.getItem('td');
+          if(tid&&_gsGameClosed&&!_gsCleanedUp){
+            console.log('[guard] beforeunload cleanup:',tid);
+            fetch('/kb.php?table_id='+encodeURIComponent(tid),{keepalive:true}).catch(function(){});
+          }
+          sessionStorage.removeItem('td');
+        });
+
+        console.log('[guard] ready');
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-Bv28.js?v=58"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DZzJMTFf.css?v=32">
+    <style>
+      @media (max-width: 768px) {
+        .hand-cards-area {
+          left: 0; right: 0;
+          bottom: calc(0px - 0.5 * var(--card-h));
+          position: absolute;
+          overflow-x: auto;
+          -webkit-overflow-scrolling: touch;
+          touch-action: pan-x;
+        }
+        .hand-cards-vert {
+          display: flex;
+          width: fit-content;
+          padding: 0 8px;
+          justify-content: flex-start;
+          margin: 0 auto;
+        }
+        .card-row {
+          flex-wrap: nowrap !important;
+        }
+        .center-area {
+          transform: translate(-50%, calc(-50% - var(--card-h) / 2 - 50px)) !important;
+        }
+      }
+      .suit-btn { display:inline-flex!important; align-items:center!important; justify-content:center!important; width:40px!important; height:40px!important; padding:0!important; border-radius:50%!important; font-size:24px!important; cursor:pointer!important; transition:all .15s!important; border:2px solid!important; background:#fff!important; line-height:1!important; box-shadow:0 1px 4px rgba(0,0,0,.15)!important; margin:0 2px!important; vertical-align:middle!important; min-width:auto!important; font-family:'Segoe UI Symbol','Apple Symbols','Arial Unicode MS',sans-serif!important; -webkit-text-fill-color:currentColor!important }
+      .suit-btn-s { color:#fff!important; border-color:#222!important; background:#333!important; -webkit-text-fill-color:#fff!important }
+      .suit-btn-h { color:#fff!important; border-color:#cc2233!important; background:#cc2233!important; -webkit-text-fill-color:#fff!important }
+      .suit-btn-c { color:#fff!important; border-color:#222!important; background:#333!important; -webkit-text-fill-color:#fff!important }
+      .suit-btn-d { color:#fff!important; border-color:#cc2233!important; background:#cc2233!important; -webkit-text-fill-color:#fff!important }
+      .suit-btn:hover { transform:scale(1.2)!important; box-shadow:0 3px 10px rgba(0,0,0,.3)!important }
+      .suit-btn:active { transform:scale(.95)!important }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <button id="fs-btn" title="全屏" style="display:none;margin-left:4px;width:28px;height:28px;border:none;border-radius:50%;background:rgba(255,255,255,0.15);color:#fff;font-size:16px;cursor:pointer;flex-shrink:0;align-items:center;justify-content:center;line-height:1;padding:0;">⛶</button>
+    <script>
+      (function(){
+        console.log('[fullscreen] init');
+        var btn = document.getElementById('fs-btn');
+        if (!btn) { console.log('[fullscreen] btn not found!'); return; }
+
+        var isFS = false;
+        btn.addEventListener('click', function(e){
+          e.preventDefault();
+          e.stopPropagation();
+          if (!isFS) {
+            var el = document.documentElement;
+            if (el.requestFullscreen) el.requestFullscreen();
+            else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+            else if (el.msRequestFullscreen) el.msRequestFullscreen();
+            // 进入全屏后尝试锁定横屏
+            setTimeout(function() {
+              try {
+                if (screen.orientation && screen.orientation.lock) {
+                  screen.orientation.lock('landscape').catch(function(){});
+                } else if (screen.lockOrientation) {
+                  screen.lockOrientation('landscape');
+                } else if (screen.mozLockOrientation) {
+                  screen.mozLockOrientation('landscape');
+                } else if (screen.msLockOrientation) {
+                  screen.msLockOrientation('landscape');
+                }
+              } catch(e2) {}
+            }, 100);
+          } else {
+            if (document.exitFullscreen) document.exitFullscreen();
+            else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+            else if (document.msExitFullscreen) document.msExitFullscreen();
+          }
+        });
+        document.addEventListener('fullscreenchange', function(){ isFS = !!document.fullscreenElement; });
+        document.addEventListener('webkitfullscreenchange', function(){ isFS = !!document.webkitFullscreenElement; });
+        document.addEventListener('msfullscreenchange', function(){ isFS = !!document.msFullscreenElement; });
+
+        var attached = false;
+        function tryInject() {
+          if (attached) return;
+          // 找"退出"按钮
+          var allBtns = document.querySelectorAll('button');
+          var exitBtn = null;
+          for (var i = 0; i < allBtns.length; i++) {
+            if (allBtns[i].textContent === '退出') {
+              exitBtn = allBtns[i];
+              break;
+            }
+          }
+          if (!exitBtn) return;
+          var parent = exitBtn.parentElement;
+          if (!parent) return;
+          parent.appendChild(btn);
+          btn.style.display = 'inline-flex';
+          attached = true;
+          console.log('[fullscreen] injected into topbar-r');
+        }
+        setInterval(tryInject, 600);
+        setTimeout(tryInject, 300);
+        setTimeout(tryInject, 1000);
+        setTimeout(tryInject, 2000);
+        tryInject();
+
+        // React 重渲染后重新注入
+        var obs = new MutationObserver(function() {
+          if (attached && !btn.parentElement) {
+            attached = false;
+            tryInject();
+          }
+        });
+        obs.observe(document.body, { childList: true, subtree: true });
+
+        console.log('[fullscreen] ready');
+      })();
+    </script>
+    <script>
+      (function(){
+        try {
+        console.log('[suit-btn] injector init');
+
+        // === 滚动清理 v5：scroll 结束后 dispatch([]) 清除残留 ===
+        (function setupScrollClean() {
+          var st = null;
+
+          document.addEventListener('touchmove', function() {
+            clearTimeout(st);
+            st = setTimeout(function() {
+              var ha = document.querySelector('.hand-cards-area');
+              var dispatch = findSelectedDispatch(ha);
+              if (dispatch) dispatch([]);
+            }, 250);
+          }, {passive: true});
+
+          console.log('[scroll-clean] ready (scroll-end dispatch clear)');
+        })();
+        // === 滚动清理结束 ===
+
+        var SUITS = [
+          {suit:'S', svg:'<svg viewBox="0 0 20 20" width="18" height="18"><path d="M10 2C10 2 3 8 3 12C3 15 6 17 10 14C14 17 17 15 17 12C17 8 10 2 10 2Z" fill="white"/><rect x="8" y="14" width="4" height="5" fill="white"/></svg>', cls:'suit-btn-s', title:'黑桃同花顺'},
+          {suit:'H', svg:'<svg viewBox="0 0 20 20" width="18" height="18"><path d="M10 17C5 12 0 8 0 5C0 2 3 0 6 0C8 0 10 2 10 2C10 2 12 0 14 0C17 0 20 2 20 5C20 8 15 12 10 17Z" fill="white"/></svg>', cls:'suit-btn-h', title:'红桃同花顺'},
+          {suit:'C', svg:'<svg viewBox="0 0 20 20" width="18" height="18"><circle cx="10" cy="5" r="4" fill="white"/><circle cx="6" cy="12" r="4" fill="white"/><circle cx="14" cy="12" r="4" fill="white"/><rect x="8" y="12" width="4" height="7" fill="white"/></svg>', cls:'suit-btn-c', title:'梅花同花顺'},
+          {suit:'D', svg:'<svg viewBox="0 0 20 20" width="18" height="18"><path d="M10 1L18 10L10 19L2 10Z" fill="white"/></svg>', cls:'suit-btn-d', title:'方块同花顺'}
+        ];
+        var RANK_VAL = {"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"10":10,"J":11,"Q":12,"K":13,"A":14};
+        var wrapper = null;
+        var injected = false;
+        var suitCycleIndex = {};
+
+        var centerPanel = null;
+
+        var centerButtons = {};
+
+        function createCenterPanel() {
+          if (centerPanel && centerPanel.parentNode) return;
+          centerPanel = document.createElement('div');
+          centerPanel.id = 'center-action-panel';
+          centerPanel.style.cssText = 'position:fixed;top:40%;left:50%;transform:translate(-50%,-50%);display:flex;gap:12px;z-index:99999;pointer-events:none;opacity:0;';
+
+          var playBtn = document.createElement('button');
+          playBtn.textContent = '出牌';
+          playBtn.className = 'center-action-btn';
+          playBtn.onclick = function(e) { e.preventDefault(); e.stopPropagation(); triggerBottomButton('出牌'); };
+          centerButtons['出牌'] = playBtn;
+
+          var passBtn = document.createElement('button');
+          passBtn.textContent = '不出';
+          passBtn.className = 'center-action-btn';
+          passBtn.onclick = function(e) { e.preventDefault(); e.stopPropagation(); triggerBottomButton('不出'); };
+          centerButtons['不出'] = passBtn;
+
+          var hintBtn = document.createElement('button');
+          hintBtn.textContent = '提示';
+          hintBtn.className = 'center-action-btn';
+          hintBtn.onclick = function(e) { e.preventDefault(); e.stopPropagation(); triggerBottomButton('提示'); };
+          centerButtons['提示'] = hintBtn;
+
+          centerPanel.appendChild(playBtn);
+          centerPanel.appendChild(passBtn);
+          centerPanel.appendChild(hintBtn);
+          document.body.appendChild(centerPanel);
+          console.log('[center-btns] panel created');
+        }
+
+        function triggerBottomButton(text) {
+          var actionBar = document.querySelector('.action-bar');
+          if (!actionBar) return;
+          var btns = actionBar.querySelectorAll('button');
+          for (var i = 0; i < btns.length; i++) {
+            var btnText = btns[i].textContent || btns[i].innerText || '';
+            if (btnText.indexOf(text) >= 0) { btns[i].click(); return; }
+          }
+        }
+
+        function updateCenterButtons() {
+          if (!centerPanel) createCenterPanel();
+          if (!centerPanel) return;
+          var actionBar = document.querySelector('.action-bar');
+          if (!actionBar) { centerPanel.style.opacity = '0'; return; }
+          var waitingIndicator = actionBar.querySelector('.waiting-indicator');
+          var waitingText = waitingIndicator ? (waitingIndicator.textContent || waitingIndicator.innerText || '') : '';
+          if (waitingIndicator && waitingText.indexOf('等待') >= 0) { centerPanel.style.opacity = '0'; return; }
+          var btns = actionBar.querySelectorAll('button');
+          var hasPlayBtn = false;
+          var styleSourceBtn = null;
+          for (var i = 0; i < btns.length; i++) {
+            var btnText = btns[i].textContent || btns[i].innerText || '';
+            if (btnText.indexOf('出牌') >= 0 || btnText.indexOf('不出') >= 0 || btnText.indexOf('提示') >= 0) {
+              hasPlayBtn = true;
+              if (!styleSourceBtn) styleSourceBtn = btns[i];
+            }
+          }
+          if (hasPlayBtn && styleSourceBtn) {
+            copyButtonStyles(styleSourceBtn);
+            centerPanel.style.display = 'flex';
+            centerPanel.style.opacity = '1';
+          } else {
+            centerPanel.style.opacity = '0';
+          }
+        }
+
+        function isMobile() {
+          return window.innerWidth <= 768 || /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+        }
+
+        function copyButtonStyles(sourceBtn) {
+          var style = window.getComputedStyle(sourceBtn);
+          var targetStyles = ['padding', 'fontSize', 'fontWeight', 'border', 'borderRadius', 'color', 'cursor', 'boxShadow', 'minWidth', 'maxWidth', 'height', 'lineHeight', 'whiteSpace'];
+          var isMobileDevice = isMobile();
+          var bgAlpha = isMobileDevice ? 0.5 : 0.25;
+          var borderAlpha = isMobileDevice ? 0.6 : 0.4;
+          for (var key in centerButtons) {
+            var btn = centerButtons[key];
+            btn.style.cssText = '';
+            for (var i = 0; i < targetStyles.length; i++) {
+              btn.style[targetStyles[i]] = style[targetStyles[i]];
+            }
+            btn.style.position = 'relative';
+            btn.style.pointerEvents = 'auto';
+            btn.style.overflow = 'visible';
+            if (key === '出牌') {
+              btn.style.background = 'rgba(63,185,80,' + bgAlpha + ')';
+              btn.style.border = '1px solid rgba(63,185,80,' + borderAlpha + ')';
+            } else if (key === '不出') {
+              btn.style.background = 'rgba(232,68,78,' + bgAlpha + ')';
+              btn.style.border = '1px solid rgba(232,68,78,' + borderAlpha + ')';
+            } else if (key === '提示') {
+              btn.style.background = 'rgba(240,208,96,' + bgAlpha + ')';
+              btn.style.border = '1px solid rgba(240,208,96,' + borderAlpha + ')';
+            }
+          }
+        }
+
+        function parseCard(str) {
+          if (!str) return null;
+          if (/^(🃏|SJ|sJ|🃏b|🃏B)$/.test(str)) return {suit:"JOKER",rank:"小",isRed:false,isJoker:true};
+          if (/^(👑|BJ|bJ|🃏R|🃏r)$/.test(str)) return {suit:"JOKER",rank:"大",isRed:true,isJoker:true};
+          var m = str.match(/^([\u2660\u2665\u2666\u2663♠♥♦♣])([2-9]|10|[JQKAjqka])$/);
+          if (m) {
+            var e = m[1], u = m[2].toUpperCase();
+            var n = "S";
+            if (e === "♠" || e === "S") n = "S";
+            else if (e === "♥" || e === "H") n = "H";
+            else if (e === "♦" || e === "D") n = "D";
+            else if (e === "♣" || e === "C") n = "C";
+            return {suit: n, rank: u, isRed: n==="H"||n==="D", isJoker: false};
+          }
+          var m2 = str.match(/^([SHDC])([2-9]|10|[JQKAjqka])$/i);
+          if (m2) {
+            var n2 = m2[1].toUpperCase();
+            return {suit: n2, rank: m2[2].toUpperCase(), isRed: n2==="H"||n2==="D", isJoker: false};
+          }
+          return null;
+        }
+
+        function getLevel() {
+          // 优先从手牌区域的 React 状态中读取 handLevel（当前手牌的级牌）
+          // 手牌级别由庄家决定，升级后会变，不是固定玩家的队伍级别
+          var handLevel = getHandLevelFromReact();
+          if (handLevel) return handLevel;
+
+          // Fallback: 从 DOM 读取玩家队伍级别
+          var el = document.querySelector('.my-team .score-level-num');
+          if (el) {
+            var txt = el.textContent.trim().toUpperCase();
+            var num = parseInt(txt);
+            if (num === 11) return 'J';
+            if (num === 12) return 'Q';
+            if (num === 13) return 'K';
+            if (num === 14 || num === 1) return 'A';
+            if (!isNaN(num) && num >= 2 && num <= 10) return '' + num;
+            return txt;
+          }
+          return '2';
+        }
+
+        function getHandLevelFromReact() {
+          // 从 React fiber 树中读取 handLevel
+          var handArea = document.querySelector('.hand-cards-area');
+          if (!handArea) return null;
+          var fk = Object.keys(handArea).find(function(k) { return k.indexOf('__reactFiber') === 0; });
+          if (!fk) return null;
+
+          // 向上遍历 fiber 树找到包含 handLevel 的 state
+          var fiber = handArea[fk];
+          for (var depth = 0; depth < 30 && fiber; depth++) {
+            fiber = fiber.return;
+            if (!fiber || !fiber.memoizedState) continue;
+            var hook = fiber.memoizedState;
+            while (hook) {
+              if (hook.memoizedState && typeof hook.memoizedState === 'object' && hook.memoizedState.handLevel) {
+                var hl = hook.memoizedState.handLevel;
+                if (typeof hl === 'string') return hl;
+                if (typeof hl === 'number') return '' + hl;
+              }
+              var base = hook.memoizedState;
+              if (base && base.hand && base.hand.handLevel) {
+                var hl2 = base.hand.handLevel;
+                if (typeof hl2 === 'string') return hl2;
+                if (typeof hl2 === 'number') return '' + hl2;
+              }
+              hook = hook.next;
+            }
+          }
+          return null;
+        }
+
+        function findAllStraightFlushes(suit) {
+          var levelRank = getLevel();
+          var slots = document.querySelectorAll('.vert-card-slot');
+          var suitCards = [];
+          var wildSlotIdx = -1;
+
+          for (var i = 0; i < slots.length; i++) {
+            var cardEl = slots[i].querySelector('.card');
+            if (!cardEl) continue;
+            var cardStr = cardEl.getAttribute('title') || '';
+            var idx = parseInt(slots[i].getAttribute('data-card-idx'));
+            if (isNaN(idx)) continue;
+
+            var card = parseCard(cardStr);
+            if (!card) continue;
+
+            if (card.rank === levelRank && card.suit === "H" && !card.isJoker) {
+              wildSlotIdx = idx;
+              continue;
+            }
+            if (card.suit === suit && !card.isJoker) {
+              var n = RANK_VAL[card.rank];
+              if (n) suitCards.push({idx: idx, rankNum: n});
+            }
+          }
+
+          suitCards.sort(function(a,b){ return a.rankNum - b.rankNum; });
+          var rankSet = new Set();
+          for (var j = 0; j < suitCards.length; j++) rankSet.add(suitCards[j].rankNum);
+
+          var naturalResults = [];
+          var wildResults = [];
+
+          function trySelect(start) {
+            var needed = [];
+            for (var r = start; r < start + 5; r++) {
+              if (!rankSet.has(r)) needed.push(r);
+            }
+            if (needed.length === 0) {
+              var sel = [];
+              for (var r2 = start; r2 < start + 5; r2++) {
+                for (var k = 0; k < suitCards.length; k++) {
+                  if (suitCards[k].rankNum === r2 && sel.indexOf(suitCards[k].idx) < 0) {
+                    sel.push(suitCards[k].idx); break;
+                  }
+                }
+              }
+              if (sel.length === 5) naturalResults.push(sel);
+            } else if (needed.length === 1 && wildSlotIdx >= 0) {
+              var sel = [];
+              for (var r2 = start; r2 < start + 5; r2++) {
+                if (rankSet.has(r2)) {
+                  for (var k = 0; k < suitCards.length; k++) {
+                    if (suitCards[k].rankNum === r2 && sel.indexOf(suitCards[k].idx) < 0) {
+                      sel.push(suitCards[k].idx); break;
+                    }
+                  }
+                }
+              }
+              if (sel.length === 4) {
+                sel.push(wildSlotIdx);
+                wildResults.push(sel);
+              }
+            }
+          }
+
+          for (var start = 2; start <= 10; start++) {
+            trySelect(start);
+          }
+
+          var hasAce = rankSet.has(14);
+          var low4 = [2,3,4,5];
+          var hasLow = low4.every(function(r){ return rankSet.has(r); });
+
+          if (hasAce && hasLow) {
+            var sel = [];
+            for (var r3 = 2; r3 <= 5; r3++) {
+              for (var k = 0; k < suitCards.length; k++) {
+                if (suitCards[k].rankNum === r3 && sel.indexOf(suitCards[k].idx) < 0) {
+                  sel.push(suitCards[k].idx); break;
+                }
+              }
+            }
+            for (var k = 0; k < suitCards.length; k++) {
+              if (suitCards[k].rankNum === 14 && sel.indexOf(suitCards[k].idx) < 0) {
+                sel.push(suitCards[k].idx); break;
+              }
+            }
+            if (sel.length === 5) naturalResults.push(sel);
+          } else if (hasLow && !hasAce && wildSlotIdx >= 0) {
+            var sel = [];
+            for (var r3 = 2; r3 <= 5; r3++) {
+              for (var k = 0; k < suitCards.length; k++) {
+                if (suitCards[k].rankNum === r3 && sel.indexOf(suitCards[k].idx) < 0) {
+                  sel.push(suitCards[k].idx); break;
+                }
+              }
+            }
+            if (sel.length === 4) {
+              sel.push(wildSlotIdx);
+              wildResults.push(sel);
+            }
+          } else if (hasAce && wildSlotIdx >= 0) {
+            var missingLow = low4.filter(function(r){ return !rankSet.has(r); });
+            if (missingLow.length === 1) {
+              var sel = [wildSlotIdx];
+              for (var r3 = 2; r3 <= 5; r3++) {
+                if (rankSet.has(r3)) {
+                  for (var k = 0; k < suitCards.length; k++) {
+                    if (suitCards[k].rankNum === r3 && sel.indexOf(suitCards[k].idx) < 0) {
+                      sel.push(suitCards[k].idx); break;
+                    }
+                  }
+                }
+              }
+              for (var k = 0; k < suitCards.length; k++) {
+                if (suitCards[k].rankNum === 14 && sel.indexOf(suitCards[k].idx) < 0) {
+                  sel.push(suitCards[k].idx); break;
+                }
+              }
+              if (sel.length === 5) wildResults.push(sel);
+            }
+          }
+
+          return {
+            results: naturalResults.concat(wildResults),
+            naturalCount: naturalResults.length
+          };
+        }
+
+        function updateHighlights() {
+          if (!wrapper) return;
+          var buttons = wrapper.querySelectorAll('.suit-btn');
+          for (var i = 0; i < buttons.length; i++) {
+            var suit = buttons[i].getAttribute('data-suit');
+            var data = findAllStraightFlushes(suit);
+            if (data && data.results.length > 0) {
+              buttons[i].style.setProperty('background-color', 'rgba(255,215,0,0.35)', 'important');
+              buttons[i].style.setProperty('border-color', '#ffd700', 'important');
+              buttons[i].style.removeProperty('box-shadow');
+            } else {
+              buttons[i].style.removeProperty('background-color');
+              buttons[i].style.removeProperty('border-color');
+              buttons[i].style.removeProperty('box-shadow');
+            }
+          }
+        }
+
+        function clickCards(cardIdxs) {
+          console.log('[suit-btn] clickCards', JSON.stringify(cardIdxs));
+          var handArea = document.querySelector('.hand-cards-area');
+          if (!handArea) return;
+
+          var fiberKey = Object.keys(handArea).find(function(k) { return k.indexOf('__reactFiber') === 0; });
+          if (!fiberKey) return;
+          var nvFiber = handArea[fiberKey].return;
+          if (nvFiber && nvFiber.memoizedState) {
+            var refHook = nvFiber.memoizedState.next;
+            if (refHook && refHook.memoizedState && refHook.memoizedState.current) {
+              refHook.memoizedState.current.wasDrag = false;
+            }
+          }
+
+          var dispatch = findSelectedDispatch(handArea);
+          if (dispatch) {
+            dispatch(function(prev) { return cardIdxs; });
+            return;
+          }
+
+          var cl = nvFiber && nvFiber.memoizedProps && nvFiber.memoizedProps.onCardClick;
+          if (cl && cl.toString().replace(/\s/g, '').length >= 15) {
+            var currentSel = nvFiber.memoizedProps.selectedIndices || [];
+            for (var i = 0; i < currentSel.length; i++) cl(currentSel[i]);
+            for (var j = 0; j < cardIdxs.length; j++) cl(cardIdxs[j]);
+          }
+        }
+
+        function findSelectedDispatch(handArea) {
+          if (!handArea) return null;
+          var fk = Object.keys(handArea).find(function(k) { return k.indexOf('__reactFiber') === 0; });
+          if (!fk) return null;
+          var nvFiber = handArea[fk].return;
+          if (!nvFiber) return null;
+
+          function hasSelectedIndicesChild(f) {
+            if (!f) return false;
+            var ch = f.child;
+            while (ch) {
+              if (ch.memoizedProps && ch.memoizedProps.selectedIndices !== undefined) return true;
+              if (hasSelectedIndicesChild(ch)) return true;
+              ch = ch.sibling;
+            }
+            return false;
+          }
+
+          var fiber = nvFiber;
+          for (var level = 0; level < 20 && fiber; level++) {
+            fiber = fiber.return;
+            if (!fiber || !fiber.memoizedState) continue;
+            if (!hasSelectedIndicesChild(fiber)) continue;
+            var hook = fiber.memoizedState;
+            while (hook) {
+              if (hook.queue && hook.queue.dispatch && Array.isArray(hook.memoizedState)) {
+                var st = hook.memoizedState;
+                if (st.length === 0 || typeof st[0] === 'number') return hook.queue.dispatch;
+              }
+              hook = hook.next;
+            }
+          }
+
+          var rootEl = document.getElementById('root');
+          var rk = Object.keys(rootEl).find(function(k) { return k.indexOf('__reactContainer') === 0; });
+          if (rk) {
+            var rf = rootEl[rk];
+            if (rf._internalRoot) rf = rf._internalRoot.current;
+            if (rf.current) rf = rf.current;
+            if (rf.stateNode === rootEl) rf = rf.child;
+            var r = _searchFiber(rf);
+            if (r) return r;
+          }
+          return null;
+        }
+        function _searchFiber(f) {
+          if (!f) return null;
+          if (f.memoizedState) {
+            var hook = f.memoizedState;
+            while (hook) {
+              if (hook.queue && hook.queue.dispatch && Array.isArray(hook.memoizedState)) {
+                var st = hook.memoizedState;
+                if (st.length === 0 || typeof st[0] === 'number') return hook.queue.dispatch;
+              }
+              hook = hook.next;
+            }
+          }
+          return _searchFiber(f.child) || _searchFiber(f.sibling);
+        }
+
+        function tryInject() {
+          var actionBar = document.querySelector('.action-bar');
+          if (!actionBar) { injected = false; return; }
+          var playBtns = actionBar.querySelectorAll('button');
+          var hasPlayBtn = false;
+          for (var i = 0; i < playBtns.length; i++) {
+            var txt = playBtns[i].textContent || '';
+            if (txt.indexOf('出牌') >= 0 || txt.indexOf('不出') >= 0) {
+              hasPlayBtn = true; break;
+            }
+          }
+          if (!hasPlayBtn) {
+            injected = false;
+            if (wrapper && wrapper.parentNode) wrapper.style.display = 'none';
+            return;
+          }
+          if (injected) {
+            if (wrapper && wrapper.parentNode) {
+              wrapper.style.display = '';
+              updateHighlights();
+              return;
+            }
+            injected = false;
+            suitCycleIndex = {};
+          }
+          if (wrapper && wrapper.parentNode) wrapper.parentNode.removeChild(wrapper);
+          wrapper = document.createElement('span');
+          wrapper.className = 'suit-btn-wrapper';
+          wrapper.style.cssText = 'display:inline-flex;align-items:center;gap:6px;margin-left:8px';
+          var suitInlineStyles = {
+            'S': 'color:#fff!important;border-color:#222!important;background:#333!important',
+            'H': 'color:#fff!important;border-color:#cc2233!important;background:#cc2233!important',
+            'C': 'color:#fff!important;border-color:#222!important;background:#333!important',
+            'D': 'color:#fff!important;border-color:#cc2233!important;background:#cc2233!important'
+          };
+          var baseStyle = 'display:inline-flex;align-items:center;justify-content:center;width:40px;height:40px;padding:0;border-radius:50%;font-size:24px;cursor:pointer;border:2px solid;line-height:1;margin:0 2px;vertical-align:middle;font-family:Segoe UI Symbol,Apple Symbols,Arial Unicode MS,sans-serif;';
+          for (var s = 0; s < SUITS.length; s++) {
+            var btn = document.createElement('button');
+            btn.className = 'suit-btn ' + SUITS[s].cls;
+            btn.title = SUITS[s].title;
+            btn.innerHTML = SUITS[s].svg;
+            btn.style.cssText = baseStyle + suitInlineStyles[SUITS[s].suit];
+            btn.setAttribute('data-suit', SUITS[s].suit);
+            (function(suit){
+              btn.addEventListener('click', function(e){
+                e.preventDefault();
+                e.stopPropagation();
+
+                var data = findAllStraightFlushes(suit);
+                if (!data || data.results.length === 0) return;
+
+                var results = data.naturalCount > 0 ? data.results.slice(0, data.naturalCount) : data.results;
+
+                var handArea = document.querySelector('.hand-cards-area');
+                var dispatch = findSelectedDispatch(handArea);
+                if (!dispatch) return;
+
+                var idx = suitCycleIndex[suit] || 0;
+
+                if (idx >= results.length) {
+                  suitCycleIndex[suit] = 0;
+                  dispatch(function(prev) { return []; });
+                  return;
+                }
+
+                var targetIdxs = results[idx];
+                suitCycleIndex[suit] = idx + 1;
+
+                dispatch(function(prev) { return targetIdxs; });
+              });
+            })(SUITS[s].suit);
+            wrapper.appendChild(btn);
+          }
+          var indicator = actionBar.querySelector('.waiting-indicator');
+          if (indicator) {
+            actionBar.insertBefore(wrapper, indicator);
+          } else {
+            actionBar.appendChild(wrapper);
+          }
+          injected = true;
+          console.log('[suit-btn] injected into action-bar');
+          updateHighlights();
+          updateCenterButtons();
+        }
+
+        createCenterPanel();
+        var observer = new MutationObserver(function(){ tryInject(); updateCenterButtons(); });
+        observer.observe(document.body || document.documentElement, {childList: true, subtree: true});
+        setInterval(function(){ tryInject(); updateCenterButtons(); }, 1000);
+        setTimeout(function(){ tryInject(); updateCenterButtons(); }, 500);
+        setTimeout(updateCenterButtons, 2000);
+        console.log('[suit-btn] injector ready');
+        } catch(e) {
+          console.error('[suit-btn] FATAL ERROR:', e.message, e.stack);
+        }
+      })();
+    </script>
+  </body>
+</html>
