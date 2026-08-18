@@ -1,0 +1,38 @@
+cpu time               (seconds, -t)  unlimited
+file size           (512-blocks, -f)  unlimited
+data seg size           (kbytes, -d)  33554432
+stack size              (kbytes, -s)  524288
+core file size      (512-blocks, -c)  2097152
+max memory size         (kbytes, -m)  2048000
+locked memory           (kbytes, -l)  2048000
+max user processes              (-u)  20
+open files                      (-n)  1500
+virtual mem size        (kbytes, -v)  unlimited
+swap limit              (kbytes, -w)  unlimited
+socket buffer size       (bytes, -b)  unlimited
+pseudo-terminals                (-p)  unlimited
+kqueues                         (-k)  unlimited
+umtx shared locks               (-o)  unlimited
+pipebuf                         (-y)  unlimited
+---
+/bin/sh: free: not found
+---
+16
+---
+Resource limits (current):
+  cputime              infinity secs
+  filesize             infinity kB
+  datasize             33554432 kB
+  stacksize              524288 kB
+  coredumpsize          1048576 kB
+  memoryuse             2048000 kB
+  memorylocked          2048000 kB
+  maxprocesses               20
+  openfiles                1500
+  sbsize               infinity bytes
+  vmemoryuse           infinity kB
+  pseudo-terminals     infinity
+  swapuse              infinity kB
+  kqueues              infinity
+  umtxp                infinity
+  pipebuf              infinity kB
