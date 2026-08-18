@@ -1,0 +1,19 @@
+{
+  "team_win_weight": 1.0,
+  "first_out_weight": 0.7657717,
+  "second_out_weight": 0.9,
+  "yield_to_partner_bias": 1.4,
+  "partner_sprint_threshold": 2,
+  "bomb_conserve_bias": 0.8,
+  "bomb_aggression_when_enemy_low": 2.2148905,
+  "enemy_low_cards_threshold": 3,
+  "endgame_hand_count_threshold": 6,
+  "endgame_clear_hand_bias": 1.2,
+  "proactive_play_bias": 1.1,
+  "low_card_dump_bias": 1.4,
+  "pass_stall_penalty": 0.9,
+  "hand_tracker_enabled": true,
+  "prob_threshold_for_bomb": 0.6,
+  "prob_threshold_for_intercept": 0.4,
+  "enable_reason_trace": false
+}

@@ -1,0 +1,62 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+
+# Logs & runtime
+*.log
+logs/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# Debug & coverage
+*.profraw
+*.profdata
+coverage/
+*.gcno
+*.gcda
+*.gcov
+
+# Build & dist (if any)
+/dist/
+/build/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# --- AI agents / copilots ---
+.cursor/
+.codex
+.codex/
+.agents/
+.aider*
+.aider/
+.claude/
+.cursor-tutor/
+.continue/
+.avante/
+.gpt-pilot/
+.windsurf/
