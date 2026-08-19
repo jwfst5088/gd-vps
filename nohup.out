@@ -1,0 +1,37 @@
+[2m2026-07-06T08:04:02.406925Z[0m [32m INFO[0m [2mclawguandan::server_runtime[0m[2m:[0m clawguandan listening [3maddr[0m[2m=[0m0.0.0.0:2230
+INFO: create_table API called: rank=Some("2") user_agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0
+INFO: join_table API called: table=t_7bd85dfe player_name=rw player_type=None
+INFO: start_bot API called: table=t_7bd85dfe user_agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0
+INFO: register_bot_pid: table=t_7bd85dfe pid=78290
+INFO: join_table API called: table=t_7bd85dfe player_name=AdvancedBot0 player_type=Some(Bot)
+INFO: join_table API called: table=t_7bd85dfe player_name=AdvancedBot1 player_type=Some(Bot)
+INFO: join_table API called: table=t_7bd85dfe player_name=AdvancedBot2 player_type=Some(Bot)
+INFO: delete_table API called: table=t_7bd85dfe user_agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0 xff=unknown
+INFO: delete_table: killing 1 tracked bots for table t_7bd85dfe
+INFO: delete_table: killed and reaped bot pid=78290
+INFO: start_learn_api called: mode=selfplay matches=50 iterations=20 population=20 output=params.json
+[learn] Starting hill-climb optimization via self-play...
+[learn] Matches per evaluation: 50
+[learn] Iterations: 20
+[learn] Total matches: ~2000
+INFO: start_learn_api called: mode=genetic matches=30 iterations=10 population=20 output=params.json
+[GA] Starting genetic algorithm optimization...
+[GA] Population size: 20
+[GA] Generations: 10
+[GA] Matches per evaluation: 30
+[GA] Total matches: ~6000
+INFO: start_learn_api called: mode=record matches=100 iterations=20 population=20 output=params.json
+[record_learner] Starting learning from game logs...
+[record_learner] Logs loaded: 2
+[record_learner] Iterations: 20
+[record_learner] Human wins: 0, losses: 0
+
+[record_learner] Record-based learning complete. Saving to params.json
+[record_learner] Best params: RuleBotParams { team_win_weight: 1.0, first_out_weight: 0.8, second_out_weight: 0.9, yield_to_partner_bias: 1.4, partner_support_threshold: 4, partner_sprint_threshold: 4, bomb_conserve_bias: 0.8, bomb_aggression_when_enemy_low_cards: 2.2, enemy_low_cards_threshold: 4, endgame_hand_count_threshold: 7, endgame_clear_hand_bias: 1.2, proactive_play_bias: 1.1, low_card_dump_bias: 1.4, pass_stall_penalty: 0.9, use_suggest_fallback: true, enable_reason_trace: false }
+[record_learner] Done.
+[learn] iter 1: score=1.0000 (best=1.0000)
+[learn] Learning stopped by user
+
+[learn] Self-play optimization complete. Saving to params.json
+[learn] Best params: RuleBotParams { team_win_weight: 1.0, first_out_weight: 0.8, second_out_weight: 0.9, yield_to_partner_bias: 1.4, partner_support_threshold: 3, partner_sprint_threshold: 3, bomb_conserve_bias: 0.8, bomb_aggression_when_enemy_low_cards: 2.2, enemy_low_cards_threshold: 3, endgame_hand_count_threshold: 6, endgame_clear_hand_bias: 1.2, proactive_play_bias: 1.1, low_card_dump_bias: 1.4, pass_stall_penalty: 0.9, use_suggest_fallback: true, enable_reason_trace: false }
+[learn] Done.
