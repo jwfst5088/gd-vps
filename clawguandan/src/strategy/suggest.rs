@@ -647,6 +647,11 @@ fn pick_playing_with_context(
 
     let pctx = build_play_context(hand, actor);
 
+    // ══ 房规：只剩最后1张时，能压就立即打出清空夺头游，任何启发式不得拦截 ══
+    if pass_action.is_some() && pctx.my_remaining == 1 && !plays.is_empty() {
+        return Ok(plays[0].clone());
+    }
+
     // Score each play with context, then pick the best (lowest score).
     let mut scored: Vec<(PlayScore, &PlayerAction)> = Vec::with_capacity(plays.len() + 1);
     for a in &plays {
@@ -681,6 +686,27 @@ fn pick_playing_with_context(
     }
 
     scored.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // ══ 房规硬守卫：残局保留最后一个炸弹——最优解若为「非清空用最后炸弹」且对手未冲刺，强制过牌 ══
+    if let Some((_, best_act)) = scored.first() {
+        if let PlayerAction::Play { cards: best_cards, .. } = best_act {
+            if best_cards.len() < pctx.my_remaining
+                && pctx.combos.bomb_count == 1
+                && pctx.my_remaining <= 6
+                && pctx.min_opp_remaining > 3
+                && pctx.my_remaining - best_cards.len() > 2
+            {
+                let looks_bomb = CombinationParser::parse(best_cards, None, ctx)
+                    .map(|c| matches!(c.class(), CombinationClass::Bomb))
+                    .unwrap_or(false);
+                if looks_bomb {
+                    if let Some(pass) = pass_action {
+                        return Ok(pass.clone());
+                    }
+                }
+            }
+        }
+    }
 
     scored
         .first()
@@ -757,16 +783,48 @@ fn score_play(a: &PlayerAction, ctx: RuleContext, pctx: &PlayContext) -> PlaySco
                 }
             }
         }
+        // 房规三豁免（mirror JS classifyBombSplit）：①清空手牌 ②中盘带出≥3张单牌
+        // ③中盘同花顺且剩余单张≤2。残局一律禁止。
+        let split_clearing = cards.len() >= pctx.my_remaining;
+        let split_endgame = pctx.my_remaining <= 6;
+        let mut carried_singles = 0usize;
+        for (&r, &pc) in &play_rank_counts {
+            if pctx.combos.rank_to_count.get(&r).copied().unwrap_or(0) == 1 {
+                carried_singles += pc;
+            }
+        }
+        let is_sf_play = matches!(combo.kind, CombinationKind::Bomb(BombKind::StraightFlush));
+        let mut singles_after_sf = usize::MAX;
+        if is_sf_play {
+            let mut s = pctx.singles_count;
+            for c in cards {
+                if let Some(ci) = pctx.card_info.get(c) {
+                    if pctx.combos.rank_to_count.get(&ci.rank).copied().unwrap_or(0) == 1 {
+                        s = s.saturating_sub(1);
+                    }
+                }
+            }
+            singles_after_sf = s;
+        }
         for (rank, play_count) in &play_rank_counts {
             if *rank == level_rank_val {
                 continue; // 级牌炸弹允许拆
             }
             let hand_total = pctx.combos.rank_to_count.get(rank).copied().unwrap_or(0);
             if hand_total >= 4 && *play_count < hand_total {
-                direct_bomb_penalty = 100; // 拆炸弹，极高惩罚
+                let exempt = split_clearing
+                    || (!split_endgame && carried_singles >= 3)
+                    || (!split_endgame && is_sf_play && singles_after_sf <= 2);
+                if !exempt {
+                    direct_bomb_penalty = 100; // 拆炸弹，极高惩罚
+                }
+                break;
             }
         }
     }
+
+    // ── 房规公共量：是否清空手牌 ──
+    let clearing = cards.len() >= pctx.my_remaining;
 
     let mut sorted = cards.clone();
     sorted.sort();
@@ -788,14 +846,27 @@ fn score_play(a: &PlayerAction, ctx: RuleContext, pctx: &PlayContext) -> PlaySco
             strategic_tier = strategic_tier.saturating_add(100); // 绝对不能空出
         }
         // 炸弹：领牌时不能空炸，跟牌时炸弹可以夺牌权
+        // 房规豁免（mirror JS「空出炸弹重罚」例外2）：剩余手牌全是炸弹（各组≥4张，
+        // 王/百搭按其rank键单独成组也需≥4张）→ 领炸连出不受罚
         if is_bomb && pctx.is_leading {
-            strategic_tier = strategic_tier.saturating_add(100); // 领牌时空炸，绝对禁止
+            let mut rest_counts: HashMap<u8, usize> = HashMap::new();
+            for (card_str, ci) in &pctx.card_info {
+                if cards.contains(card_str) {
+                    continue;
+                }
+                *rest_counts.entry(ci.rank).or_default() += 1;
+            }
+            let rest_all_bombs = rest_counts.values().all(|&n| n >= 4);
+            if !rest_all_bombs {
+                strategic_tier = strategic_tier.saturating_add(100); // 领牌空炸，绝对禁止
+            }
         }
     }
 
     // 逢人配不能单出，尽量配成炸弹/同花顺/木板/钢板/杂顺等组合
     // 逢人配极其珍贵，单出/对子/三张同中浪费逢人配 → 极高惩罚；用于组合牌型 → 不惩罚
-    if wild_count > 0 && !is_bomb {
+    // 房规豁免（mirror JS finishingPlay）：清空手牌时百搭任意用法全部豁免
+    if wild_count > 0 && !is_bomb && !clearing {
         let waste = match combo.kind {
             CombinationKind::Ordinary(OrdinaryKind::Single) => 100, // 逢人配绝不能单出，极高惩罚
             CombinationKind::Ordinary(OrdinaryKind::Pair) => 50,    // 对子中浪费逢人配，极高惩罚
@@ -806,6 +877,56 @@ fn score_play(a: &PlayerAction, ctx: RuleContext, pctx: &PlayContext) -> PlaySco
         strategic_tier = strategic_tier.saturating_add(waste);
     }
 
+    // ══ 房规：百搭分级惩罚（mirror JS DUAL_WILD_* / WILD_ON_LEVEL_* / UPGRADED_BOMB_*）══
+    // 清空手牌豁免所有百搭罚分（上面已挡）；此处覆盖双百搭矩阵与升档炸。
+    if wild_count >= 2 && !clearing {
+        let endgame_hand = pctx.my_remaining <= 6;
+        let touches_level_natural = cards.iter().any(|c| {
+            pctx.card_info.get(c).map(|ci| ci.is_level && !ci.is_wild).unwrap_or(false)
+        });
+        let nonwild_count = cards.len() - wild_count;
+        // 白名单（mirror JS pushDualWildSanctioned）：残局≤6、非级牌参与、
+        // 四头炸(非级牌对+2百搭)/三带二/木板/钢板 → 仅轻罚
+        let sanctioned_shape = endgame_hand && !touches_level_natural && match combo.kind {
+            CombinationKind::Bomb(BombKind::SameRank { n }) => n == 4 && nonwild_count == 2,
+            CombinationKind::Ordinary(OrdinaryKind::FullHouse) => nonwild_count == 3,
+            CombinationKind::Ordinary(OrdinaryKind::Plate) => true,
+            CombinationKind::Ordinary(OrdinaryKind::Tube) => true,
+            _ => false,
+        };
+        if sanctioned_shape {
+            strategic_tier = strategic_tier.saturating_add(1); // 白名单用法：仅 −10 级别
+        } else {
+            // 其余一律重罚：中盘 −600 / 残局 −60；裸双百搭再叠 −200；沾级牌再叠 −250/−20
+            let bare = nonwild_count == 0;
+            let mut pen: u8 = if endgame_hand { 6 } else { 40 };
+            if bare {
+                pen = pen.saturating_add(12);
+            }
+            if touches_level_natural {
+                pen = pen.saturating_add(if endgame_hand { 4 } else { 22 });
+            }
+            strategic_tier = strategic_tier.saturating_add(pen);
+        }
+    }
+
+    // 升档炸弹（3自然+1百搭）：轻罚（−150/−10）；对手冲刺≤6豁免；级牌rank走沾级罚
+    if wild_count == 1 && is_bomb && cards.len() == 4 && !clearing && pctx.min_opp_remaining > 6 {
+        let mut nat_rank_count: HashMap<u8, usize> = HashMap::new();
+        for c in cards {
+            if let Some(ci) = pctx.card_info.get(c) {
+                if !ci.is_wild {
+                    *nat_rank_count.entry(ci.rank).or_default() += 1;
+                }
+            }
+        }
+        let up_three = nat_rank_count.values().max().copied().unwrap_or(0) == 3;
+        let up_level = nat_rank_count.keys().any(|&r| r == pctx.level_rank);
+        if up_three && !up_level {
+            strategic_tier = strategic_tier.saturating_add(if pctx.my_remaining <= 6 { 2 } else { 12 });
+        }
+    }
+
     // 王对子惩罚：不能用一对王（大小王）去打小对子
     if matches!(combo.kind, CombinationKind::Ordinary(OrdinaryKind::Pair)) {
         let has_joker = cards.iter().any(|c| c.starts_with("🃏") || c.starts_with("👑"));
@@ -814,14 +935,42 @@ fn score_play(a: &PlayerAction, ctx: RuleContext, pctx: &PlayContext) -> PlaySco
         }
     }
 
+    // ══ 房规：先出小牌，不要空出大牌（J以上按点数递增罚；清空豁免）══
+    // mirror JS scoreLeadPlay「先出小牌」：J −18 / Q −36 / K −54 / A −72 / 王 −108 / 百搭 −90
+    if pctx.is_leading && !clearing {
+        let has_joker_card = cards.iter().any(|c| c.starts_with("🃏") || c.starts_with("👑"));
+        let has_wild = cards.iter().any(|c| pctx.card_info.get(c).map(|ci| ci.is_wild).unwrap_or(false));
+        let max_nat = cards
+            .iter()
+            .filter_map(|c| pctx.card_info.get(c))
+            .filter(|ci| !ci.is_wild && !ci.is_joker)
+            .map(|ci| ci.rank)
+            .max()
+            .unwrap_or(0);
+        let max_any = if has_joker_card { 16 } else if has_wild { 15 } else { max_nat };
+        if max_any >= 11 {
+            strategic_tier = strategic_tier.saturating_add((max_any - 10).saturating_mul(2));
+        }
+    }
+
+    // ══ 房规：接风重奖——队友已全部出完（mirror JS +120 首出 / +180 压敌）══
+    if pctx.teammate_remaining == 0 {
+        if pctx.is_leading {
+            strategic_tier = strategic_tier.saturating_sub(12);
+        } else if !pctx.partner_leading {
+            strategic_tier = strategic_tier.saturating_sub(18);
+        }
+    }
+
     // 级牌炸弹惩罚：级牌应拆开出，不应形成炸弹
-    // 级牌可以拆成单张或对子压牌
+    // 房规（mirror JS 天然级牌炸弹规则）：天然级牌四炸中盘近乎禁绝(+50)，残局留作万不得已(+8)
     if is_bomb {
-        let all_level = cards.iter().all(|c| {
-            pctx.card_info.get(c).map(|ci| ci.is_level).unwrap_or(false)
+        let all_level_natural = cards.iter().all(|c| {
+            pctx.card_info.get(c).map(|ci| ci.is_level && !ci.is_wild).unwrap_or(false)
         });
-        if all_level {
-            strategic_tier = strategic_tier.saturating_add(8);
+        if all_level_natural {
+            let tier_add = if !clearing && pctx.my_remaining > 6 { 50 } else { 8 };
+            strategic_tier = strategic_tier.saturating_add(tier_add);
         }
     }
 
@@ -943,6 +1092,55 @@ fn score_play(a: &PlayerAction, ctx: RuleContext, pctx: &PlayContext) -> PlaySco
     // 炸完后自己全是单张小散，无法连续出牌，不炸，放过本轮
     // ══════════════════════════════════════════════════════════════
     let is_last_play = cards.len() >= pctx.my_remaining;
+
+    // ══ 房规：避免把自己打到「只剩小单张」——非清空出牌后剩余≥3张且全为≤10散单张时递增罚 ══
+    // mirror JS −22/张。仅中盘生效（>6张）：残局以多清牌为先，不与此冲突。
+    if !is_last_play && pctx.my_remaining > 6 {
+        let remaining_after = pctx.my_remaining - cards.len();
+        if remaining_after >= 3 {
+            let played_set: std::collections::HashSet<&String> = cards.iter().collect();
+            let mut rest_cnt: HashMap<u8, usize> = HashMap::new();
+            let mut bad_remainder = false;
+            for (card_str, ci) in &pctx.card_info {
+                if played_set.contains(card_str) {
+                    continue;
+                }
+                if ci.is_wild || ci.is_joker {
+                    bad_remainder = true;
+                    break;
+                }
+                *rest_cnt.entry(ci.rank).or_default() += 1;
+            }
+            if !bad_remainder {
+                let mut distinct_singles = 0usize;
+                for (&r, &n) in &rest_cnt {
+                    if n == 0 {
+                        continue;
+                    }
+                    if n != 1 || r == pctx.level_rank || r > 10 {
+                        bad_remainder = true;
+                        break;
+                    }
+                    distinct_singles += 1;
+                }
+                if !bad_remainder && distinct_singles >= 3 {
+                    strategic_tier = strategic_tier.saturating_add(distinct_singles.min(8) as u8);
+                }
+            }
+        }
+    }
+
+    // ══ 房规：残局保留最后一个炸弹（mirror JS −400）：清空/对手冲刺≤3/打完剩≤2张 豁免 ══
+    if is_bomb && !clearing && !is_last_play
+        && pctx.combos.bomb_count == 1
+        && pctx.my_remaining <= 6
+        && pctx.min_opp_remaining > 3
+        && pctx.my_remaining - cards.len() > 2
+    {
+        strategic_tier = strategic_tier.saturating_add(40);
+    }
+
+    // 红线2：炸完后全是单张小散，无法连续出牌，不炸放过本轮
     if is_bomb && !is_last_play {
         let remaining_after = pctx.my_remaining - cards.len();
         // 计算炸完后手牌中单张的数量

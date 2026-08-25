@@ -75,7 +75,7 @@ fn search_best(
             {
                 return;
             }
-            let key = strength_key(&combo, cur);
+            let key = strength_key(&combo, cur, ctx);
             match best {
                 Some((bk, _)) if key <= *bk => {}
                 _ => {
@@ -217,19 +217,28 @@ fn all_non_joker_symbols() -> Vec<String> {
     v
 }
 
-type StrengthKey = (u8, u8, u8, u8, Vec<String>);
+type StrengthKey = (u8, u8, u8, u8, u8, Vec<String>);
 
-fn strength_key(combo: &Combination, wild_targets: &[String]) -> StrengthKey {
+/// 房规（对齐 JS inferWildTargets）：强度完全相同时，优先选择不落在级牌上的
+/// 配法。JS 以「先找到者胜 + 级牌 rank 最后入池」达成该偏好；此处用显式
+/// `level_used` 分量（0=未配级牌，排在更小/更优）实现同等语义。
+fn strength_key(combo: &Combination, wild_targets: &[String], ctx: RuleContext) -> StrengthKey {
     let class_rank = match combo.class() {
         CombinationClass::Ordinary => 0,
         CombinationClass::Bomb => 1,
     };
     let kind_rank = kind_rank(combo.kind);
+    let level_rank = ctx.hand_level.to_rank();
+    let level_used = wild_targets
+        .iter()
+        .filter_map(|t| parse_card_symbol(t).ok())
+        .any(|c| c.rank == level_rank) as u8;
     (
         class_rank,
         combo.bomb_tier,
         combo.primary,
         kind_rank,
+        level_used,
         wild_targets.to_vec(),
     )
 }
@@ -275,5 +284,78 @@ mod tests {
             .unwrap();
         let combo = CombinationParser::parse(&cards, Some(&inferred), ctx).unwrap();
         assert!(matches!(combo.kind, CombinationKind::Bomb(_)));
+    }
+
+    #[test]
+    fn infer_dual_wilds_complete_quad_on_natural_pair() {
+        // 房规：非级牌对 + 双百搭 → 可同 rank 配成四炸并作为合法推断结果
+        // （旧版 distinct-rank 限制下此处根本无解）。
+        let ctx = RuleContext {
+            hand_level: HandLevel::Two,
+        };
+        let cards = vec!["♠5".into(), "♦5".into(), "♥2".into(), "♥2".into()];
+        let inferred = WildTargetInfer::infer_best(&cards, ctx, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(inferred.len(), 2);
+        let combo = CombinationParser::parse(&cards, Some(&inferred), ctx).unwrap();
+        // 最强解是四张同 rank 炸弹（级牌 rank 的 level-order 值最高，
+        // 与 JS inferWildTargets 一致按强度选择；两个百搭必然同 rank）。
+        assert_eq!(
+            combo.kind,
+            CombinationKind::Bomb(BombKind::SameRank { n: 4 })
+        );
+        let t0 = parse_card_symbol(&inferred[0]).unwrap();
+        let t1 = parse_card_symbol(&inferred[1]).unwrap();
+        assert_eq!(t0.rank, t1.rank);
+    }
+
+    #[test]
+    fn infer_dual_wild_completion_prefers_non_level_when_stronger_exists() {
+        // 55 66 + 双百搭：非级落点 7,7 组成木板 556677（hi=7），强于钢板
+        // 555666（hi=6）；级牌落点无法成形。推断必须选到该非级牌解。
+        let ctx = RuleContext {
+            hand_level: HandLevel::Two,
+        };
+        let cards = vec![
+            "♠5".into(),
+            "♦5".into(),
+            "♠6".into(),
+            "♦6".into(),
+            "♥2".into(),
+            "♥2".into(),
+        ];
+        let inferred = WildTargetInfer::infer_best(&cards, ctx, None)
+            .unwrap()
+            .unwrap();
+        let combo = CombinationParser::parse(&cards, Some(&inferred), ctx).unwrap();
+        assert_eq!(combo.kind, CombinationKind::Ordinary(OrdinaryKind::Tube));
+        assert_eq!(combo.primary, 7);
+        assert!(
+            inferred
+                .iter()
+                .all(|t| parse_card_symbol(t).unwrap().rank != Rank::Two),
+            "level-rank targets must not be inferred when non-level alternatives exist"
+        );
+    }
+
+    #[test]
+    fn infer_single_wild_still_completes_straight_flush() {
+        // 单百搭补同花顺保持合法且被优先推断。
+        let ctx = RuleContext {
+            hand_level: HandLevel::Two,
+        };
+        let cards = vec![
+            "♥2".into(),
+            "♠10".into(),
+            "♠J".into(),
+            "♠Q".into(),
+            "♠K".into(),
+        ];
+        let inferred = WildTargetInfer::infer_best(&cards, ctx, None)
+            .unwrap()
+            .unwrap();
+        let combo = CombinationParser::parse(&cards, Some(&inferred), ctx).unwrap();
+        assert_eq!(combo.kind, CombinationKind::Bomb(BombKind::StraightFlush));
     }
 }

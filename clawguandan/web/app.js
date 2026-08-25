@@ -1781,11 +1781,25 @@ function syncPrivateHandSelection() {
   renderCache.privateHandSelectionSig = selectedSig;
 }
 
+function resolveDealerSeat(table) {
+  // Prefer the explicit dealer field when present (old anchoring).
+  const explicit = String(table?.hand?.dealerSeat || "").trim();
+  if (explicit) return explicit;
+  // Tolerate new dealer anchoring: dealer = declarer-team anchor seat (E/S).
+  const teams = Array.isArray(table?.teams) ? table.teams : [];
+  const declarer = teams.find(
+    (team) => String(team?.role || "").trim().toLowerCase() === "declarer",
+  );
+  const seats = Array.isArray(declarer?.seats) ? declarer.seats : [];
+  const anchor = seats.find((seat) => seat === "E") || seats.find((seat) => seat === "S");
+  return anchor ? String(anchor) : "";
+}
+
 function buildSeatTags(table, seat, info) {
   const tags = [];
   const team = teamForSeat(table, seat);
   const teamLevel = String(team?.level || "").trim();
-  const dealerSeat = String(table?.hand?.dealerSeat || "").trim();
+  const dealerSeat = resolveDealerSeat(table);
 
   if (teamLevel) {
     tags.push({

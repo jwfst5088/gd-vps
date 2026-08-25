@@ -601,4 +601,85 @@ mod tests {
         let c = CombinationParser::parse(&["♥2".into()], Some(&["♠K".into()]), ctx).unwrap();
         assert_eq!(c.kind, CombinationKind::Ordinary(OrdinaryKind::Single));
     }
+
+    // ── 房规（对齐 cards.js validatePlay / resolveWildcards 最终策略）──
+
+    #[test]
+    fn single_wild_completes_bomb_from_three_naturals() {
+        // 3 张同 rank + 1 逢人配 = 四头炸（保持合法）。
+        let ctx = RuleContext {
+            hand_level: HandLevel::Two,
+        };
+        let cards = vec!["♠5".into(), "♦5".into(), "♣5".into(), "♥2".into()];
+        let c = CombinationParser::parse(&cards, Some(&["♥5".into()]), ctx).unwrap();
+        assert_eq!(c.kind, CombinationKind::Bomb(BombKind::SameRank { n: 4 }));
+    }
+
+    #[test]
+    fn dual_wilds_same_rank_as_natural_pair_form_quad_bomb() {
+        // 房规：非级牌自然对 X + 双百搭都当 X = 四头炸（合法；
+        // 旧版「两张百搭不能同 rank」限制已移除）。纯自然四炸不受影响。
+        let ctx = RuleContext {
+            hand_level: HandLevel::Two,
+        };
+        let cards = vec!["♠5".into(), "♦5".into(), "♥2".into(), "♥2".into()];
+        let targets = vec!["♣5".into(), "♥5".into()];
+        let c = CombinationParser::parse(&cards, Some(&targets), ctx).unwrap();
+        assert_eq!(c.kind, CombinationKind::Bomb(BombKind::SameRank { n: 4 }));
+    }
+
+    #[test]
+    fn dual_wild_natural_level_pair_quad_also_legal() {
+        // 级牌对 + 双百搭同级牌 = 级牌四炸：走通用规则，同样合法（不特殊生成）。
+        let ctx = RuleContext {
+            hand_level: HandLevel::Two,
+        };
+        let cards = vec!["♠2".into(), "♦2".into(), "♥2".into(), "♥2".into()];
+        let targets = vec!["♣2".into(), "♦2".into()];
+        let c = CombinationParser::parse(&cards, Some(&targets), ctx).unwrap();
+        assert_eq!(c.kind, CombinationKind::Bomb(BombKind::SameRank { n: 4 }));
+        assert_eq!(c.primary, 14); // 级牌 level-order 值
+    }
+
+    #[test]
+    fn dual_wilds_as_pair_complete_full_house() {
+        // 非级牌三张 + 双百搭当代一对 = 三带二。
+        let ctx = RuleContext {
+            hand_level: HandLevel::Two,
+        };
+        let cards = vec!["♠5".into(), "♦5".into(), "♣5".into(), "♥2".into(), "♥2".into()];
+        let targets = vec!["♠9".into(), "♥9".into()];
+        let c = CombinationParser::parse(&cards, Some(&targets), ctx).unwrap();
+        assert_eq!(c.kind, CombinationKind::Ordinary(OrdinaryKind::FullHouse));
+        assert_eq!(c.primary, level_order_value(
+            Card { suit: Suit::Spades, rank: crate::game::card::Rank::Five },
+            ctx,
+        ));
+    }
+
+    #[test]
+    fn dual_wilds_complete_plate_from_two_adjacent_pairs() {
+        // 两相邻非级牌对各两张 + 双百搭各补一张 = 钢板。
+        let ctx = RuleContext {
+            hand_level: HandLevel::Two,
+        };
+        let cards = vec!["♠5".into(), "♦5".into(), "♠6".into(), "♦6".into(), "♥2".into(), "♥2".into()];
+        let targets = vec!["♣5".into(), "♣6".into()];
+        let c = CombinationParser::parse(&cards, Some(&targets), ctx).unwrap();
+        assert_eq!(c.kind, CombinationKind::Ordinary(OrdinaryKind::Plate));
+        assert_eq!(c.primary, 6);
+    }
+
+    #[test]
+    fn dual_wilds_complete_tube_as_third_pair() {
+        // 两相邻非级牌对 + 双百搭配成第三对（落点非级牌）= 木板。
+        let ctx = RuleContext {
+            hand_level: HandLevel::Two,
+        };
+        let cards = vec!["♠5".into(), "♦5".into(), "♠6".into(), "♦6".into(), "♥2".into(), "♥2".into()];
+        let targets = vec!["♠7".into(), "♥7".into()];
+        let c = CombinationParser::parse(&cards, Some(&targets), ctx).unwrap();
+        assert_eq!(c.kind, CombinationKind::Ordinary(OrdinaryKind::Tube));
+        assert_eq!(c.primary, 7);
+    }
 }

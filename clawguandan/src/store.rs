@@ -2,17 +2,18 @@
 
 use crate::domain::{
     Expect, NextStateBody, PlayerPresence, PlayerRecord, PlayerType, Seat, StateTransition,
-    TableRuntimeState, TableState, TableStatus, iso_timestamp, snapshot_replace_delta,
+    TableRuntimeState, TableState, TableStatus, TransitionDelta, iso_timestamp,
+    snapshot_replace_delta,
 };
 use crate::error::AppError;
 use crate::game::card::{parse_card_symbol, is_wild, level_order_value, RuleContext};
-use crate::game::engine::{GameEngine, PlayerAction};
+use crate::game::engine::{declarer_anchor_seat, GameEngine, PlayerAction};
 use crate::game::rules::narration::{
-    format_big_play, format_game_end_by_leave, format_hand_end, format_hand_open,
-    format_hand_open_with_tribute_canceled, format_rank_announce, format_tribute_action,
-    is_big_play_combination,
+    format_big_play, format_game_end_by_leave, format_game_end_champion, format_hand_end,
+    format_hand_open, format_hand_open_with_tribute_canceled, format_rank_announce,
+    format_tribute_action, is_big_play_combination,
 };
-use crate::game::rules::scoring::{Level, ScoringService, WinType};
+use crate::game::rules::scoring::{Level, TeamProgress, WinType};
 use crate::game::types::{
     GameConfig, GamePhase, HandCommitMeta, HandState, HistoryActionKind, TeamId,
 };
@@ -63,6 +64,15 @@ struct TableInner {
     bot_turn_started_at: Option<std::time::Instant>,
     /// PIDs of bot processes spawned for this table (for reliable cleanup).
     bot_pids: Vec<u32>,
+    /// 房规：冠军展示期截止时刻（12秒）。期间全员 ready 也不开新一场；到期后
+    /// 若所有入座玩家均已 ready 则自动发牌（mirror JS `_champPauseUntil`）。
+    champ_pause_until: Option<std::time::Instant>,
+    /// 房规：整场分出胜负后原地重开的参数（冠军队）。在下一手开始时执行双方降回2级等重置
+    /// （mirror JS `_rematchFromLevel2`）。
+    rematch_from_level2: Option<TeamId>,
+    /// 房规：本场冠军信息，随 scoreboard 以 `lastChampionship` 附加字段暴露给客户端
+    /// （mirror JS `scoreboard.lastChampionship`；additive JSON）。
+    last_championship: Option<serde_json::Value>,
 }
 
 impl TableStore {
@@ -100,6 +110,9 @@ impl TableStore {
             notify: Arc::new(Notify::new()),
             bot_turn_started_at: None,
             bot_pids: Vec::new(),
+            champ_pause_until: None,
+            rematch_from_level2: None,
+            last_championship: None,
         }));
         let mut g = self.tables.lock().await;
         g.insert(id.clone(), inner);
@@ -108,14 +121,39 @@ impl TableStore {
     }
 
     pub async fn get_snapshot(&self, table_id: &str) -> Result<TableRuntimeState, AppError> {
-        let t = self.table_mutex(table_id).await?;
-        let mut inner = t.lock().await;
-        Self::expire_inactive_players_locked(&mut inner)?;
-        Ok(inner.state.clone())
+        Ok(self.get_snapshot_with_championship(table_id).await?.0)
     }
 
-    /// All tables (materialized runtime state), sorted by `table_id` for stable output.
-        /// Register a bot process PID for this table so it can be reliably killed on delete.
+    /// Snapshot plus the room's persisted championship payload (`scoreboard.lastChampionship`).
+    pub async fn get_snapshot_with_championship(
+        &self,
+        table_id: &str,
+    ) -> Result<(TableRuntimeState, Option<serde_json::Value>), AppError> {
+        let t = self.table_mutex(table_id).await?;
+        let mut inner = t.lock().await;
+        Self::expire_inactive_players_locked(self, &mut inner)?;
+        Ok((inner.state.clone(), inner.last_championship.clone()))
+    }
+
+    /// All tables (materialized runtime state), sorted by `table_id` for stable output,
+    /// each with its championship payload.
+    pub async fn list_table_runtimes_with_championship(
+        &self,
+    ) -> Vec<(TableRuntimeState, Option<serde_json::Value>)> {
+        let arcs: Vec<Arc<TableMutex>> = {
+            let g = self.tables.lock().await;
+            g.values().cloned().collect()
+        };
+        let mut out = Vec::with_capacity(arcs.len());
+        for arc in arcs {
+            let mut inner = arc.lock().await;
+            let _ = Self::expire_inactive_players_locked(self, &mut inner);
+            out.push((inner.state.clone(), inner.last_championship.clone()));
+        }
+        out.sort_by(|a, b| a.0.table_id.cmp(&b.0.table_id));
+        out
+    }
+    /// Register a bot process PID for this table so it can be reliably killed on delete.
     pub async fn register_bot_pid(&self, table_id: &str, pid: u32) -> Result<(), AppError> {
         let arc = self.table_mutex(table_id).await?;
         let mut inner = arc.lock().await;
@@ -239,18 +277,11 @@ impl TableStore {
     }
 
 pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
-        let arcs: Vec<Arc<TableMutex>> = {
-            let g = self.tables.lock().await;
-            g.values().cloned().collect()
-        };
-        let mut out = Vec::with_capacity(arcs.len());
-        for arc in arcs {
-            let mut inner = arc.lock().await;
-            let _ = Self::expire_inactive_players_locked(&mut inner);
-            out.push(inner.state.clone());
-        }
-        out.sort_by(|a, b| a.table_id.cmp(&b.table_id));
-        out
+        self.list_table_runtimes_with_championship()
+            .await
+            .into_iter()
+            .map(|(state, _)| state)
+            .collect()
     }
 
     fn pick_seat(state: &TableRuntimeState, requested: SeatOrAuto) -> Result<Seat, AppError> {
@@ -331,6 +362,7 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
                 "actorPlayerId": pid,
                 "seat": seat.as_str(),
             })),
+            inner.last_championship.as_ref(),
         );
         inner.log.push(LogEntry {
             transition: tr,
@@ -352,7 +384,7 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
         let mut inner = arc.lock().await;
         Self::verify_player_identity_locked(&inner, player_id, player_key)?;
         Self::touch_player_activity_locked(&mut inner, player_id);
-        Self::expire_inactive_players_locked(&mut inner)?;
+        Self::expire_inactive_players_locked(self, &mut inner)?;
 
         let mut found = None;
         for (seat, slot) in &inner.state.seats {
@@ -389,9 +421,11 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
 
         let will_start_first_hand =
             inner.state.all_ready() && matches!(inner.state.status, TableStatus::Waiting);
+        // 房规：冠军展示期内（12秒）全员 ready 也不开新一场（mirror JS `_champPauseActive`）。
         let will_start_next_hand = inner.state.all_ready()
             && matches!(inner.state.status, TableStatus::InGame)
-            && inner.state.waiting_next_hand_ready;
+            && inner.state.waiting_next_hand_ready
+            && !Self::champ_pause_active(&inner);
         if will_start_first_hand {
             inner.state.status = TableStatus::InGame;
             inner.state.game_config = GameConfig {
@@ -406,56 +440,15 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
             engine
                 .start_first_hand(&mut gs, Seat::E, first_hand_level)
                 .expect("start_first_hand should not fail");
+            // 房规：dealerSeat 锚定庄家方席位（EW→E，SN→S）
+            gs.dealer_seat = declarer_anchor_seat(inner.state.current_declarer);
             inner.state.game = Some(gs);
             inner.state.sync_phase_from_game();
             inner.state.waiting_next_hand_ready = false;
             inner.state.narration =
                 format_hand_open(inner.state.current_declarer, first_hand_level.as_api_str());
         } else if will_start_next_hand {
-            let seq = inner.state.seq;
-            let declarer = inner.state.current_declarer;
-            let next_hand_level = match declarer {
-                TeamId::Ew => inner.state.team_progress_ew.level,
-                TeamId::Sn => inner.state.team_progress_sn.level,
-            };
-            let finishing_order = inner.state.last_finishing_order.clone();
-            let engine = GameEngine::new(inner.state.game_config.clone());
-            let canceled_opening_lead = {
-                let game = inner
-                    .state
-                    .game
-                    .as_mut()
-                    .ok_or_else(|| AppError::Conflict {
-                        message: "game state not initialized".into(),
-                        code: "INVALID_TABLE_STATUS",
-                        current_seq: Some(seq),
-                    })?;
-                engine
-                    .start_next_hand_with_tribute(game, declarer, next_hand_level, &finishing_order)
-                    .map_err(|msg| map_engine_error(msg, seq))?;
-                game.hand
-                    .as_ref()
-                    .and_then(|h| h.tribute.as_ref())
-                    .and_then(|t| {
-                        if t.canceled {
-                            Some(game.turn_seat)
-                        } else {
-                            None
-                        }
-                    })
-            };
-            inner.state.sync_phase_from_game();
-            inner.state.waiting_next_hand_ready = false;
-            let level_s = next_hand_level.as_api_str();
-            if let Some(lead) = canceled_opening_lead {
-                inner.state.narration = format_hand_open_with_tribute_canceled(
-                    declarer,
-                    level_s,
-                    &player_name_for_seat(&inner.state, lead),
-                );
-            } else {
-                inner.state.narration = format_hand_open(declarer, level_s);
-            }
+            Self::prepare_next_hand_locked(&mut inner)?;
         }
 
         inner.state.seq += 1;
@@ -484,6 +477,7 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
                 "gameStarted": will_start_first_hand,
                 "nextHandStarted": will_start_next_hand,
             })),
+            inner.last_championship.as_ref(),
         );
         inner.log.push(LogEntry {
             transition: tr,
@@ -497,6 +491,7 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
     }
 
     fn apply_action_locked(
+        store: &TableStore,
         inner: &mut TableInner,
         player_id: &str,
         player_key: &str,
@@ -506,8 +501,8 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
     ) -> Result<u64, AppError> {
         Self::verify_player_identity_locked(inner, player_id, player_key)?;
         Self::touch_player_activity_locked(inner, player_id);
-        let _ = Self::expire_bot_turns_locked(inner);
-        Self::expire_inactive_players_locked(inner)?;
+        let _ = Self::expire_bot_turns_locked(store, inner);
+        Self::expire_inactive_players_locked(store, inner)?;
         if client_seq != inner.state.seq {
             return Err(AppError::Conflict {
                 message: format!(
@@ -584,6 +579,7 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
                 "actorPlayerId": player_id,
                 "payload": logged_payload
             })),
+            inner.last_championship.as_ref(),
         );
         inner.log.push(LogEntry {
             transition: tr,
@@ -595,12 +591,15 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
         inner.bot_turn_started_at = None;
 
         // If hand enters scoring, apply scoring and switch to re-ready flow.
-        Self::settle_scoring_and_wait_ready(inner)?;
+        Self::settle_scoring_and_wait_ready(store, inner)?;
 
         Ok(inner.state.seq)
     }
 
-    fn settle_scoring_and_wait_ready(inner: &mut TableInner) -> Result<(), AppError> {
+    fn settle_scoring_and_wait_ready(
+        store: &TableStore,
+        inner: &mut TableInner,
+    ) -> Result<(), AppError> {
         if !matches!(inner.state.status, TableStatus::InGame) {
             return Ok(());
         }
@@ -635,54 +634,76 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
         let prev_snapshot = inner.state.to_table_state();
         let prev_seq = inner.state.seq;
         let win_type = infer_win_type(&completed_order, winner);
-        let outcome = ScoringService::apply_hand(
+        // 房规计分（mirror JS `_applyHand`）：A级双上是唯一夺冠方式；A三战失败仅退回2级，比赛继续。
+        let outcome = apply_hand_house_rules(
             inner.state.team_progress_ew.clone(),
             inner.state.team_progress_sn.clone(),
             inner.state.current_declarer,
             winner,
             win_type,
-            true,
-        )
-        .map_err(|msg| AppError::Conflict {
-            message: msg,
-            code: "INVALID_SCORING",
-            current_seq: Some(seq),
-        })?;
+        );
 
-        inner.state.team_progress_ew = outcome.progress_ew;
-        inner.state.team_progress_sn = outcome.progress_sn;
+        inner.state.team_progress_ew = outcome.progress_ew.clone();
+        inner.state.team_progress_sn = outcome.progress_sn.clone();
         inner.state.current_declarer = outcome.next_declarer;
         inner.state.last_finishing_order = completed_order.clone();
         reset_all_players_ready(&mut inner.state);
 
         let ew_level = inner.state.team_progress_ew.level.as_api_str();
         let sn_level = inner.state.team_progress_sn.level.as_api_str();
+        // ⚠️ 提示行仅统计仍处于 A 级队伍的失败次数（mirror JS `_formatHandEnd`）。
+        let ew_a_fails = if inner.state.team_progress_ew.level == Level::A {
+            inner.state.team_progress_ew.ace_failed_attempts
+        } else {
+            0
+        };
+        let sn_a_fails = if inner.state.team_progress_sn.level == Level::A {
+            inner.state.team_progress_sn.ace_failed_attempts
+        } else {
+            0
+        };
         let finish_names = completed_order
             .iter()
             .map(|seat| player_name_for_seat(&inner.state, *seat))
             .collect::<Vec<_>>();
-        if outcome.winner_team.is_some() {
-            inner.state.status = TableStatus::Finished;
-            inner.state.waiting_next_hand_ready = false;
-            inner.state.game_winner_team_id = outcome.winner_team;
+        let championship = outcome.game_winner_team_id;
+        if let Some(champion) = championship {
+            // 房规：整场结束不返回大厅 —— 原地重开新一场（双方从2级重新对战，胜方坐庄）。
+            // 保持 status='in_game' + waiting_next_hand_ready=true，复用现有 ready→下一手机制；
+            // 重开参数由 rematch_from_level2 携带，在下一手开始时执行降级重置。
+            inner.state.status = TableStatus::InGame;
+            inner.state.waiting_next_hand_ready = true;
+            inner.state.game_winner_team_id = Some(champion);
+            inner.rematch_from_level2 = Some(champion);
+            inner.champ_pause_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(12));
+            let champ_seq = inner.state.seq + 1;
+            inner.last_championship = Some(json!({
+                "winnerTeamId": champion.as_str(),
+                "reason": "champion",
+                "levels": { "EW": ew_level, "SN": sn_level },
+                "seq": champ_seq,
+                "at": chrono::Utc::now().timestamp_millis(),
+            }));
+            inner.state.narration =
+                format_game_end_champion(champion, &finish_names, ew_level, sn_level);
+            // game.phase 保持 Scoring：compute_expect 据此给出 ready 等待。
+
+            Self::log_game_result(inner, &completed_order, winner);
+        } else {
+            inner.state.waiting_next_hand_ready = true;
             inner.state.narration = format_hand_end(
                 &finish_names,
                 ew_level,
                 sn_level,
-                false,
                 true,
-                outcome.winner_team,
+                false,
+                None,
+                outcome.demoted_from_a,
+                outcome.declarer_team_id,
+                ew_a_fails,
+                sn_a_fails,
             );
-            if let Some(g) = inner.state.game.as_mut() {
-                g.phase = GamePhase::Completed;
-            }
-            inner.state.sync_phase_from_game();
-            
-            Self::log_game_result(inner, &completed_order, winner);
-        } else {
-            inner.state.waiting_next_hand_ready = true;
-            inner.state.narration =
-                format_hand_end(&finish_names, ew_level, sn_level, true, false, None);
         }
 
         inner.state.seq += 1;
@@ -690,10 +711,24 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
         let new_seq = inner.state.seq;
         let expect_after = new_snapshot.expect.clone();
 
-        let transition_type = if matches!(inner.state.status, TableStatus::Finished) {
-            "GAME_COMPLETED"
+        // 冠军手同样处于「本手结束等待再准备」状态；保留既有 transition type 以兼容
+        // 机器人/观察者对完牌手的统计（夺冠信息走 scoreboard.lastChampionship + event）。
+        let transition_type = "HAND_ENDED_WAITING_READY";
+        let event = if let Some(champion) = championship {
+            json!({
+                "actionType": "hand_end",
+                "winnerTeamId": winner.as_str(),
+                "finishingOrder": completed_order.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                "championTeamId": champion.as_str(),
+                "rematchFromLevel2": true,
+            })
         } else {
-            "HAND_ENDED_WAITING_READY"
+            json!({
+                "actionType": "hand_end",
+                "winnerTeamId": winner.as_str(),
+                "finishingOrder": completed_order.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                "demotedFromA": outcome.demoted_from_a,
+            })
         };
         let tr = build_transition(
             &prev_snapshot,
@@ -701,17 +736,22 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
             prev_seq,
             new_seq,
             transition_type,
-            Some(json!({
-                "actionType": "hand_end",
-                "winnerTeamId": winner.as_str(),
-                "finishingOrder": completed_order.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            })),
+            Some(event),
+            inner.last_championship.as_ref(),
         );
         inner.log.push(LogEntry {
             transition: tr,
             expect_after,
         });
         inner.notify.notify_waiters();
+
+        // 房规：冠军展示期 —— 12秒后若全员已准备则自动开始重开后的第一手
+        // （mirror JS `setTimeout(_maybeStartAfterChampPause, 12500)`）。
+        if championship.is_some() {
+            let tables = store.tables.clone();
+            let timer_table_id = inner.state.table_id.clone();
+            tokio::spawn(Self::champ_pause_auto_start(tables, timer_table_id));
+        }
         Ok(())
     }
 
@@ -727,6 +767,7 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
         let arc = self.table_mutex(table_id).await?;
         let mut inner = arc.lock().await;
         Self::apply_action_locked(
+            self,
             &mut inner,
             player_id,
             player_key,
@@ -749,7 +790,7 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
         loop {
             let notify = {
                 let mut inner = arc.lock().await;
-                Self::expire_inactive_players_locked(&mut inner)?;
+                Self::expire_inactive_players_locked(self, &mut inner)?;
                 if since_seq > inner.state.seq {
                     return Err(AppError::BadRequest(format!(
                         "sinceSeq {} is ahead of currentSeq {}",
@@ -844,7 +885,7 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
         let arc = self.table_mutex(table_id).await?;
         let mut inner = arc.lock().await;
         Self::touch_player_activity_locked(&mut inner, player_id);
-        Self::expire_inactive_players_locked(&mut inner)?;
+        Self::expire_inactive_players_locked(self, &mut inner)?;
         Ok(())
     }
 
@@ -856,7 +897,7 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
     ) -> Result<(), AppError> {
         let arc = self.table_mutex(table_id).await?;
         let mut inner = arc.lock().await;
-        Self::expire_inactive_players_locked(&mut inner)?;
+        Self::expire_inactive_players_locked(self, &mut inner)?;
         Self::verify_player_identity_locked(&inner, player_id, player_key)
     }
 
@@ -896,7 +937,7 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
 
     /// Auto-pass for bots that have exceeded their turn deadline.
     /// Uses bot_turn_started_at (NOT last_activity_at) to avoid observer polling resetting the timer.
-    fn expire_bot_turns_locked(inner: &mut TableInner) -> Result<bool, AppError> {
+    fn expire_bot_turns_locked(store: &TableStore, inner: &mut TableInner) -> Result<bool, AppError> {
         if !matches!(inner.state.status, TableStatus::InGame) {
             return Ok(false);
         }
@@ -1088,6 +1129,7 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
                 "reason": "bot_turn_timeout",
                 "payload": {}
             })),
+            inner.last_championship.as_ref(),
         );
         inner.log.push(LogEntry {
             transition: tr,
@@ -1096,17 +1138,20 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
         inner.notify.notify_waiters();
 
         // If hand enters scoring, apply scoring
-        Self::settle_scoring_and_wait_ready(inner)?;
+        Self::settle_scoring_and_wait_ready(store, inner)?;
 
         Ok(true)
     }
 
-    fn expire_inactive_players_locked(inner: &mut TableInner) -> Result<(), AppError> {
+    fn expire_inactive_players_locked(
+        store: &TableStore,
+        inner: &mut TableInner,
+    ) -> Result<(), AppError> {
         if matches!(inner.state.status, TableStatus::Finished) {
             return Ok(());
         }
         // Check bot turn timeout first (shorter timeout than player inactivity)
-        if Self::expire_bot_turns_locked(inner)? {
+        if Self::expire_bot_turns_locked(store, inner)? {
             if matches!(inner.state.status, TableStatus::Finished) {
                 return Ok(());
             }
@@ -1163,6 +1208,7 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
                 "awayPlayerIds": away_player_ids,
                 "gameEnded": should_finish_game,
             })),
+            inner.last_championship.as_ref(),
         );
         inner.log.push(LogEntry {
             transition: tr,
@@ -1170,6 +1216,164 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
         });
         inner.notify.notify_waiters();
         Ok(())
+    }
+
+    /// 房规：冠军展示期是否仍在进行（mirror JS `_champPauseActive`）。
+    /// 期间即使全员 ready 也不开始下一手。
+    fn champ_pause_active(inner: &TableInner) -> bool {
+        matches!(inner.state.status, TableStatus::InGame)
+            && inner.state.waiting_next_hand_ready
+            && inner
+                .champ_pause_until
+                .is_some_and(|until| std::time::Instant::now() < until)
+    }
+
+    /// 冠军展示期到点后的自动开局（mirror JS `_maybeStartAfterChampPause`）：
+    /// 展示期已过且所有入座玩家均已 ready 时，原地重开新一场的第一手。
+    async fn champ_pause_auto_start(
+        tables: Arc<Mutex<HashMap<String, Arc<Mutex<TableInner>>>>>,
+        table_id: String,
+    ) {
+        sleep(Duration::from_millis(12_500)).await;
+        let arc = { tables.lock().await.get(&table_id).cloned() };
+        let Some(arc) = arc else {
+            return; // table deleted during the celebration pause
+        };
+        let mut inner = arc.lock().await;
+        if !matches!(inner.state.status, TableStatus::InGame)
+            || !inner.state.waiting_next_hand_ready
+        {
+            return;
+        }
+        match inner.champ_pause_until {
+            Some(until) if std::time::Instant::now() < until => return,
+            _ => {}
+        }
+        inner.champ_pause_until = None;
+        if !inner.state.all_ready() {
+            // 等待玩家再次点击准备：后续 set_ready 会触发开局。
+            return;
+        }
+        let prev_snapshot = inner.state.to_table_state();
+        let prev_seq = inner.state.seq;
+        if let Err(e) = Self::prepare_next_hand_locked(&mut inner) {
+            eprintln!("WARN: champ-pause auto start failed for {table_id}: {e}");
+            return;
+        }
+        inner.state.seq += 1;
+        let new_snapshot = inner.state.to_table_state();
+        let new_seq = inner.state.seq;
+        let expect_after = new_snapshot.expect.clone();
+        let tr = build_transition(
+            &prev_snapshot,
+            &new_snapshot,
+            prev_seq,
+            new_seq,
+            "NEXT_HAND_STARTED",
+            Some(json!({
+                "actionType": "ready",
+                "actorPlayerId": serde_json::Value::Null,
+                "ready": true,
+                "gameStarted": false,
+                "nextHandStarted": true,
+                "reason": "champ_pause_expired",
+            })),
+            inner.last_championship.as_ref(),
+        );
+        inner.log.push(LogEntry {
+            transition: tr,
+            expect_after,
+        });
+        eprintln!("INFO: champ-pause expired - started next hand for table {table_id}");
+        inner.notify.notify_waiters();
+    }
+
+    /// 开始下一手：先执行冠军后的原地重开重置（若有），再按常规流程发牌/建进贡计划。
+    /// 返回抗贡时的首出席位（无抗贡为 `None`）。mirror JS `_startNextHand`。
+    fn prepare_next_hand_locked(inner: &mut TableInner) -> Result<Option<Seat>, AppError> {
+        // 房规：上一整场已分胜负 → 原地重开新一场（双方从2级、胜方坐庄、首局无进贡、
+        // 清空完牌顺序、比赛计数复位）。mirror JS `_rematchFromLevel2` 分支。
+        if let Some(champion) = inner.rematch_from_level2.take() {
+            inner.state.team_progress_ew = TeamProgress {
+                team: TeamId::Ew,
+                level: Level::Two,
+                ace_failed_attempts: 0,
+            };
+            inner.state.team_progress_sn = TeamProgress {
+                team: TeamId::Sn,
+                level: Level::Two,
+                ace_failed_attempts: 0,
+            };
+            inner.state.current_declarer = champion;
+            inner.state.game_winner_team_id = None;
+            inner.state.last_finishing_order.clear();
+            // lastChampionship 保留（前端按时间戳去重展示），仅清空当前夺冠标记。
+            let engine = GameEngine::new(inner.state.game_config.clone());
+            let mut gs = engine.init_table(inner.state.table_id.clone());
+            engine
+                .start_rematch_first_hand(&mut gs, champion)
+                .map_err(|msg| AppError::Conflict {
+                    message: msg,
+                    code: "INVALID_TABLE_STATUS",
+                    current_seq: Some(inner.state.seq),
+                })?;
+            inner.state.game = Some(gs);
+            inner.state.sync_phase_from_game();
+            inner.state.waiting_next_hand_ready = false;
+            inner.state.narration = format_hand_open(champion, Level::Two.as_api_str());
+            eprintln!(
+                "INFO: rematch reset for table {}: new game from level 2, declarer={}",
+                inner.state.table_id,
+                champion.as_str()
+            );
+            return Ok(None);
+        }
+
+        let seq = inner.state.seq;
+        let declarer = inner.state.current_declarer;
+        let next_hand_level = match declarer {
+            TeamId::Ew => inner.state.team_progress_ew.level,
+            TeamId::Sn => inner.state.team_progress_sn.level,
+        };
+        let finishing_order = inner.state.last_finishing_order.clone();
+        let engine = GameEngine::new(inner.state.game_config.clone());
+        let canceled_opening_lead = {
+            let game = inner
+                .state
+                .game
+                .as_mut()
+                .ok_or_else(|| AppError::Conflict {
+                    message: "game state not initialized".into(),
+                    code: "INVALID_TABLE_STATUS",
+                    current_seq: Some(seq),
+                })?;
+            engine
+                .start_next_hand_with_tribute(game, declarer, next_hand_level, &finishing_order)
+                .map_err(|msg| map_engine_error(msg, seq))?;
+            game.hand
+                .as_ref()
+                .and_then(|h| h.tribute.as_ref())
+                .and_then(|t| {
+                    if t.canceled {
+                        Some(game.turn_seat)
+                    } else {
+                        None
+                    }
+                })
+        };
+        inner.state.sync_phase_from_game();
+        inner.state.waiting_next_hand_ready = false;
+        let level_s = next_hand_level.as_api_str();
+        if let Some(lead) = canceled_opening_lead {
+            inner.state.narration = format_hand_open_with_tribute_canceled(
+                declarer,
+                level_s,
+                &player_name_for_seat(&inner.state, lead),
+            );
+        } else {
+            inner.state.narration = format_hand_open(declarer, level_s);
+        }
+        Ok(canceled_opening_lead)
     }
 }
 
@@ -1309,6 +1513,99 @@ fn infer_win_type(order: &[Seat], winner: TeamId) -> WinType {
     WinType::OneFour
 }
 
+/// 房规手结果（mirror JS `_applyHand` 返回结构）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HandOutcome {
+    progress_ew: TeamProgress,
+    progress_sn: TeamProgress,
+    next_declarer: TeamId,
+    declarer_team_id: TeamId,
+    /// A级三战失败退回2级（比赛继续，不产生冠军）。
+    demoted_from_a: bool,
+    /// 仅 A级双上夺冠时为 `Some(champion)`；其余情况比赛继续。
+    game_winner_team_id: Option<TeamId>,
+}
+
+/// 房规计分（mirror JS `_applyHand` / `_promoteLevel`）：
+/// - 唯一夺冠方式：庄家在 A 级且双上（1-2 完牌）→ `game_winner_team_id = Some(declarer)`
+/// - 其余胜利按 win type 升级（封顶 A），比赛继续
+/// - A级失败追踪：除双上外的任何结果计一次失败；累计 3 次 → 该队退回 2 级、
+///   失败计数清零、`demoted_from_a = true`，比赛原地继续（对方不算获胜）。
+fn apply_hand_house_rules(
+    progress_ew: TeamProgress,
+    progress_sn: TeamProgress,
+    declarer: TeamId,
+    winner: TeamId,
+    win_type: WinType,
+) -> HandOutcome {
+    let delta = win_type.promotion_delta();
+    let mut ew = progress_ew;
+    let mut sn = progress_sn;
+
+    let declarer_won = winner == declarer;
+    let declarer_is_a = match declarer {
+        TeamId::Ew => ew.level == Level::A,
+        TeamId::Sn => sn.level == Level::A,
+    };
+
+    // A级终结胜利：庄家必须双上（1-2）才算获胜——这是唯一夺冠方式
+    if declarer_is_a && declarer_won && matches!(win_type, WinType::OneTwo) {
+        return HandOutcome {
+            progress_ew: ew,
+            progress_sn: sn,
+            next_declarer: declarer,
+            declarer_team_id: declarer,
+            demoted_from_a: false,
+            game_winner_team_id: Some(declarer),
+        };
+    }
+
+    // 赢家升级（封顶A级）
+    match winner {
+        TeamId::Ew => ew.level = ew.level.promote_by(delta),
+        TeamId::Sn => sn.level = sn.level.promote_by(delta),
+    }
+
+    // A级失败追踪：三战失败仅退回2级，比赛原地继续（不结束、对方不算获胜）
+    let mut demoted_from_a = false;
+    let mut attempts = match declarer {
+        TeamId::Ew => ew.ace_failed_attempts,
+        TeamId::Sn => sn.ace_failed_attempts,
+    };
+    if declarer_is_a {
+        if !declarer_won || !matches!(win_type, WinType::OneTwo) {
+            attempts += 1;
+        }
+        if attempts >= 3 {
+            demoted_from_a = true;
+            match declarer {
+                TeamId::Ew => {
+                    ew.level = Level::Two;
+                    ew.ace_failed_attempts = 0;
+                }
+                TeamId::Sn => {
+                    sn.level = Level::Two;
+                    sn.ace_failed_attempts = 0;
+                }
+            }
+        } else {
+            match declarer {
+                TeamId::Ew => ew.ace_failed_attempts = attempts,
+                TeamId::Sn => sn.ace_failed_attempts = attempts,
+            }
+        }
+    }
+
+    HandOutcome {
+        progress_ew: ew,
+        progress_sn: sn,
+        next_declarer: winner,
+        declarer_team_id: declarer,
+        demoted_from_a,
+        game_winner_team_id: None,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum SeatOrAuto {
     Auto,
@@ -1419,6 +1716,21 @@ fn normalized_event_payload(
     payload
 }
 
+/// Additive JSON injection: expose `scoreboard.lastChampionship` on every `/scoreboard`
+/// replace op once a championship has been recorded (mirror JS `gs.scoreboard`).
+fn inject_last_championship(delta: &mut TransitionDelta, champ: Option<&serde_json::Value>) {
+    let Some(champ) = champ else {
+        return;
+    };
+    for op in &mut delta.ops {
+        if op.get("path").and_then(|x| x.as_str()) == Some("/scoreboard")
+            && let Some(obj) = op.get_mut("value").and_then(|v| v.as_object_mut())
+        {
+            obj.insert("lastChampionship".to_string(), champ.clone());
+        }
+    }
+}
+
 fn build_transition(
     prev: &TableState,
     next: &TableState,
@@ -1426,8 +1738,10 @@ fn build_transition(
     seq: u64,
     transition_type: &str,
     event: Option<serde_json::Value>,
+    last_championship: Option<&serde_json::Value>,
 ) -> StateTransition {
     let mut delta = snapshot_replace_delta(prev, next);
+    inject_last_championship(&mut delta, last_championship);
     delta.event = event.map(|trigger| json!({ "trigger": trigger, "derived": [] }));
     StateTransition {
         seq,

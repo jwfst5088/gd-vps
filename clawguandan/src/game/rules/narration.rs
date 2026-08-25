@@ -123,6 +123,14 @@ pub fn format_hand_open_with_tribute_canceled(
     )
 }
 
+/// Team label used by hand-end extras (matches JS `_formatHandEnd`).
+fn hand_end_team_label(team: TeamId) -> (&'static str, &'static str) {
+    match team {
+        TeamId::Ew => ("EW（东西组）", "EW (East–West)"),
+        TeamId::Sn => ("SN（南北组）", "SN (South–North)"),
+    }
+}
+
 pub fn format_hand_end(
     finishing_names: &[String],
     level_ew: &str,
@@ -130,6 +138,10 @@ pub fn format_hand_end(
     waiting_ready: bool,
     game_over: bool,
     winner_team: Option<TeamId>,
+    demoted_from_a: bool,
+    declarer_team: TeamId,
+    ew_a_fail_count: u32,
+    sn_a_fail_count: u32,
 ) -> String {
     let ranking_zh = if finishing_names.is_empty() {
         "本手结束".to_string()
@@ -177,9 +189,49 @@ pub fn format_hand_end(
             ),
         )
     } else if waiting_ready {
+        // 房规附加行（mirror JS `_formatHandEnd`）：
+        // - demoted_from_a: A级三战失败退回2级，比赛继续
+        // - 否则：仍在A的队伍显示本手冲击未成的失败计数（第 n/3 次）
+        let (extra_zh, extra_en) = if demoted_from_a {
+            let (d_zh, d_en) = hand_end_team_label(declarer_team);
+            (
+                format!(" 💥 {} 冲击A级三战失败，退回 2 级，游戏继续！", d_zh),
+                format!(
+                    " 💥 {} failed three challenges at level A and drops back to 2. The game continues!",
+                    d_en
+                ),
+            )
+        } else {
+            let n = ew_a_fail_count.max(sn_a_fail_count);
+            if n > 0 {
+                let (t_zh, t_en) = if ew_a_fail_count > 0 {
+                    hand_end_team_label(TeamId::Ew)
+                } else {
+                    hand_end_team_label(TeamId::Sn)
+                };
+                (
+                    format!(
+                        " ⚠️ {} 本手冲击A级未成（第 {}/3 次；三败退回2级）",
+                        t_zh, n
+                    ),
+                    format!(
+                        " ⚠️ {} failed this level-A challenge ({}/3; three fails drop to 2)",
+                        t_en, n
+                    ),
+                )
+            } else {
+                (String::new(), String::new())
+            }
+        };
         bilingual(
-            format!("{}; {}。请全员再次准备 ▶️", ranking_zh, levels_zh),
-            format!("{}; {}. Everyone ready again ▶️", ranking_en, levels_en),
+            format!(
+                "{}; {}。{} 请全员再次准备 ▶️",
+                ranking_zh, levels_zh, extra_zh
+            ),
+            format!(
+                "{}; {}.{} Everyone ready again ▶️",
+                ranking_en, levels_en, extra_en
+            ),
         )
     } else {
         bilingual(
@@ -194,6 +246,41 @@ fn winning_team_phrase(team: TeamId) -> (&'static str, &'static str) {
         TeamId::Ew => ("EW（东西组）", "EW (East-West)"),
         TeamId::Sn => ("SN（南北组）", "SN (South-North)"),
     }
+}
+
+/// 房规：A级双上夺冠战报（mirror JS `_formatGameEnd`，结构化双语对象）。
+/// 唯一夺冠方式是 A级双上；整场结束不回大厅 —— 原地重开新一场（双方从2级，12秒后自动发牌）。
+pub fn format_game_end_champion(
+    winner_team: TeamId,
+    finishing_names: &[String],
+    level_ew: &str,
+    level_sn: &str,
+) -> String {
+    let ranking_zh = if finishing_names.is_empty() {
+        "本手结束".to_string()
+    } else {
+        format!("本手排名: {}", finishing_names.join(" > "))
+    };
+    let ranking_en = if finishing_names.is_empty() {
+        "Hand ended".to_string()
+    } else {
+        format!("Ranking: {}", finishing_names.join(" > "))
+    };
+    let (winner_zh, winner_en) = hand_end_team_label(winner_team);
+    let headline_zh = format!("🏆 {} A级双上，夺得本场冠军！", winner_zh);
+    let headline_en = format!("🏆 {} completes level A and wins the match!", winner_en);
+    let final_score_zh = format!("最终成绩 EW {} / SN {}", level_ew, level_sn);
+    let final_score_en = format!("Final score EW {} / SN {}", level_ew, level_sn);
+    bilingual(
+        format!(
+            "{} {}；{}。🎉 新一场即将开始：双方从 2 级重新对战！（12秒后自动发牌）",
+            headline_zh, ranking_zh, final_score_zh
+        ),
+        format!(
+            "{} {}; {}. 🎉 A new game starts soon: both teams replay from level 2! (dealing automatically in 12 seconds)",
+            headline_en, ranking_en, final_score_en
+        ),
+    )
 }
 
 pub fn format_game_end_by_leave(leaving_names: &[String]) -> String {

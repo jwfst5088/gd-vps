@@ -171,7 +171,7 @@ pub struct ListTablesEntry {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListTablesResponse {
-    pub tables: Vec<ListTablesEntry>,
+    pub tables: Vec<serde_json::Value>,
 }
 
 
@@ -220,22 +220,54 @@ async fn leave_table(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Additive JSON injection: expose `scoreboard.lastChampionship` once a championship
+/// has been recorded (mirror JS `gs.scoreboard.lastChampionship`; additive field).
+fn inject_last_championship_into(
+    value: &mut serde_json::Value,
+    scoreboard_path: &[&str],
+    champ: Option<&serde_json::Value>,
+) {
+    let Some(champ) = champ else {
+        return;
+    };
+    let mut cur = value;
+    for seg in scoreboard_path {
+        cur = match cur.get_mut(*seg) {
+            Some(next) => next,
+            None => return,
+        };
+    }
+    if let Some(obj) = cur.as_object_mut() {
+        obj.insert("lastChampionship".to_string(), champ.clone());
+    }
+}
+
 async fn list_tables(
     State(state): State<AppState>,
     Query(q): Query<ListTablesQuery>,
 ) -> Result<Json<ListTablesResponse>, AppError> {
-    let runtimes = state.store.list_table_runtimes().await;
+    let runtimes = state.store.list_table_runtimes_with_championship().await;
     let tables = runtimes
         .into_iter()
-        .map(|runtime| {
+        .map(|(runtime, last_championship)| {
             let name = runtime.table_name.clone();
-            let mut state = runtime.to_table_state();
+            let mut table_state = runtime.to_table_state();
             if !q.detail {
-                state.hand = None;
+                table_state.hand = None;
             }
-            ListTablesEntry { name, state }
+            let mut entry = serde_json::to_value(ListTablesEntry {
+                name,
+                state: table_state,
+            })
+            .map_err(|e| AppError::BadRequest(format!("serialize table entry: {}", e)))?;
+            inject_last_championship_into(
+                &mut entry,
+                &["state", "scoreboard"],
+                last_championship.as_ref(),
+            );
+            Ok(entry)
         })
-        .collect();
+        .collect::<Result<Vec<serde_json::Value>, AppError>>()?;
     Ok(Json(ListTablesResponse { tables }))
 }
 
@@ -631,8 +663,12 @@ async fn snapshot(
     State(state): State<AppState>,
     Path(table_id): Path<String>,
     Query(q): Query<SnapshotQuery>,
-) -> Result<Json<SnapshotResponse>, AppError> {
-    let snap = state.store.get_snapshot(&table_id).await?;
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (snap, last_championship) =
+        state
+            .store
+            .get_snapshot_with_championship(&table_id)
+            .await?;
     if let Some(at_seq) = q.at_seq
         && at_seq != snap.seq
     {
@@ -661,10 +697,13 @@ async fn snapshot(
         .player_id
         .and_then(|pid| snap.private_view_for_player(&pid));
 
-    Ok(Json(SnapshotResponse {
+    let mut value = serde_json::to_value(SnapshotResponse {
         state: table_state,
         private,
-    }))
+    })
+    .map_err(|e| AppError::BadRequest(format!("serialize snapshot: {}", e)))?;
+    inject_last_championship_into(&mut value, &["scoreboard"], last_championship.as_ref());
+    Ok(Json(value))
 }
 
 #[derive(Debug, Deserialize)]

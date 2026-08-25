@@ -1,4 +1,4 @@
-use crate::game::card::{RuleContext, Suit, is_wild, natural_rank_value, parse_card_symbol};
+use crate::game::card::{RuleContext, Suit, is_wild, parse_card_symbol};
 
 pub struct WildcardResolver;
 
@@ -23,21 +23,10 @@ impl WildcardResolver {
             ));
         }
 
-        // 两张逢人配不能配在同一个单张（含同一张级牌）上
-        if wild_count >= 2 {
-            let mut target_ranks: Vec<u8> = Vec::new();
-            for t in targets {
-                let card = parse_card_symbol(t)?;
-                if let Ok(nat) = natural_rank_value(card.rank) {
-                    if target_ranks.contains(&nat) {
-                        return Err(
-                            "two wild cards cannot target the same rank".into(),
-                        );
-                    }
-                    target_ranks.push(nat);
-                }
-            }
-        }
+        // 房规（对齐 cards.js resolveWildcards）：两张逢人配允许配在同一个 rank 上
+        // （例如自然对 X + 双百搭都当 X，构成四张炸）。旧版「两张百搭不能同 rank」
+        // 的限制已按 JS 最终策略移除；纯自然炸弹不受影响。
+        // 仍然禁止：百搭表示王（下方逐张校验）。
 
         let mut resolved = Vec::with_capacity(parsed.len());
         let mut ti = 0usize;
@@ -93,5 +82,17 @@ mod tests {
         };
         let out = WildcardResolver::resolve(&cards, Some(&targets), ctx).unwrap();
         assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn dual_wilds_may_share_target_rank() {
+        // 房规：两张逢人配可配同一 rank（如双百搭都当 5，与自然对成四炸）。
+        let cards = vec!["♠5".into(), "♦5".into(), "♥2".into(), "♥2".into()];
+        let targets = vec!["♣5".into(), "♥5".into()];
+        let ctx = RuleContext {
+            hand_level: HandLevel::Two,
+        };
+        let out = WildcardResolver::resolve(&cards, Some(&targets), ctx).unwrap();
+        assert_eq!(out.len(), 4);
     }
 }

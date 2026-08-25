@@ -143,6 +143,16 @@ pub struct GameEngine {
     pub cfg: GameConfig,
 }
 
+/// 庄家方固定锚点席位（EW队→E，SN队→S）。
+/// 房规：`dealerSeat` 是「庄」标识，必须锚定庄家方席位，不能跟随 leader/轮转——
+/// 先出牌者可能是进贡的输家，会把庄标带错队伍（mirror JS `_buildHandJson` declarerAnchorSeat）。
+pub fn declarer_anchor_seat(declarer: TeamId) -> Seat {
+    match declarer {
+        TeamId::Ew => Seat::E,
+        TeamId::Sn => Seat::S,
+    }
+}
+
 impl GameEngine {
     pub fn new(cfg: GameConfig) -> Self {
         Self { cfg }
@@ -241,7 +251,40 @@ impl GameEngine {
 
         // All state mutations happen together AFTER all fallible operations succeed
         state.hand_index = new_hand_index;
+        // 房规：dealerSeat 锚定庄家方席位（EW→E，SN→S）
+        state.dealer_seat = declarer_anchor_seat(declarer);
         state.hand = Some(hand);
+        Ok(())
+    }
+
+    /// 房规：冠军后原地重开的第一手（mirror JS `_startNextHand` 的 `_rematchFromLevel2` 路径）。
+    /// 双方从 2 级、无进贡/还贡，从 E 逆时针发牌、由 E 先出（空完牌顺序回退），
+    /// `dealerSeat` 锚定庄家方（冠军队）席位；`leaderSeat` 语义不变（首出者）。
+    pub fn start_rematch_first_hand(
+        &self,
+        state: &mut TableGameState,
+        declarer: TeamId,
+    ) -> Result<(), String> {
+        state.hand_index += 1;
+        state.phase = GamePhase::Dealing;
+        let mut hand = HandState::new(HandLevel::Two);
+        let deck = Deck::new_shuffled_double_deck(self.cfg.rng_seed + state.hand_index as u64);
+        let dealt = deck.deal_27_each_ccw_from(Seat::E);
+        for s in Seat::ALL {
+            let cards = dealt
+                .get(&s)
+                .ok_or_else(|| "dealing missing seat".to_string())?
+                .iter()
+                .map(|c| to_card_symbol(*c))
+                .collect();
+            hand.hands.insert(s, cards);
+        }
+        state.winner_team = None;
+        state.hand = Some(hand);
+        state.dealer_seat = declarer_anchor_seat(declarer);
+        state.leader_seat = Seat::E;
+        state.turn_seat = Seat::E;
+        state.phase = GamePhase::Playing;
         Ok(())
     }
 }

@@ -4,7 +4,9 @@ use std::collections::HashSet;
 use std::collections::HashMap;
 
 use crate::domain::Seat;
-use crate::game::card::{RuleContext, is_wild, level_order_value, natural_rank_value, parse_card_symbol};
+use crate::game::card::{
+    Rank, RuleContext, Suit, is_wild, level_order_value, natural_rank_value, parse_card_symbol,
+};
 use crate::game::engine::PlayerAction;
 use crate::game::rules::beat_comparator::BeatComparator;
 use crate::game::rules::combination_parser::CombinationParser;
@@ -179,6 +181,144 @@ fn enumerate_wild_products(
     rec(pool, &mut buf, 0, &mut count, MAX_WILD_PRODUCT, &mut fmut);
 }
 
+/// Ascending natural-rank windows of length `k` over `vals` (deduped in place),
+/// including the A-low wrap (e.g. straight A2345, tube AA2233, plate AAA222).
+fn natural_windows(mut vals: Vec<u8>, k: usize) -> Vec<Vec<u8>> {
+    vals.sort_unstable();
+    vals.dedup();
+    let mut out = Vec::new();
+    if k > 0 && vals.len() >= k {
+        for i in 0..=(vals.len() - k) {
+            let w = &vals[i..i + k];
+            if w.windows(2).all(|p| p[1] == p[0] + 1) {
+                out.push(w.to_vec());
+            }
+        }
+    }
+    if k >= 2 {
+        // A-low: A(14) treated as lowest — {A,2} / {A,2,3} / {A,2,3,4,5}.
+        let low: Vec<u8> = (2u8..2u8 + (k as u8 - 1))
+            .chain(std::iter::once(14u8))
+            .collect();
+        if low.iter().all(|v| vals.contains(v)) && !out.contains(&low) {
+            out.push(low);
+        }
+    }
+    out
+}
+
+/// 房规（对齐 bot-advanced.js `findBestLeadPlay` 的 allTypes —— 现包含全部炸弹
+/// 类型，以及 `generatePlaysOfType` 的结构化生成）：领出/跟牌候选必须覆盖
+/// 同 rank 炸弹 4..=10、同花顺、四王炸与木板/钢板。
+///
+/// 通用 k 子集枚举受 [`MAX_COMBO_TRIES`] 预算限制：满手 27 张时 k>=6 的子集会
+/// 被截断（k=7..10 完全不会执行），导致大炸弹从领出候选中消失。这里按牌组
+/// 直接生成补齐；仅用纯自然牌，含百搭的变体仍由通用路径枚举。小手牌下产生的
+/// 动作与通用枚举重复，由 `seen` 去重，不改变行为。
+fn generate_structural_bombs_and_sequences(
+    h: &[String],
+    ctx: RuleContext,
+    top: Option<&crate::game::rules::combination_parser::Combination>,
+    out: &mut Vec<PlayerAction>,
+    seen: &mut HashSet<(Vec<String>, Option<Vec<String>>)>,
+) {
+    let mut rank_to_indices: HashMap<u8, Vec<usize>> = HashMap::new();
+    let mut suit_rank_index: HashMap<Suit, HashMap<u8, usize>> = HashMap::new();
+    let mut reds: Vec<usize> = Vec::new();
+    let mut blacks: Vec<usize> = Vec::new();
+    for (i, s) in h.iter().enumerate() {
+        let Ok(c) = parse_card_symbol(s) else {
+            continue;
+        };
+        if is_wild(c, ctx) {
+            continue;
+        }
+        match c.suit {
+            Suit::Joker => match c.rank {
+                Rank::RedJoker => reds.push(i),
+                Rank::BlackJoker => blacks.push(i),
+                _ => {}
+            },
+            _ => {
+                if let Ok(nat) = natural_rank_value(c.rank) {
+                    rank_to_indices.entry(nat).or_default().push(i);
+                    suit_rank_index
+                        .entry(c.suit)
+                        .or_default()
+                        .entry(nat)
+                        .or_insert(i);
+                }
+            }
+        }
+    }
+
+    // 同 rank 炸弹 n = 4..=min(count, 10)。
+    let mut ranks: Vec<u8> = rank_to_indices.keys().copied().collect();
+    ranks.sort_unstable();
+    for r in ranks {
+        let idxs = &rank_to_indices[&r];
+        let max_n = idxs.len().min(10);
+        for n in 4..=max_n {
+            let cards: Vec<String> = idxs.iter().take(n).map(|&i| h[i].clone()).collect();
+            push_play_unique(out, seen, cards, None, ctx, top);
+        }
+    }
+
+    // 四王炸：双红双黑。
+    if reds.len() >= 2 && blacks.len() >= 2 {
+        let cards = vec![
+            h[reds[0]].clone(),
+            h[reds[1]].clone(),
+            h[blacks[0]].clone(),
+            h[blacks[1]].clone(),
+        ];
+        push_play_unique(out, seen, cards, None, ctx, top);
+    }
+
+    // 同花顺：同花色 5 连自然 rank（含 A 低顺）。
+    for by_rank in suit_rank_index.values() {
+        let vals: Vec<u8> = by_rank.keys().copied().collect();
+        for w in natural_windows(vals, 5) {
+            let cards: Vec<String> = w.iter().map(|v| h[by_rank[v]].clone()).collect();
+            push_play_unique(out, seen, cards, None, ctx, top);
+        }
+    }
+
+    // 木板：三连对（含 A 低 AA2233）。
+    let pair_ranks: Vec<u8> = rank_to_indices
+        .iter()
+        .filter(|(_, v)| v.len() >= 2)
+        .map(|(&r, _)| r)
+        .collect();
+    for w in natural_windows(pair_ranks, 3) {
+        let cards: Vec<String> = w
+            .iter()
+            .flat_map(|v| rank_to_indices[v].iter().take(2))
+            .map(|&i| h[i].clone())
+            .collect();
+        if cards.len() == 6 {
+            push_play_unique(out, seen, cards, None, ctx, top);
+        }
+    }
+
+    // 钢板：两连三张（含 A 低 AAA222）。
+    let triple_ranks: Vec<u8> = rank_to_indices
+        .iter()
+        .filter(|(_, v)| v.len() >= 3)
+        .map(|(&r, _)| r)
+        .collect();
+    for w in natural_windows(triple_ranks, 2) {
+        let cards: Vec<String> = w
+            .iter()
+            .flat_map(|v| rank_to_indices[v].iter().take(3))
+            .map(|&i| h[i].clone())
+            .collect();
+        if cards.len() == 6 {
+            push_play_unique(out, seen, cards, None, ctx, top);
+        }
+    }
+}
+
 fn enumerate_playing(
     hand_state: &HandState,
     actor: Seat,
@@ -274,6 +414,11 @@ fn enumerate_playing(
             }
         }
     }
+
+    // 房规：候选必须包含全部炸弹类型（同 rank 4..=10、同花顺、四王）与
+    // 木板/钢板 —— 领出不得被限制在炸弹之外。置于预算受限的通用枚举之前，
+    // 保证大手牌时也不因 MAX_COMBO_TRIES 截断而缺失。
+    generate_structural_bombs_and_sequences(h, ctx, top, &mut out, &mut seen);
 
     // Generate k=3..=max_k via combinations
     for k in 3..=max_k {

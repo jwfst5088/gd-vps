@@ -1116,5 +1116,189 @@
         }
       })();
     </script>
+
+    <!-- ═══════════ 夺冠战报动画层（房规：A级双上夺冠，整场结束不回大厅） ═══════════ -->
+    <style>
+      #gxp-overlay {
+        position: fixed; inset: 0; z-index: 2147483000;
+        background: rgba(8, 12, 28, 0.82);
+        backdrop-filter: blur(4px);
+        display: none; align-items: center; justify-content: center;
+        font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      #gxp-overlay.gxp-show { display: flex; }
+      .gxp-card {
+        position: relative; text-align: center; padding: 44px 64px;
+        border-radius: 24px;
+        background: linear-gradient(160deg, rgba(30,40,80,.96), rgba(16,20,44,.96));
+        border: 1px solid rgba(255,215,100,.45);
+        box-shadow: 0 0 60px rgba(255,200,60,.35), inset 0 0 40px rgba(255,220,120,.08);
+        animation: gxp-pop .55s cubic-bezier(.2,1.6,.4,1) both;
+      }
+      .gxp-trophy {
+        font-size: 84px; line-height: 1;
+        animation: gxp-bounce 1.4s ease-in-out infinite;
+        filter: drop-shadow(0 0 18px rgba(255,210,80,.75));
+      }
+      .gxp-title {
+        margin-top: 14px; font-size: 34px; font-weight: 800; color: #ffe9a8;
+        letter-spacing: 2px;
+        text-shadow: 0 0 22px rgba(255,205,90,.65);
+      }
+      .gxp-sub { margin-top: 10px; font-size: 17px; color: #cdd6f4; }
+      .gxp-restart {
+        display: inline-block; margin-top: 18px; padding: 9px 22px;
+        border-radius: 999px; font-size: 15px; color: #101528; font-weight: 700;
+        background: linear-gradient(90deg,#ffd76e,#ffb347);
+        box-shadow: 0 4px 18px rgba(255,190,70,.45);
+      }
+      @keyframes gxp-pop {
+        0% { transform: scale(.55); opacity: 0; }
+        62% { transform: scale(1.06); opacity: 1; }
+        100% { transform: scale(1); }
+      }
+      @keyframes gxp-bounce {
+        0%,100% { transform: translateY(0); }
+        50% { transform: translateY(-14px); }
+      }
+      .gxp-confetti {
+        position: absolute; top: -24px; width: 10px; height: 16px;
+        border-radius: 2px; opacity: .95; pointer-events: none;
+        animation: gxp-fall linear forwards;
+      }
+      @keyframes gxp-fall {
+        to { transform: translateY(108vh) rotate(720deg); opacity: .85; }
+      }
+    </style>
+    <div id="gxp-overlay"></div>
+    <script>
+      (function () {
+        'use strict';
+        // 链接已有的 fetch 包装（[guard] 已包过一次），本包装再链一层
+        var _gxpOrigFetch = window.fetch;
+        var _gxpLastKey = null;
+
+        function teamName(id) {
+          return id === 'team_EW' ? 'EW（东西组）' : 'SN（南北组）';
+        }
+
+        function spawnConfetti(box) {
+          var colors = ['#ffd76e','#ff8fab','#7ee787','#79c0ff','#d2a8ff','#ffa657'];
+          for (var i = 0; i < 42; i++) {
+            var p = document.createElement('div');
+            p.className = 'gxp-confetti';
+            p.style.left = Math.random() * 100 + '%';
+            p.style.background = colors[i % colors.length];
+            p.style.animationDuration = (2.4 + Math.random() * 2.4) + 's';
+            p.style.animationDelay = (Math.random() * 1.6) + 's';
+            p.style.transform = 'rotate(' + Math.random() * 360 + 'deg)';
+            box.appendChild(p);
+          }
+        }
+
+        function showChampion(winnerId, reason) {
+          try {
+            var ov = document.getElementById('gxp-overlay');
+            if (!ov) {
+              ov = document.createElement('div');
+              ov.id = 'gxp-overlay';
+              document.body.appendChild(ov);
+            }
+            if (ov.classList.contains('gxp-show')) return;
+            var failLine = reason === 'aceFail'
+              ? '<div class="gxp-sub" style="color:#ff9b9b">💥 对方冲击A级三战失败（本场失败）</div>'
+              : '';
+            ov.innerHTML =
+              '<div class="gxp-card">' +
+                '<div class="gxp-trophy">🏆</div>' +
+                '<div class="gxp-title">' + teamName(winnerId) + ' A级双上，夺得本场冠军！</div>' +
+                failLine +
+                '<div class="gxp-restart">🎉 新一场即将开始：双方从 2 级重新对战！（12秒后自动发牌）</div>' +
+              '</div>';
+            spawnConfetti(ov);
+            requestAnimationFrame(function () { ov.classList.add('gxp-show'); });
+            var closed = false;
+            var close = function () {
+              if (closed) return;
+              closed = true;
+              ov.classList.remove('gxp-show');
+              setTimeout(function () { ov.innerHTML = ''; }, 250);
+            };
+            ov.addEventListener('click', close);
+            setTimeout(close, 9000); // 展示9秒后自动关闭
+            console.log('[champ-overlay] champion shown:', winnerId);
+          } catch (e) { console.error('[champ-overlay]', e); }
+        }
+
+        // 本应用两种响应形态：
+        //  /snapshot、/tables → 全量 JSON（tableState 或 tables[]，scoreboard 为顶层字段）
+        //  /nextstate → { seq, prevSeq, delta:{ ops:[{op:'replace'|'add', path:'/x/y', value}] } }（JSON Pointer 补丁）
+        function extractState(data) {
+          if (!data || typeof data !== 'object') return null;
+          if (data.scoreboard) return data;
+          if (data.state && data.state.scoreboard) return data.state;
+          var ops = data.delta && data.delta.ops;
+          if (ops && ops.length) {
+            var partial = null;
+            for (var i = 0; i < ops.length; i++) {
+              var o = ops[i];
+              if (!o || typeof o.path !== 'string') continue;
+              if (o.path === '/scoreboard' && o.value && typeof o.value === 'object') {
+                return { scoreboard: o.value };
+              }
+              var v = o.value;
+              if (v && typeof v === 'object' && v.scoreboard) return v;
+              // /nextstate 的细粒度补丁：/scoreboard/gameWinnerTeamId、/scoreboard/lastChampionship 等
+              if (o.path.indexOf('/scoreboard/') === 0) {
+                var sub = o.path.slice('/scoreboard/'.length);
+                if (sub.indexOf('/') < 0) {
+                  partial = partial || {};
+                  partial[sub] = o.value;
+                }
+              }
+            }
+            if (partial && ('gameWinnerTeamId' in partial || 'lastChampionship' in partial)) {
+              return { scoreboard: partial };
+            }
+          }
+          return null;
+        }
+
+        function inspect(data) {
+          try {
+            var st = extractState(data);
+            var sc = st && st.scoreboard;
+            if (!sc || !sc.gameWinnerTeamId) return;
+            var champ = sc.lastChampionship || {};
+            var at = Number(champ.at || 0);
+            // 新鲜度：仅展示90秒内的冠军事件，避免迟到客户端弹出历史战报
+            if (!at || Date.now() - at > 90000) return;
+            var winnerId = String(sc.gameWinnerTeamId || champ.winnerTeamId || champ.winnerId || '');
+            if (!winnerId) return;
+            var key = at + '|' + winnerId;
+            if (key === _gxpLastKey) return;
+            _gxpLastKey = key;
+            showChampion(winnerId, champ.reason || 'champion');
+          } catch (e) { console.error('[champ-overlay] inspect', e); }
+        }
+
+        // 拦截轮询响应，检测夺冠标记（scoreboard 随状态暴露）
+        window.fetch = function () {
+          var args = arguments;
+          var url = String((args[0] && args[0].url) || args[0] || '');
+          return _gxpOrigFetch.apply(this, args).then(function (resp) {
+            try {
+              if (url.indexOf('/nextstate') >= 0 || url.indexOf('/snapshot') >= 0 ||
+                  url.indexOf('/tables') >= 0) {
+                resp.clone().json().then(inspect).catch(function () {});
+              }
+            } catch (e) {}
+            return resp;
+          });
+        };
+
+        console.log('[champ-overlay] ready');
+      })();
+    </script>
   </body>
 </html>
