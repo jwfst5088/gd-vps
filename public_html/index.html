@@ -1175,7 +1175,10 @@
         var _gxpLastKey = null;
 
         function teamName(id) {
-          return id === 'team_EW' ? 'EW（东西组）' : 'SN（南北组）';
+          var s = String(id || '').toUpperCase();
+          if (s.indexOf('SN') >= 0) return 'SN（南北组）';
+          if (s.indexOf('EW') >= 0) return 'EW（东西组）';
+          return String(id || '');
         }
 
         function spawnConfetti(box) {
