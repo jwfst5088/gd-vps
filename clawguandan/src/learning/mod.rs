@@ -72,7 +72,7 @@ pub fn run_learning_with_progress(
     let mut resumed_best_score = 0.0f32;
     let mut has_resumed_state = false;
 
-    let state_file = std::path::Path::new("/home/Cooki/domains/gg.meaigo.eu.org/clawguandan/learning_state.json");
+    let state_file = std::path::Path::new("./learning_state.json");
     if state_file.exists() {
         if let Ok(content) = std::fs::read_to_string(state_file) {
             if let Ok(saved_state) = serde_json::from_str::<crate::learning::task_manager::SavedLearningState>(&content) {

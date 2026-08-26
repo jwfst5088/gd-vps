@@ -734,8 +734,9 @@ async fn start_bot_process(
     bot_type: &str,
     players: Option<usize>,
 ) -> std::result::Result<u32, String> {
-    let bot_binary = "/home/Cooki/domains/gg.meaigo.eu.org/clawguandan/target/release/clawguandan";
-    let bot_working_dir = "/home/Cooki/domains/gg.meaigo.eu.org/clawguandan";
+    // 房规可移植性：以当前工作目录定位二进制
+    let bot_binary = "./target/release/clawguandan";
+    let bot_working_dir = ".";
 
     let mut cmd = StdCommand::new(bot_binary);
     cmd.current_dir(bot_working_dir);
@@ -864,8 +865,8 @@ async fn start_learn_api(
         body.mode, body.matches_per_eval, body.iterations, body.population_size, body.output_path
     );
     
-    let output_path = "/home/Cooki/domains/gg.meaigo.eu.org/clawguandan/advanced_params.json";
-    match crate::learning::start_learning(body.matches_per_eval, body.iterations, output_path, &body.mode, body.population_size) {
+    let output_path = "advanced_params.json".to_string();
+    match crate::learning::start_learning(body.matches_per_eval, body.iterations, &output_path, &body.mode, body.population_size) {
         Ok(job_id) => {
             let matches = body.matches_per_eval;
             let iterations = body.iterations;
@@ -873,9 +874,9 @@ async fn start_learn_api(
             let population_size = body.population_size;
             
             tokio::task::spawn_blocking(move || {
-                let base_dir = "/home/Cooki/domains/gg.meaigo.eu.org/clawguandan";
+                let base_dir = ".";
                 let logs_path = format!("{}/game_logs.jsonl", base_dir);
-                let output_path = "/home/Cooki/domains/gg.meaigo.eu.org/clawguandan/advanced_params.json";
+                let output_path = "advanced_params.json".to_string();
                 
                 let result = match mode.as_str() {
                     "genetic" => crate::learning::run_genetic_learning_with_progress(

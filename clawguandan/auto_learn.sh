@@ -4,7 +4,8 @@
 #  → ③经 /api/v1/learn 训练(有≥5条真人局用 record 真日志模式,否则 selfplay)
 #  → ④17键范围校验 ⑤原子换参+备份(留5份) ⑥重启+ping校验(失败回滚)
 #  → ⑦发布 public_html/auto_params.json 镜像供 CF 端运行时跟随
-BASE=/home/Cooki/domains/gg.meaigo.eu.org
+# 房规可移植性：以脚本所在目录的上一级为站点根（脚本位于 <域名目录>/clawguandan/ 内）
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$BASE/clawguandan" || exit 0
 LOG=auto_train.log
 

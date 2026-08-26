@@ -28,7 +28,7 @@ pub fn is_running_generation(generation: u64) -> bool {
     is_running()
 }
 
-const STATE_FILE: &str = "/home/Cooki/domains/gg.meaigo.eu.org/clawguandan/learning_state.json";
+const STATE_FILE: &str = "./learning_state.json";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

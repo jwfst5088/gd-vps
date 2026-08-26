@@ -17,8 +17,10 @@ pub struct AdvancedBotPlugin {
 
 impl Default for AdvancedBotPlugin {
     fn default() -> Self {
-        let params_path = "/home/Cooki/domains/gg.meaigo.eu.org/clawguandan/advanced_params.json";
-        let params = AdvancedBotParams::load(params_path).unwrap_or_else(|_| {
+        // 房规可移植性：默认相对 cwd（daemon/bot 均以部署目录为 cwd），可用 CLAW_PARAMS_PATH 覆盖
+        let params_path = std::env::var("CLAW_PARAMS_PATH")
+            .unwrap_or_else(|_| "./advanced_params.json".to_string());
+        let params = AdvancedBotParams::load(&params_path).unwrap_or_else(|_| {
             eprintln!("[advanced-bot] No {} found, using default balanced profile", params_path);
             AdvancedBotParams::default_balanced()
         });
