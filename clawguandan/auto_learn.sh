@@ -25,7 +25,7 @@ if [ "$FORCED" = "bg" ] || [ "$FORCED" = "forced" ] || [ "$FORCED" = "finalize" 
 else
   { [ "$N" -ge 30 ] && [ "$DIFF" -ge 30 ]; } || exit 0
   LR=$(cat .learn_last_run 2>/dev/null || echo 0); NOW=$(date +%s)
-  [ $((NOW - LR)) -lt 21600 ] && exit 0
+  [ $((NOW - LR)) -lt 259200 ] && exit 0
   nohup /bin/sh "$0" bg >> auto_train.log 2>&1 &
   echo "$(date '+%F %T') 已派发后台学习任务" >> $LOG
   exit 0
