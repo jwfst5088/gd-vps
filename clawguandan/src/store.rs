@@ -704,6 +704,8 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
                 ew_a_fails,
                 sn_a_fails,
             );
+            // 房规：每一手结束都落账（含普通手），供学习管线统计真人打法。
+            Self::log_game_result(inner, &completed_order, winner);
         }
 
         inner.state.seq += 1;
@@ -1798,9 +1800,7 @@ impl TableStore {
             }
         }
         
-        if bot_seats.is_empty() {
-            return;
-        }
+        // 房规：纯真人局同样落账（学习统计需要人类打法样本），不再因无 AI 而丢弃。
         
         let mut actions = Vec::new();
         for entry in &hand.history {
@@ -1820,6 +1820,9 @@ impl TableStore {
             .map(|s| s.as_str().to_string())
             .collect();
         
+        // 先快照参数（bot_seats 随后会被结构体字面量移动）
+        let current_params = load_current_bot_params(&bot_seats);
+
         let entry = GameLogEntry {
             game_id: uuid::Uuid::new_v4().to_string(),
             table_id: game.table_id.clone(),
@@ -1829,7 +1832,7 @@ impl TableStore {
             winner_team: team_to_str(winner),
             bot_seats,
             human_seats,
-            bot_params: None,
+            bot_params: current_params,
             actions,
             hand_level: hand.hand_level.as_api_str().to_string(),
         };
@@ -1838,7 +1841,17 @@ impl TableStore {
     }
 }
 
-#[cfg(feature = "test-utils")]
+/// 房规：对局落账时快照当前训练参数（advanced_params.json）。
+/// 纯真人局没有参数可记，返回 None；读取失败也不影响记录本身。
+fn load_current_bot_params(bot_seats: &[String]) -> Option<crate::bot::plugins::AdvancedBotParams> {
+    if bot_seats.is_empty() {
+        return None;
+    }
+    std::fs::read_to_string("./advanced_params.json")
+        .ok()
+        .and_then(|s| serde_json::from_str::<crate::bot::plugins::AdvancedBotParams>(&s).ok())
+}
+#[cfg(feature = "test-utils")]#[cfg(feature = "test-utils")]
 impl TableStore {
     /// Replace in-memory engine state (preserves `seq` and transition log).
     /// Hidden hook for integration tests; not part of the public HTTP contract.

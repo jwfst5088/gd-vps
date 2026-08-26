@@ -603,6 +603,12 @@ pub(crate) enum Top {
         #[arg(short = 'o', long, default_value = "advanced_params.json")]
         output: String,
     },
+    /// 统计对局日志中真人 vs AI 的出牌习惯（只读报告）
+    Stats {
+        /// Path to game logs JSONL file (default: game_logs.jsonl)
+        #[arg(short = 'f', long, default_value = "game_logs.jsonl")]
+        log_file: String,
+    },
     /// Show embedded reference material (no server required)
     Show {
         #[command(subcommand)]
@@ -1085,6 +1091,10 @@ pub fn run_from_top(command: Top) -> Result<(), String> {
         } => {
             use clawguandan::learning::run_learning_from_logs;
             run_learning_from_logs(&log_file, iterations, &output)
+        }
+        Top::Stats { log_file } => {
+            use clawguandan::learning::human_stats;
+            human_stats::run(&log_file)
         }
         Top::Show { cmd } => match cmd {
             ShowCmd::Rules { lang } => {

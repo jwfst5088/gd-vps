@@ -11,6 +11,7 @@ mod optimizer;
 mod genetic_optimizer;
 mod record_learner;
 pub mod game_logger;
+pub mod human_stats;
 mod task_manager;
 pub use optimizer::{HillClimbConfig, optimize, EvalResult, SelfPlayConfig};
 pub use genetic_optimizer::{GeneticConfig, genetic_optimize};
