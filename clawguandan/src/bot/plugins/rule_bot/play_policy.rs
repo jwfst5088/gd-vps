@@ -28,6 +28,11 @@ impl PlayPolicy for RulePlayPolicy {
             return Ok(BotDecision::UseSuggest);
         }
 
+        // ── 房规：只剩最后1张必打（清空夺头游），让牌启发式不得拦截 ──
+        if features.can_pass && features.can_play && features.my_hand_count == 1 {
+            return Ok(BotDecision::UseSuggest);
+        }
+
         let (picked, trace) = choose_play_candidate(&self.params, &features);
         if self.params.enable_reason_trace {
             eprintln!(

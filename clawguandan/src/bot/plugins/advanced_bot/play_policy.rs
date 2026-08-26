@@ -114,6 +114,13 @@ impl PlayPolicy for AdvancedPlayPolicy {
         drop(tracker);
         let reasoner = ProbabilisticReasoner::new(tracker_clone);
 
+        // ── 房规（mirror gd.rmyy.nyc.mn decideAdvancedPlay「只剩1张必打」）──────
+        // 只剩最后1张且能出牌时，立即交由 suggest 强制打出清空夺头游；
+        // 任何让牌启发式（压队友大牌/疑似炸弹/队友冲刺/胜率保守等）不得拦截。
+        if can_pass && can_play && my_hand.len() == 1 {
+            return Ok(BotDecision::UseSuggest);
+        }
+
         let partner_leading = top_play_seat == Some(teammate_seat);
         let enemy_leading = top_play_seat.is_some() && !partner_leading;
 
