@@ -702,13 +702,44 @@ fn pick_playing(
         }
         let p = build_play_context(hand, actor, ctx);
         let mut best: Option<(f32, &Candidate)> = None;
+        let mut best_non_bomb: Option<(f32, &Candidate)> = None;
         for cand in &candidates {
             let s = score_lead(cand.cards, &cand.combo, &p);
             if best.map_or(true, |(bs, _)| s > bs) {
                 best = Some((s, cand));
             }
+            if cand.combo.class() != CombinationClass::Bomb
+                && best_non_bomb.map_or(true, |(bs, _)| s > bs)
+            {
+                best_non_bomb = Some((s, cand));
+            }
         }
-        return Ok(best.expect("candidates non-empty").1.action.clone());
+        let (_, best_cand) = best.expect("candidates non-empty");
+        // ── 房规（用户）：中盘主动出炸后，剩余手牌重新清点炸弹数（含潜在炸）——
+        //    剩 0 → 改出非炸最优牌；无非炸候选（整手皆炸）时维持原炸（打完仍剩其余炸）。
+        //    豁免：残局（≤6 张）、对手冲刺（≤6 张）、清空出牌。
+        {
+            let is_endgame = p.my_remaining <= 6;
+            let is_opp_sprinting = p.min_opp_remaining <= 6;
+            if best_cand.combo.class() == CombinationClass::Bomb
+                && !is_endgame
+                && !is_opp_sprinting
+                && best_cand.cards.len() < p.my_remaining
+            {
+                let rest: Vec<String> = p
+                    .my_hand
+                    .iter()
+                    .filter(|c| !best_cand.cards.contains(*c))
+                    .cloned()
+                    .collect();
+                if analyze_hand_combos(&rest, ctx).bomb_count == 0 {
+                    if let Some((_, alt)) = best_non_bomb {
+                        return Ok(alt.action.clone());
+                    }
+                }
+            }
+        }
+        return Ok(best_cand.action.clone());
     };
 
     // 跟牌：Pass 必然在合法动作中（movegen 保证）
@@ -876,6 +907,25 @@ fn find_best_play_follow<'a>(
     //      2 个炸弹不再拦；"手里 ≥3 个炸可用"的豁免由条件 =1 自然排除）
     if best_is_bomb && !is_endgame && !is_opp_sprinting && p.combos.bomb_count == 1 {
         return Ok(PlayerAction::Pass);
+    }
+
+    // ①b 炸弹保留·事后重算（用户房规）：中盘出炸（含反炸）后，对剩余手牌重新清点
+    //    炸弹数（天然 4+ 同张、百搭拼 3 同张、同花顺候选全部重算）——剩 0 → 不出，
+    //    保炸到残局。解决"潜在炸共用百搭导致账面虚增"（如 ♠6789+♥6789+♥2 账面 2 颗、
+    //    打掉一颗后实际 0 颗）。豁免：残局（≤6 张）、对手冲刺（≤6 张）、炸完直接清空。
+    if best_is_bomb && !is_endgame && !is_opp_sprinting && best_cards.len() < my_remaining {
+        let rest: Vec<String> = p
+            .my_hand
+            .iter()
+            .filter(|c| !best_cards.contains(*c))
+            .cloned()
+            .collect();
+        let rest_ctx = RuleContext {
+            hand_level: p.ctx.hand_level,
+        };
+        if analyze_hand_combos(&rest, rest_ctx).bomb_count == 0 {
+            return Ok(PlayerAction::Pass);
+        }
     }
 
     // ③ 绝对禁止：队友出牌时，绝不能使用炸弹压队友的牌 (JS 664-669)
@@ -2747,6 +2797,51 @@ mod tests {
                 );
             }
             _ => panic!("Expected Play (bomb on big top), got {:?}", picked),
+        }
+    }
+
+    #[test]
+    fn counter_bomb_blocked_by_post_play_recount_shared_wild() {
+        // 用户房规：中盘反炸后剩余炸弹数（含潜在炸，重算）= 0 → 不出。
+        // 手 [♠5,♥5,♦5,♥2,♠6,♠7,♠8,♠9]（8 张中盘）：账面 2 颗（百搭拼 555 炸 + ♠6789 拼同花顺），
+        // 但两颗潜在炸共用 ♥2——反炸打掉任意一颗后实际剩 0 → 必须 Pass 保炸。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♠5", "♥5", "♦5", "♥2", "♠6", "♠7", "♠8", "♠9"],
+            Some((Seat::N, vec!["♣4", "♦4", "♥4", "♠4"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♣5", "♦5", "♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♣8"],
+            vec!["♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J", "♣J", "♠Q"],
+            vec!["♣Q", "♥Q", "♦Q", "♠K", "♣K", "♦K", "♠A", "♥A", "♦A"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        assert_eq!(
+            picked,
+            PlayerAction::Pass,
+            "反炸会把最后一颗（潜在）炸耗尽（共用百搭），中盘必须 Pass 保炸"
+        );
+    }
+
+    #[test]
+    fn two_bombs_counter_allowed_when_post_play_bombs_remain() {
+        // 用户房规对照：两颗独立炸（天然 5555 + 百搭拼 666）中盘反炸 4 炸后仍剩 1 颗 → 允许出。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♠5", "♥5", "♦5", "♣5", "♠6", "♥6", "♦6", "♥2"],
+            Some((Seat::N, vec!["♣4", "♦4", "♥4", "♠4"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♣7", "♥7", "♦7", "♣8", "♥8", "♦8", "♣9", "♥9", "♦9"],
+            vec!["♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J", "♣J", "♠Q"],
+            vec!["♣Q", "♥Q", "♦Q", "♠K", "♣K", "♦K", "♠A", "♥A", "♦A"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { .. } => {}
+            other => panic!("两颗独立炸中盘反炸（打完剩 1 颗）应允许，got {:?}", other),
         }
     }
 
