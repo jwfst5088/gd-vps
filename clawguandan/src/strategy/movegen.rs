@@ -4,9 +4,7 @@ use std::collections::HashSet;
 use std::collections::HashMap;
 
 use crate::domain::Seat;
-use crate::game::card::{
-    Rank, RuleContext, Suit, is_wild, level_order_value, natural_rank_value, parse_card_symbol,
-};
+use crate::game::card::{HandLevel, Rank, RuleContext, Suit, is_wild, level_order_value, natural_rank_value, parse_card_symbol};
 use crate::game::engine::PlayerAction;
 use crate::game::rules::beat_comparator::BeatComparator;
 use crate::game::rules::combination_parser::CombinationParser;
@@ -377,8 +375,35 @@ fn enumerate_playing(
         }
     }
 
-    // Generate k=2 (pairs) directly: group by rank to avoid duplicates
+    // Generate k=2 (pairs) directly: group by rank to avoid duplicates.
+    // 含百搭的对子必须生成：此前组索引跳过百搭（组内 wilds_in_card 恒为空，
+    // enumerate_wild_products 分支是死代码），导致 [自然单张X, 百搭] 领出只能单出 X、
+    // 跟牌无法用百搭配对压小对子，百搭必然沦为最后一张单牌（用户反馈的
+    // 「最后一张是百搭」主因）。组 = 同 rank 自然牌 ∪ 全部百搭；
+    // 单百搭目标取组内自然牌本身（同 rank 复制，合法且枚举最小）。
     if n >= 2 {
+        let wild_indices: Vec<usize> = (0..n).filter(|&i| hand_wild_positions[i]).collect();
+        let mut seen_pairs: HashSet<Vec<String>> = HashSet::new();
+        // 双百搭对子：两百搭可同 rank 成对（房规），目标取池中首个非百搭符号。
+        if wild_indices.len() >= 2 {
+            let mut cards = vec![h[wild_indices[0]].clone(), h[wild_indices[1]].clone()];
+            cards.sort();
+            if seen_pairs.insert(cards.clone()) {
+                if let Some(t) = pool.iter().find(|s| {
+                    parse_card_symbol(s).ok().map(|c| !is_wild(c, ctx)).unwrap_or(false)
+                }) {
+                    let target = t.clone();
+                    push_play_unique(
+                        &mut out,
+                        &mut seen,
+                        cards,
+                        Some(vec![target.clone(), target]),
+                        ctx,
+                        top,
+                    );
+                }
+            }
+        }
         let mut rank_to_indices: HashMap<u8, Vec<usize>> = HashMap::new();
         for i in 0..n {
             if hand_wild_positions[i] { continue; }
@@ -388,26 +413,31 @@ fn enumerate_playing(
                 }
             }
         }
-        let mut seen_pairs: HashSet<Vec<String>> = HashSet::new();
         for indices in rank_to_indices.values() {
-            if indices.len() < 2 { continue; }
-            for a in 0..indices.len() {
-                for b in (a+1)..indices.len() {
-                    let mut cards = vec![h[indices[a]].clone(), h[indices[b]].clone()];
+            // 组 = 该 rank 的自然牌 + 全部百搭（百搭可当任意 rank，含本组）
+            let mut group: Vec<usize> = indices.clone();
+            group.extend_from_slice(&wild_indices);
+            for a in 0..group.len() {
+                for b in (a + 1)..group.len() {
+                    let mut cards = vec![h[group[a]].clone(), h[group[b]].clone()];
                     cards.sort();
-                    if seen_pairs.insert(cards.clone()) {
-                        // Check wildcard interactions
-                        let wilds_in_card: Vec<usize> = (0..2).filter(|&j| {
-                            parse_card_symbol(&cards[j]).ok().map(|c| is_wild(c, ctx)).unwrap_or(false)
-                        }).collect();
-                        if wilds_in_card.is_empty() {
+                    if !seen_pairs.insert(cards.clone()) {
+                        continue;
+                    }
+                    let is_wild_at = |j: usize| {
+                        parse_card_symbol(&cards[j]).ok().map(|c| is_wild(c, ctx)).unwrap_or(false)
+                    };
+                    match (is_wild_at(0), is_wild_at(1)) {
+                        (false, false) => {
                             push_play_unique(&mut out, &mut seen, cards, None, ctx, top);
-                        } else {
-                            let wn = wilds_in_card.len();
-                            enumerate_wild_products(&pool, wn, |targets| {
-                                push_play_unique(&mut out, &mut seen, cards.clone(), Some(targets.to_vec()), ctx, top);
-                                true
-                            });
+                        }
+                        (false, true) | (true, false) => {
+                            // 自然牌 + 百搭：目标取自然牌本身（同 rank 复制，必然合法）
+                            let natural = if is_wild_at(0) { cards[1].clone() } else { cards[0].clone() };
+                            push_play_unique(&mut out, &mut seen, cards, Some(vec![natural]), ctx, top);
+                        }
+                        (true, true) => {
+                            // 纯双百搭对子已由上方专块生成，跳过
                         }
                     }
                 }
@@ -583,5 +613,71 @@ pub fn enumerate_legal_actions(
         GamePhase::Scoring | GamePhase::Dealing | GamePhase::TableSetup | GamePhase::Completed => {
             Ok(vec![])
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::card::HandLevel;
+    use crate::game::types::{HandState, PlayState};
+
+    fn ctx() -> RuleContext {
+        RuleContext { hand_level: HandLevel::Two }
+    }
+
+    fn lead_actions(hand_cards: Vec<&str>) -> Vec<PlayerAction> {
+        let mut hand = HandState::new(HandLevel::Two);
+        hand.hands.insert(Seat::E, hand_cards.into_iter().map(ToString::to_string).collect());
+        for seat in Seat::ALL {
+            hand.hands.entry(seat).or_insert_with(Vec::new);
+        }
+        enumerate_playing(&hand, Seat::E, ctx()).unwrap()
+    }
+
+    #[test]
+    fn pair_with_wild_is_generated_for_lead() {
+        // [♠9, ♥2(级2百搭)] 领出：必须含对 9（百搭当 9）的候选。
+        let acts = lead_actions(vec!["♠9", "♥2"]);
+        let has_wild_pair = acts.iter().any(|a| matches!(a,
+            PlayerAction::Play { cards, wild_targets }
+            if cards.len() == 2 && wild_targets.is_some()
+        ));
+        assert!(has_wild_pair, "wild pair must be a lead candidate: {:?}", acts);
+    }
+
+    #[test]
+    fn natural_pair_and_wild_pairs_exist_in_bigger_hand() {
+        // [♠9, ♦9, ♥2(百搭)]：应有自然对 ♠9♦9，以及百搭与每个 9 的对子。
+        let acts = lead_actions(vec!["♠9", "♦9", "♥2"]);
+        let nine_pairs: Vec<_> = acts.iter().filter(|a| matches!(a,
+            PlayerAction::Play { cards, .. } if cards.len() == 2
+        )).collect();
+        assert!(nine_pairs.len() >= 3, "expected natural pair + wild pairs (≥3), got {:?}", nine_pairs);
+    }
+
+    #[test]
+    fn double_wild_pair_is_generated() {
+        // [♥2, ♥2]（两张级2红桃2）：应生成双百搭对子。
+        let acts = lead_actions(vec!["♥2", "♥2"]);
+        let has_double_wild_pair = acts.iter().any(|a| matches!(a,
+            PlayerAction::Play { cards, wild_targets }
+            if cards.len() == 2 && wild_targets.as_ref().map_or(false, |wt| wt.len() == 2)
+        ));
+        assert!(has_double_wild_pair, "double wild pair must be generated: {:?}", acts);
+    }
+
+    #[test]
+    fn wild_bomb_from_three_naturals_plus_wild_is_generated() {
+        // [♠5,♥5,♦5,♠8,♥2(百搭)]：3张5+百搭必须能组成 5555 炸弹候选
+        //（残局百搭转化规则依赖该候选存在）。
+        let acts = lead_actions(vec!["♠5", "♥5", "♦5", "♠8", "♥2"]);
+        let has_wild_bomb = acts.iter().any(|a| matches!(a,
+            PlayerAction::Play { cards, .. }
+            if cards.len() == 4
+                && cards.iter().filter(|c| c.as_str().ends_with('5')).count() == 3
+                && cards.iter().any(|c| c.as_str() == "♥2")
+        ));
+        assert!(has_wild_bomb, "wild-assisted bomb (3 fives + wild) must be a candidate: {:?}", acts);
     }
 }

@@ -1,39 +1,50 @@
 //! Deterministic choice among [`super::enumerate_legal_actions`] for a single actor.
 //!
-//! Strategy improvements over the baseline:
-//! - Hand composition analysis to avoid splitting bombs/straights/triples
-//! - Endgame mode (≤6 cards): prioritize clearing more cards when leading
-//! - Teammate sprint support: play supportive card types when teammate is close to winning
-//! - Opponent sprint interrupt: prefer bombs/intercepts when opponent is close to winning
-//! - Bomb conservation: 1 bomb → save for midgame; endgame 1 bomb → use to win
-//! - Joker respect: early game only (my_remaining > 10), don't bomb jokers/level cards when bombs < 3
-//! - Endgame bomb: 1 bomb in endgame → play small cards first, use bomb to win (not hold forever)
-//! - Straight priority: prefer straights that consume ≥3 single cards, even if it means splitting combos
-//! - Pass as strategic choice: Pass competes with plays in scoring, enabling bomb conservation
-//! - Endgame cleanup: clear small singles when following in endgame, keep big cards + bombs
-//! - Bomb sizing: prefer smaller bombs (4-card) over bigger bombs, straight flush, or four joker
+//! **1:1 port of the JavaScript rule standard** (`gd-cloudflare-main/src/bot-advanced.js`):
+//! - [`decide_follow`]      ⇔ JS `decideAdvancedPlay` (pass/play heuristic, JS 460-611)
+//! - [`find_best_play_follow`] ⇔ JS `findBestPlay` (sort + hard guards, JS 622-725)
+//! - [`score_follow`]       ⇔ JS `scorePlay` (follow scoring, base 100, JS 732-1157)
+//! - [`score_lead`]         ⇔ JS `scoreLeadPlay` (lead scoring, base 50, JS 1465-1992)
+//! - [`analyze_hand_combos`] ⇔ JS `analyzeHandCombos` (JS 1215-1320)
+//! - [`classify_bomb_split`] ⇔ JS `classifyBombSplit` (JS 1330-1363)
+//! - [`split_penalty`]      ⇔ JS `splitPenalty` (JS 1381-1457)
+//!
+//! Scoring contract (mirrors JS exactly):
+//! - `f32` scores, **higher is better**.
+//! - Probability-dependent terms (`probOpponentCanFollow`, `probOpponentHasBomb`,
+//!   `calculateGameWinProb`) contribute **0** — 无牌踪器，概率项置 0 (no card tracker in
+//!   this port); every deterministic term is kept verbatim.
+//! - Seat remaining counts are read directly from `state.hand.hands` (`len`);
+//!   `min_opp_remaining` = min of the two opponents; teammate = `Seat::teammate`.
+//!
+//! The old Rust-only rules (tier 0/1 wild slots, stall penalty, endgame tidiness bonus,
+//! level-empty-single penalty, redundant-wild penalty, dedicated clearing fast path, …)
+//! were removed: JS is the single source of truth. Clearing emerges from the `+10000`
+//! in-score bonus plus the "last card → forced play" exception (JS 488-497).
 
-use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+use crate::bot::plugins::advanced_bot::AdvancedBotParams;
 use crate::domain::Seat;
 use crate::game::card::{
-    is_wild, level_order_value, natural_rank_value, parse_card_symbol, RuleContext,
+    is_wild, level_order_value, natural_rank_value, parse_card_symbol, Rank, RuleContext, Suit,
 };
 use crate::game::engine::PlayerAction;
 use crate::game::rules::combination_parser::{
-    BombKind, CombinationClass, CombinationKind, CombinationParser, OrdinaryKind,
+    BombKind, Combination, CombinationClass, CombinationKind, CombinationParser, OrdinaryKind,
 };
-use crate::game::types::{GamePhase, HandState, TableGameState};
+use crate::game::types::{GamePhase, HandState, PlayState, TableGameState};
 
 use super::enumerate_legal_actions;
 
-// ── Learning params (global store for AI self-learning) ──
-// When set, the strategy uses these weights instead of hardcoded values.
-// Set by the learning module before running self-play evaluations.
-use crate::bot::plugins::advanced_bot::AdvancedBotParams;
+// ── Learning params (global store for AI self-learning) ────────────────
+// Interface kept for `crate::learning` (set_learn_params_for_teams). When set, the
+// heuristic weights come from training; otherwise the JS `TRAINED_PARAMS` defaults
+// (the rule standard) are used.
 static LEARN_PARAMS: Mutex<Option<AdvancedBotParams>> = Mutex::new(None);
+static LEARN_PARAMS_NS: Mutex<Option<AdvancedBotParams>> = Mutex::new(None);
+static LEARN_PARAMS_EW: Mutex<Option<AdvancedBotParams>> = Mutex::new(None);
 
 /// Set the global learning parameters. Pass `None` to reset to defaults.
 pub fn set_learn_params(params: Option<AdvancedBotParams>) {
@@ -42,27 +53,8 @@ pub fn set_learn_params(params: Option<AdvancedBotParams>) {
     }
 }
 
-/// Get the current learning parameters (or None if using defaults).
-fn get_learn_params() -> Option<AdvancedBotParams> {
-    LEARN_PARAMS.lock().ok().and_then(|lock| lock.clone())
-}
-
-// ── Team-specific learning params (asymmetric training) ──
-// When set, NS team (S/N seats) uses LEARN_PARAMS_NS, EW team (E/W) uses LEARN_PARAMS_EW.
-// Falls back to the generic LEARN_PARAMS when the team-specific slot is None.
-// This breaks NS/EW symmetry in self-play so the optimizer can actually tell whether a
-// candidate param set plays better than the baseline, instead of seeing ~50% win rate
-// regardless of params.
-static LEARN_PARAMS_NS: Mutex<Option<AdvancedBotParams>> = Mutex::new(None);
-static LEARN_PARAMS_EW: Mutex<Option<AdvancedBotParams>> = Mutex::new(None);
-
 /// Set team-specific learning parameters for asymmetric self-play evaluation.
-/// Pass `(Some(candidate), Some(baseline))` to evaluate candidate (NS) vs baseline (EW).
-/// Pass `None` for both to reset to symmetric mode (uses generic LEARN_PARAMS).
-pub fn set_learn_params_for_teams(
-    ns: Option<AdvancedBotParams>,
-    ew: Option<AdvancedBotParams>,
-) {
+pub fn set_learn_params_for_teams(ns: Option<AdvancedBotParams>, ew: Option<AdvancedBotParams>) {
     if let Ok(mut lock) = LEARN_PARAMS_NS.lock() {
         *lock = ns;
     }
@@ -71,9 +63,11 @@ pub fn set_learn_params_for_teams(
     }
 }
 
-/// Get learning parameters for a specific seat.
-/// Priority: team-specific (NS/EW) > generic LEARN_PARAMS > None.
-fn get_learn_params_for_seat(seat: Seat) -> Option<AdvancedBotParams> {
+fn get_learn_params() -> Option<AdvancedBotParams> {
+    LEARN_PARAMS.lock().ok().and_then(|lock| lock.clone())
+}
+
+fn get_params_for_seat(seat: Seat) -> AdvancedBotParams {
     let team_lock = match seat {
         Seat::S | Seat::N => LEARN_PARAMS_NS.lock(),
         _ => LEARN_PARAMS_EW.lock(),
@@ -82,33 +76,137 @@ fn get_learn_params_for_seat(seat: Seat) -> Option<AdvancedBotParams> {
         .ok()
         .and_then(|l| l.clone())
         .or_else(get_learn_params)
+        .unwrap_or_else(js_trained_params)
 }
 
-// ── Hand composition analysis ──────────────────────────────────────────
+/// JS `TRAINED_PARAMS` (bot-advanced.js L49-69) — the rule-standard defaults.
+fn js_trained_params() -> AdvancedBotParams {
+    AdvancedBotParams {
+        team_win_weight: 1.0,
+        first_out_weight: 0.7657717,
+        second_out_weight: 0.9,
+        yield_to_partner_bias: 1.4,
+        partner_sprint_threshold: 2,
+        bomb_conserve_bias: 0.8,
+        bomb_aggression_when_enemy_low: 2.2148905,
+        enemy_low_cards_threshold: 6, // 用户房规：冲刺 = 任一对手剩 ≤6 张（JS 原值 3）
+        endgame_hand_count_threshold: 6,
+        endgame_clear_hand_bias: 1.2,
+        proactive_play_bias: 1.1,
+        low_card_dump_bias: 1.4,
+        pass_stall_penalty: 0.9,
+        hand_tracker_enabled: true,
+        prob_threshold_for_bomb: 0.6,
+        prob_threshold_for_intercept: 0.4,
+        enable_reason_trace: true,
+    }
+}
 
-/// Records which cards in hand belong to "good combos" that should not be split.
-#[derive(Clone, Debug, Default)]
+// ── JS 房规常量 (bot-advanced.js L14-42), 按值移植 ──────────────────────
+
+/// JS `DUAL_WILD_HAND_ENDGAME`: 手牌 ≤ 此值视为残局（百搭/拆炸房规专用，硬编码 6）
+const DUAL_WILD_HAND_ENDGAME: usize = 6;
+/// JS `DUAL_WILD_PENALTY_MIDGAME`: 中盘双百搭同出重罚（近乎禁绝）
+const DUAL_WILD_PENALTY_MIDGAME: f32 = 600.0;
+/// JS `DUAL_WILD_PENALTY_ENDGAME`: 残局双百搭同出罚
+const DUAL_WILD_PENALTY_ENDGAME: f32 = 60.0;
+/// JS `DUAL_WILD_CANDIDATE_HAND_MAX`: 仅 movegen（JS generatePlaysOfType）使用；
+/// 本文件不枚举候选（由 `enumerate_legal_actions` 负责），保留仅为 1:1 对应。
 #[allow(dead_code)]
+const DUAL_WILD_CANDIDATE_HAND_MAX: usize = 6;
+/// JS `UPGRADED_BOMB_WILD_PENALTY_MIDGAME`: 天然炸弹贴百搭升档中盘重罚
+const UPGRADED_BOMB_WILD_PENALTY_MIDGAME: f32 = 150.0;
+/// JS `UPGRADED_BOMB_WILD_PENALTY_ENDGAME`: 升档残局轻罚
+const UPGRADED_BOMB_WILD_PENALTY_ENDGAME: f32 = 10.0;
+/// JS `WILD_ON_LEVEL_PENALTY_MIDGAME`: 百搭落级牌中盘重罚
+const WILD_ON_LEVEL_PENALTY_MIDGAME: f32 = 250.0;
+/// JS `WILD_ON_LEVEL_PENALTY_ENDGAME`: 百搭落级牌残局轻罚
+const WILD_ON_LEVEL_PENALTY_ENDGAME: f32 = 20.0;
+/// JS `WILD_PLAIN_PAIR_PENALTY_MIDGAME`: 百搭配普通单张成普通对中盘重罚
+const WILD_PLAIN_PAIR_PENALTY_MIDGAME: f32 = 300.0;
+/// JS `WILD_PAIR_PENALTY_ENDGAME`: 百搭配对子残局轻罚
+const WILD_PAIR_PENALTY_ENDGAME: f32 = 15.0;
+/// JS `BARE_DUAL_WILD_EXTRA_PENALTY`: 裸出双百搭额外加重
+const BARE_DUAL_WILD_EXTRA_PENALTY: f32 = 200.0;
+
+// JS 内联分值常量（scorePlay base 100 / scoreLeadPlay base 50 / penalty×20 / 清空+10000）
+const BASE_FOLLOW_SCORE: f32 = 100.0;
+const BASE_LEAD_SCORE: f32 = 50.0;
+const SPLIT_PENALTY_SCALE: f32 = 20.0;
+const CLEAR_HAND_BONUS: f32 = 10000.0;
+const BANNED_SCORE: f32 = 99999.0;
+
+// ── Card helpers (cards.js getRank / rankValue / NATURAL_RANK 等价物) ───
+
+/// Pre-parsed card metadata for hot loops.
+#[derive(Clone, Copy, Debug)]
+struct CardMeta {
+    rank: Rank,
+    /// `natural_rank_value` (NATURAL_RANK: 2→2 … A→14); jokers → None.
+    natural: Option<u8>,
+    is_wild: bool,
+    is_joker: bool,
+    /// JS `rankValue` comparison scale: 3=3 … A=14, 2=15, 小王=16, 大王=17.
+    rank_value: u8,
+}
+
+fn meta_of(sym: &str, ctx: RuleContext) -> Option<CardMeta> {
+    let card = parse_card_symbol(sym).ok()?;
+    Some(CardMeta {
+        rank: card.rank,
+        natural: natural_rank_value(card.rank).ok(),
+        is_wild: is_wild(card, ctx),
+        is_joker: card.suit == Suit::Joker,
+        rank_value: rank_value_js(card.rank),
+    })
+}
+
+/// JS `rankValue` (bot-advanced.js L116-119): 3=3 … A=14, 2=15, B=16, R=17.
+fn rank_value_js(rank: Rank) -> u8 {
+    match rank {
+        Rank::Two => 15,
+        Rank::Three => 3,
+        Rank::Four => 4,
+        Rank::Five => 5,
+        Rank::Six => 6,
+        Rank::Seven => 7,
+        Rank::Eight => 8,
+        Rank::Nine => 9,
+        Rank::Ten => 10,
+        Rank::J => 11,
+        Rank::Q => 12,
+        Rank::K => 13,
+        Rank::A => 14,
+        Rank::BlackJoker => 16,
+        Rank::RedJoker => 17,
+    }
+}
+
+fn is_joker_sym(sym: &str) -> bool {
+    sym.starts_with('🃏')
+}
+
+// ── Hand combo analysis (JS analyzeHandCombos L1215-1320) ──────────────
+
+#[derive(Clone, Debug, Default)]
+#[allow(dead_code)] // straight_flush_count/wild_count 仅参与 bomb_count 推导（JS 字段 1:1 保留）
 struct HandCombos {
-    /// For each card symbol, the natural rank value (0 if not computed).
+    /// symbol → natural rank value (non-wild, non-joker only) — JS `cardToRank`.
     card_to_rank: HashMap<String, u8>,
-    /// How many cards of each natural rank exist in hand.
+    /// natural rank → count in hand (non-wild, non-joker) — JS `rankToCount`.
     rank_to_count: HashMap<u8, usize>,
-    /// Ranks that have >= 4 cards (potential bomb).
-    bomb_ranks: Vec<u8>,
-    /// Ranks that have >= 3 cards (potential triple / plate part).
-    triple_ranks: Vec<u8>,
-    /// Ranks that have >= 2 cards (potential pair / tube part).
-    pair_ranks: Vec<u8>,
-    /// Consecutive triple ranks (plate candidates): pairs of (rank, rank+1).
+    /// consecutive triple pairs (plate candidates) — JS `platePairs`.
     plate_pairs: Vec<(u8, u8)>,
-    /// Consecutive pair triples (tube candidates): triples of (rank, rank+1, rank+2).
+    /// consecutive pair runs of 3 (tube candidates) — JS `tubeTriples`.
     tube_triples: Vec<(u8, u8, u8)>,
-    /// Total estimated bomb count in hand (same-rank 4+ + straight flush candidates).
-    /// Used for bomb conservation strategy.
+    /// bombRanks.len + wild-assisted + straight-flush candidates — JS `bombCount`.
     bomb_count: usize,
-    /// Number of straight flush candidates (cached to avoid recomputation).
+    /// JS `straightFlushCount`.
     straight_flush_count: usize,
+    /// cards whose rank appears exactly once in hand (wilds/jokers excluded) — JS `singlesCount`.
+    singles_count: usize,
+    /// JS `wildCount`.
+    wild_count: usize,
 }
 
 fn analyze_hand_combos(hand: &[String], ctx: RuleContext) -> HandCombos {
@@ -117,58 +215,85 @@ fn analyze_hand_combos(hand: &[String], ctx: RuleContext) -> HandCombos {
     let mut wild_count = 0usize;
 
     for card in hand {
-        if let Ok(c) = parse_card_symbol(card) {
-            if is_wild(c, ctx) {
-                wild_count += 1;
-                continue; // wildcards are flexible; no penalty for using them
-            }
-            if let Ok(nat_val) = natural_rank_value(c.rank) {
-                *rank_to_count.entry(nat_val).or_default() += 1;
-                card_to_rank.insert(card.clone(), nat_val);
-            }
+        let Some(c) = parse_card_symbol(card).ok() else {
+            continue;
+        };
+        if is_wild(c, ctx) {
+            wild_count += 1;
+            continue;
+        }
+        if let Ok(nv) = natural_rank_value(c.rank) {
+            *rank_to_count.entry(nv).or_default() += 1;
+            card_to_rank.insert(card.clone(), nv);
         }
     }
 
-    let bomb_ranks: Vec<u8> = rank_to_count
+    let mut bomb_ranks: Vec<u8> = rank_to_count
         .iter()
-        .filter(|(_, c)| **c >= 4)
-        .map(|(r, _)| *r)
+        .filter(|&(_, &c)| c >= 4)
+        .map(|(&r, _)| r)
         .collect();
-    let triple_ranks: Vec<u8> = rank_to_count
+    let mut triple_ranks: Vec<u8> = rank_to_count
         .iter()
-        .filter(|(_, c)| **c >= 3)
-        .map(|(r, _)| *r)
+        .filter(|&(_, &c)| c >= 3)
+        .map(|(&r, _)| r)
         .collect();
-    let pair_ranks: Vec<u8> = rank_to_count
+    let mut pair_ranks: Vec<u8> = rank_to_count
         .iter()
-        .filter(|(_, c)| **c >= 2)
-        .map(|(r, _)| *r)
+        .filter(|&(_, &c)| c >= 2)
+        .map(|(&r, _)| r)
         .collect();
+    bomb_ranks.sort_unstable();
+    triple_ranks.sort_unstable();
+    pair_ranks.sort_unstable();
 
-    // Find consecutive triple ranks (plate candidates)
+    // platePairs: consecutive triples (JS L1246-1251)
     let mut plate_pairs = Vec::new();
-    let mut sorted_triples = triple_ranks.clone();
-    sorted_triples.sort();
-    for w in sorted_triples.windows(2) {
+    for w in triple_ranks.windows(2) {
         if w[1] - w[0] == 1 {
             plate_pairs.push((w[0], w[1]));
         }
     }
-
-    // Find consecutive pair triples (tube candidates)
+    // tubeTriples: consecutive pair runs of 3 (JS L1255-1260)
     let mut tube_triples = Vec::new();
-    let mut sorted_pairs = pair_ranks.clone();
-    sorted_pairs.sort();
-    for w in sorted_pairs.windows(3) {
+    for w in pair_ranks.windows(3) {
         if w[1] - w[0] == 1 && w[2] - w[1] == 1 {
             tube_triples.push((w[0], w[1], w[2]));
         }
     }
 
-    // Count total bombs: same-rank 4+ + wildcard-assisted + straight flush candidates
-    let straight_flush_count = count_straight_flush_candidates(hand, ctx);
+    // straight flush candidates (JS L1263-1285)
+    let mut straight_flush_count = 0usize;
+    let mut suit_to_ranks: HashMap<Suit, Vec<u8>> = HashMap::new();
+    for card in hand {
+        let Some(c) = parse_card_symbol(card).ok() else {
+            continue;
+        };
+        if is_wild(c, ctx) || c.suit == Suit::Joker {
+            continue;
+        }
+        if let Ok(nv) = natural_rank_value(c.rank) {
+            suit_to_ranks.entry(c.suit).or_default().push(nv);
+        }
+    }
+    for ranks in suit_to_ranks.values_mut() {
+        ranks.sort_unstable();
+        ranks.dedup();
+        let mut run_len = 1usize;
+        for i in 1..ranks.len() {
+            if ranks[i] - ranks[i - 1] == 1 {
+                run_len += 1;
+                if run_len >= 5 {
+                    straight_flush_count += 1;
+                    run_len = 0;
+                }
+            } else {
+                run_len = 1;
+            }
+        }
+    }
 
-    // Wildcard-assisted bombs: 3 same-rank + 1 wildcard = a bomb
+    // wildcard-assisted bombs (JS L1288-1290): ranks with exactly 3 naturals, capped by wilds
     let wild_assisted_bombs = if wild_count >= 1 {
         rank_to_count.values().filter(|&&c| c == 3).count().min(wild_count)
     } else {
@@ -177,386 +302,293 @@ fn analyze_hand_combos(hand: &[String], ctx: RuleContext) -> HandCombos {
 
     let bomb_count = bomb_ranks.len() + wild_assisted_bombs + straight_flush_count;
 
+    // singles count (JS L1295-1302)
+    let mut singles_count = 0usize;
+    for card in hand {
+        let Some(c) = parse_card_symbol(card).ok() else {
+            continue;
+        };
+        if is_wild(c, ctx) || c.suit == Suit::Joker {
+            continue;
+        }
+        if let Ok(nv) = natural_rank_value(c.rank) {
+            if rank_to_count.get(&nv).copied().unwrap_or(0) == 1 {
+                singles_count += 1;
+            }
+        }
+    }
+
     HandCombos {
         card_to_rank,
         rank_to_count,
-        bomb_ranks,
-        triple_ranks,
-        pair_ranks,
         plate_pairs,
         tube_triples,
         bomb_count,
         straight_flush_count,
+        singles_count,
+        wild_count,
     }
 }
 
-/// Count potential straight flush combinations in hand.
-/// A straight flush is 5+ consecutive cards of the same suit.
-fn count_straight_flush_candidates(hand: &[String], ctx: RuleContext) -> usize {
-    let mut suit_to_ranks: HashMap<String, Vec<u8>> = HashMap::new();
-    for card in hand {
-        if let Ok(c) = parse_card_symbol(card) {
-            if is_wild(c, ctx) {
-                continue;
-            }
-            if let Ok(nat_val) = natural_rank_value(c.rank) {
-                let suit = card.chars().next().map(|ch| ch.to_string()).unwrap_or_default();
-                if !suit.is_empty() {
-                    suit_to_ranks.entry(suit).or_default().push(nat_val);
-                }
-            }
-        }
-    }
+// ── 拆炸弹裁决 (JS classifyBombSplit L1330-1363) ────────────────────────
 
-    let mut count = 0;
-    for (_, mut ranks) in suit_to_ranks {
-        ranks.sort();
-        ranks.dedup();
-        if ranks.len() < 5 {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BombSplitVerdict {
+    /// 未拆炸弹
+    NotBreaking,
+    /// 放行拆炸（清空 / 中盘带出≥3单牌 / 中盘同花顺剩单≤2）
+    Exempt,
+    /// 禁止拆炸（含残局一律禁止）
+    Banned,
+}
+
+fn classify_bomb_split(
+    play_cards: &[String],
+    hand: &[String],
+    play_kind: &CombinationKind,
+    my_remaining: usize,
+) -> BombSplitVerdict {
+    // handCnt: all non-joker cards counted at face rank (wilds included, JS L1332-1337)
+    let mut hand_cnt: HashMap<Rank, usize> = HashMap::new();
+    for hc in hand {
+        if is_joker_sym(hc) {
             continue;
         }
-        // Find consecutive sequences of 5+
-        let mut run_len = 1;
-        for i in 1..ranks.len() {
-            if ranks[i] - ranks[i - 1] == 1 {
-                run_len += 1;
-                if run_len >= 5 {
-                    count += 1;
-                    run_len = 0; // reset to avoid double-counting overlapping sequences
-                }
-            } else {
-                run_len = 1;
-            }
+        if let Ok(c) = parse_card_symbol(hc) {
+            *hand_cnt.entry(c.rank).or_default() += 1;
         }
     }
-
-    count
+    let mut breaks_bomb = false;
+    let mut singles_carried = 0usize;
+    let mut play_cnt: HashMap<Rank, usize> = HashMap::new();
+    for c in play_cards {
+        if is_joker_sym(c) {
+            continue;
+        }
+        if let Ok(card) = parse_card_symbol(c) {
+            if hand_cnt.get(&card.rank).copied().unwrap_or(0) == 1 {
+                singles_carried += 1;
+            }
+            *play_cnt.entry(card.rank).or_default() += 1;
+        }
+    }
+    // 只有「部分消耗」≥4 的点数才算拆（整组全出不算）(JS L1348-1350)
+    for (r, &pc) in &play_cnt {
+        let hc = hand_cnt.get(r).copied().unwrap_or(0);
+        if hc >= 4 && pc >= 1 && pc < hc {
+            breaks_bomb = true;
+        }
+    }
+    if !breaks_bomb {
+        return BombSplitVerdict::NotBreaking;
+    }
+    if play_cards.len() >= my_remaining {
+        return BombSplitVerdict::Exempt; // ①清空手牌
+    }
+    if my_remaining <= DUAL_WILD_HAND_ENDGAME {
+        return BombSplitVerdict::Banned; // 残局一律禁止
+    }
+    if singles_carried >= 3 {
+        return BombSplitVerdict::Exempt; // ②同时减少≥3张单牌
+    }
+    if matches!(play_kind, CombinationKind::Bomb(BombKind::StraightFlush)) {
+        // ③同花顺且剩单≤2 (JS L1355-1361)
+        let mut remain_singles = 0i32;
+        for (r, &cnt) in &hand_cnt {
+            let played = play_cnt.get(r).copied().unwrap_or(0) as i32;
+            if cnt as i32 - played == 1 {
+                remain_singles += 1;
+            }
+        }
+        if remain_singles <= 2 {
+            return BombSplitVerdict::Exempt;
+        }
+    }
+    BombSplitVerdict::Banned
 }
 
-/// Returns a penalty score for a play based on how much it "splits" good combos.
-/// Higher = worse (more splitting).
-///
-/// Penalty is scaled by total bomb count in hand:
-/// - 1 bomb: breaking it = 10 (never break the only bomb)
-/// - 2 bombs: breaking = 5 (strongly discourage)
-/// - 3+ bombs: breaking = 3 (normal penalty)
-///
-/// Plate/Tube protection:
-/// - Playing a single/pair from a triple that's part of a plate: penalty 3
-/// - Playing the triple (3 cards) but not the full plate: penalty 1
-/// - Playing a single from a pair that's part of a tube: penalty 2
-/// - Playing the pair (2 cards) but not the full tube: penalty 1
-fn split_penalty(cards: &[String], combos: &HandCombos, ctx: RuleContext) -> u8 {
-    // Count how many cards of each rank are in this play
+// ── 拆牌惩罚 (JS splitPenalty L1381-1457) ───────────────────────────────
+/// Higher = worse. JS 只会返回 0 或 99999（绝对禁令）。
+fn split_penalty(
+    play_cards: &[String],
+    combos: &HandCombos,
+    level_nat: u8,
+    has_level_card_or_joker: bool,
+    play_kind: &CombinationKind,
+) -> u32 {
+    // playRankCounts via cardToRank: wilds/jokers contribute nothing (JS L1386-1392)
     let mut play_rank_counts: HashMap<u8, usize> = HashMap::new();
-    for card in cards {
-        if let Some(&rank) = combos.card_to_rank.get(card) {
-            *play_rank_counts.entry(rank).or_default() += 1;
+    for card in play_cards {
+        if let Some(&nv) = combos.card_to_rank.get(card) {
+            *play_rank_counts.entry(nv).or_default() += 1;
         }
     }
 
-    let _bomb_count = combos.bomb_count;
-    let mut penalty = 0u8;
+    for (&rank, &play_count) in &play_rank_counts {
+        let hand_count = combos.rank_to_count.get(&rank).copied().unwrap_or(0);
+        let is_level_rank = rank == level_nat;
 
-    // Level card rank for bomb-break encouragement
-    let level_rank = natural_rank_value(ctx.hand_level.to_rank()).unwrap_or(0);
-
-    for (rank, play_count) in &play_rank_counts {
-        let hand_count = combos.rank_to_count.get(rank).copied().unwrap_or(0);
-        let is_level_rank = *rank == level_rank;
-
-        // ── Bomb protection ──
-        if hand_count >= 4 && *play_count < hand_count {
-            if is_level_rank {
-                // 级牌炸弹应拆开：不惩罚拆级牌炸弹
-                continue;
-            }
-            // 炸弹不能拆开出：4张同rank不能拆成3+1、2+2等
-            // 惩罚极高，确保任何情况下都不会拆炸弹
-            penalty = penalty.saturating_add(50);
-            continue; // bomb check done, skip plate/tube checks
+        // Not splitting (playCount >= handCount), skip (JS L1399-1400)
+        if play_count >= hand_count {
+            continue;
         }
 
-        // ── Plate protection (钢板: consecutive triples) ──
+        // ABSOLUTE BAN: never split bombs (≥4 same rank, except level cards)
+        if hand_count >= 4 {
+            if is_level_rank {
+                continue; // level card bombs can be split
+            }
+            return BANNED_SCORE_U32; // ABSOLUTE BAN
+        }
+
+        // Plate protection + triple splitting rules
         if hand_count >= 3 {
             let is_plate_part = combos
                 .plate_pairs
                 .iter()
-                .any(|(a, b)| *rank == *a || *rank == *b);
+                .any(|&(a, b)| rank == a || rank == b);
             if is_plate_part {
-                let plays_full_plate = combos
-                    .plate_pairs
-                    .iter()
-                    .filter(|(a, b)| *rank == *a || *rank == *b)
-                    .any(|(a, b)| {
-                        let other = if *rank == *a { *b } else { *a };
-                        play_rank_counts.get(&other).copied().unwrap_or(0) >= 3
-                            && *play_count >= 3
-                    });
-                if !plays_full_plate {
-                    if *play_count < 3 {
-                        penalty += 3;
-                    } else {
-                        penalty += 1;
-                    }
-                }
-                continue;
+                return BANNED_SCORE_U32; // ABSOLUTE BAN: plate
             }
-            if *play_count < 3 && *play_count < hand_count {
-                penalty += 1;
+            if play_count < 3 {
+                if is_level_rank {
+                    continue; // 级牌可以单出、对子、三张
+                }
+                // 顺子拆对/三同张优先于禁止拆牌规则
+                if matches!(play_kind, CombinationKind::Ordinary(OrdinaryKind::Straight)) {
+                    continue;
+                }
+                if rank <= 10 {
+                    return BANNED_SCORE_U32; // ABSOLUTE BAN: rank ≤ 10
+                }
+                if has_level_card_or_joker {
+                    return BANNED_SCORE_U32; // ABSOLUTE BAN
+                }
+                // rank > 10 且无级牌/王：允许拆
             }
             continue;
         }
 
-        // ── Tube protection (木板: consecutive pairs) ──
+        // Tube protection + pair splitting rules
         if hand_count >= 2 {
             let is_tube_part = combos
                 .tube_triples
                 .iter()
-                .any(|(a, b, c)| *rank == *a || *rank == *b || *rank == *c);
+                .any(|&(a, b, c)| rank == a || rank == b || rank == c);
             if is_tube_part {
-                let plays_full_tube = combos
-                    .tube_triples
-                    .iter()
-                    .filter(|(a, b, c)| *rank == *a || *rank == *b || *rank == *c)
-                    .any(|(a, b, c)| {
-                        [*a, *b, *c].iter().all(|r| {
-                            play_rank_counts.get(r).copied().unwrap_or(0) >= 2
-                        })
-                    });
-                if !plays_full_tube {
-                    if *play_count < 2 {
-                        penalty += 2;
-                    } else {
-                        penalty += 1;
-                    }
+                return BANNED_SCORE_U32; // ABSOLUTE BAN: tube
+            }
+            if play_count < 2 {
+                if is_level_rank {
+                    continue;
+                }
+                if matches!(play_kind, CombinationKind::Ordinary(OrdinaryKind::Straight)) {
+                    continue;
+                }
+                if rank <= 10 {
+                    return BANNED_SCORE_U32;
+                }
+                if has_level_card_or_joker {
+                    return BANNED_SCORE_U32;
                 }
             }
         }
     }
 
-    penalty
+    0 // No penalty (allowed)
 }
 
-// ── Context-aware play selection ───────────────────────────────────────
+const BANNED_SCORE_U32: u32 = 99999;
 
-/// Pre-computed card info to avoid repeated parse_card_symbol calls in score_play.
-#[derive(Clone, Debug)]
-struct CardInfo {
-    /// natural_rank_value
-    rank: u8,
-    is_wild: bool,
-    is_level: bool,
-    is_joker: bool,
-}
+// ── Play context (预计算, mirror JS build_play_context 参数面) ──────────
 
-/// Game context extracted once for scoring all candidate plays.
 struct PlayContext {
-    is_leading: bool,
-    /// Whether the current top card was played by the teammate.
-    partner_leading: bool,
-    /// Primary value of the current top play (if any), used to judge if teammate's card is "big".
-    top_play_value: Option<u8>,
-    /// Debug representation of the current top play's combination kind.
-    /// E.g. "Ordinary(Single)", "Ordinary(Pair)", "Ordinary(Triple)".
-    top_play_kind: Option<String>,
+    ctx: RuleContext,
+    /// 当前级牌 Rank（JS `levelRank`）
+    level_rank: Rank,
+    /// 级牌的 NATURAL_RANK 值（JS `NATURAL_RANK[lvl]`）
+    level_nat: u8,
+    params: AdvancedBotParams,
+    /// 我的手牌（clone）
+    my_hand: Vec<String>,
     my_remaining: usize,
-    /// The seat of the actor (used to pick team-specific learn params).
-    actor: Seat,
+    teammate_seat: Seat,
     teammate_remaining: usize,
+    /// 两个对手的最小剩余张数
     min_opp_remaining: usize,
+    /// JS `isEndgame = myRemaining <= params.endgame_hand_count_threshold`
+    is_endgame: bool,
     combos: HandCombos,
-    /// Total bomb count in hand (same-rank 4+ + straight flush candidates).
-    bomb_count: usize,
-    // ── 精准残局判断变量 ──
-    /// 对手剩1张
-    opponent_1: bool,
-    /// 对手剩2张
-    opponent_2: bool,
-    /// 对手剩3-5张（危险区间）
-    opponent_3_5: bool,
-    /// 队友剩1张
-    teammate_1: bool,
-    /// 队友剩2张
-    teammate_2: bool,
-    /// 队友剩3张
-    teammate_3: bool,
-    // ── 炸弹使用原则：对手剩牌数细分 ──
-    /// 对手剩5张（大概率4炸+单，必炸）
-    opponent_5: bool,
-    /// 对手剩7张（多为一炸+两手牌，必炸）
-    opponent_7: bool,
-    /// 对手剩4张（极可能本身就是4张炸，慎炸）
-    opponent_4: bool,
-    /// 对手剩8张（可能是两炸或炸+牌，缓观）
-    opponent_8: bool,
-    // ── 顺风判断 ──
-    /// 我方是否顺风大优（我+队友剩余牌数都少于对手）
-    is_wind_advantage: bool,
-    // ── 队友牌质量 ──
-    /// 队友牌烂（队友剩余牌≥15张，全程无上手机会）
-    teammate_weak: bool,
-    // ── 当前牌权是否被队友炸弹控制 ──
-    /// 队友刚才出了炸弹并拿到牌权
-    partner_just_bombed: bool,
-    // ── 手牌散牌统计 ──
-    /// 手牌中单张的数量（用于判断炸完后是否全是散牌）
-    singles_count: usize,
-    // ── 炸弹大小统计 ──
-    /// 4张小炸弹数量
-    small_bomb_count: usize,
-    /// 5张中炸弹+同花顺数量
-    mid_bomb_count: usize,
-    /// 6张+大炸弹+王炸数量
-    big_bomb_count: usize,
-    /// 当前打几的级牌rank值（如打2则level_rank=2）
-    level_rank: u8,
-    /// Pre-computed card info for actor's hand (avoids repeated parse_card_symbol).
-    card_info: HashMap<String, CardInfo>,
+    /// 手中是否有（非百搭）级牌或王 — JS `hasLevelCardOrJoker`
+    has_level_card_or_joker: bool,
+    /// 我手牌的预解析元数据
+    meta: HashMap<String, CardMeta>,
 }
 
-fn build_play_context(hand: &HandState, actor: Seat) -> PlayContext {
-    let my_cards = hand.hands.get(&actor).map(|v| v.as_slice()).unwrap_or(&[]);
-    let my_remaining = my_cards.len();
-    let top = hand.trick.top_play.as_ref();
-    let is_leading = top.is_none();
-
+fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayContext {
+    let my_hand: Vec<String> = hand.hands.get(&actor).cloned().unwrap_or_default();
+    let my_remaining = my_hand.len();
     let teammate_seat = actor.teammate();
-    let partner_leading = top.map(|t| t.seat == teammate_seat).unwrap_or(false);
-    let teammate_remaining = hand
-        .hands
-        .get(&teammate_seat)
-        .map(|v| v.len())
-        .unwrap_or(27);
-
-    // Collect opponent card counts once instead of traversing 8 times
+    // 各座剩余张数直接取 hands.len()（任务要求；JS 用 tracker 计数，等价）
+    let teammate_remaining = hand.remaining_count(teammate_seat);
     let opp_counts: Vec<usize> = Seat::ALL
         .iter()
         .filter(|s| **s != actor && **s != teammate_seat)
-        .filter_map(|s| hand.hands.get(s).map(|v| v.len()))
+        .map(|s| hand.remaining_count(*s))
         .collect();
-    let min_opp_remaining = opp_counts.iter().min().copied().unwrap_or(27);
+    let min_opp_remaining = opp_counts.iter().min().copied().unwrap_or(0);
 
-    let opponent_1 = opp_counts.iter().any(|&n| n == 1);
-    let opponent_2 = !opponent_1 && opp_counts.iter().any(|&n| n == 2);
-    let opponent_3_5 = !opponent_1 && !opponent_2 && opp_counts.iter().any(|&n| n >= 3 && n <= 5);
+    let params = get_params_for_seat(actor);
+    let is_endgame = my_remaining <= params.endgame_hand_count_threshold as usize;
+    let combos = analyze_hand_combos(&my_hand, ctx);
+    let level_rank = ctx.hand_level.to_rank();
+    let level_nat = natural_rank_value(level_rank).unwrap_or(2);
 
-    let teammate_1 = teammate_remaining == 1;
-    let teammate_2 = teammate_remaining == 2;
-    let teammate_3 = teammate_remaining == 3;
+    let meta: HashMap<String, CardMeta> = my_hand
+        .iter()
+        .filter_map(|s| meta_of(s, ctx).map(|m| (s.clone(), m)))
+        .collect();
 
-    let opponent_5 = !opponent_1 && !opponent_2 && !opponent_3_5 && opp_counts.iter().any(|&n| n == 5);
-    let opponent_7 = !opponent_1 && !opponent_2 && !opponent_3_5 && !opponent_5 && opp_counts.iter().any(|&n| n == 7);
-    let opponent_4 = !opponent_1 && !opponent_2 && !opponent_3_5 && opp_counts.iter().any(|&n| n == 4);
-    let opponent_8 = !opponent_1 && !opponent_2 && !opponent_3_5 && !opponent_5 && !opponent_7 && opp_counts.iter().any(|&n| n == 8);
-
-    // ── 顺风判断：我+队友剩余牌数都少于对手 ──
-    let opp_max_remaining = opp_counts.iter().max().copied().unwrap_or(27);
-    let is_wind_advantage = my_remaining < opp_max_remaining && teammate_remaining < opp_max_remaining;
-
-    // ── 队友牌质量 ──
-    let teammate_weak = teammate_remaining >= 15;
-
-    // ── 队友刚才是否出了炸弹 ──
-    let partner_just_bombed = top.as_ref().map(|t| {
-        t.seat == teammate_seat && format!("{:?}", t.combination.kind).starts_with("Bomb")
-    }).unwrap_or(false);
-
-    let ctx = RuleContext {
-        hand_level: hand.hand_level,
-    };
-    let combos = analyze_hand_combos(my_cards, ctx);
-    let bomb_count = combos.bomb_count;
-
-    // ── 手牌散牌统计（依赖combos.rank_to_count）──
-    let singles_count = my_cards.iter().filter(|card| {
-        if let Ok(c) = parse_card_symbol(card) {
-            if let Ok(nat) = natural_rank_value(c.rank) {
-                let count = combos.rank_to_count.get(&nat).copied().unwrap_or(0);
-                return count == 1;
-            }
+    let has_level_card_or_joker = my_hand.iter().any(|c| {
+        match meta.get(c) {
+            Some(m) => m.is_joker || (m.rank == level_rank && !m.is_wild),
+            None => is_joker_sym(c),
         }
-        false
-    }).count();
-
-    // ── 炸弹大小统计 ──
-    let mut small_bomb_count = 0usize;
-    let mut mid_bomb_count = 0usize;
-    let mut big_bomb_count = 0usize;
-    for rank in &combos.bomb_ranks {
-        let count = combos.rank_to_count.get(rank).copied().unwrap_or(0);
-        if count == 4 {
-            small_bomb_count += 1;
-        } else if count == 5 {
-            mid_bomb_count += 1;
-        } else {
-            big_bomb_count += 1;
-        }
-    }
-    // 同花顺算中等炸弹
-    mid_bomb_count += combos.straight_flush_count;
-    // 王炸算大炸弹（wild_assisted_bombs按最坏情况估算）
-
-    let top_play_value = top.map(|t| t.combination.primary);
-
-    let top_play_kind = top.map(|t| format!("{:?}", t.combination.kind));
-
-    let level_rank = natural_rank_value(hand.hand_level.to_rank()).unwrap_or(2) as u8;
-
-    // Pre-compute card info for score_play to avoid repeated parse_card_symbol
-    let card_info: HashMap<String, CardInfo> = my_cards.iter().map(|card| {
-        let c = parse_card_symbol(card).unwrap();
-        let rank = natural_rank_value(c.rank).unwrap_or(0);
-        (card.clone(), CardInfo {
-            rank,
-            is_wild: is_wild(c, ctx),
-            is_level: rank == level_rank,
-            is_joker: card.starts_with("🃏") || card.starts_with("👑"),
-        })
-    }).collect();
+    });
 
     PlayContext {
-        is_leading,
-        partner_leading,
-        top_play_value,
-        top_play_kind,
+        ctx,
+        level_rank,
+        level_nat,
+        params,
+        my_hand,
         my_remaining,
-        actor,
+        teammate_seat,
         teammate_remaining,
         min_opp_remaining,
+        is_endgame,
         combos,
-        bomb_count,
-        opponent_1,
-        opponent_2,
-        opponent_3_5,
-        teammate_1,
-        teammate_2,
-        teammate_3,
-        opponent_5,
-        opponent_7,
-        opponent_4,
-        opponent_8,
-        is_wind_advantage,
-        teammate_weak,
-        partner_just_bombed,
-        singles_count,
-        small_bomb_count,
-        mid_bomb_count,
-        big_bomb_count,
-        level_rank,
-        card_info,
+        has_level_card_or_joker,
+        meta,
+    }
+}
+
+impl PlayContext {
+    fn meta_for(&self, sym: &str) -> Option<CardMeta> {
+        self.meta
+            .get(sym)
+            .copied()
+            .or_else(|| meta_of(sym, self.ctx))
     }
 }
 
 // ── Public API ─────────────────────────────────────────────────────────
 
 /// Pick one legal action:
-/// - playing: context-aware strategy (small first, avoid splitting, endgame, teammate support)
-/// - tribute/return: smaller card value first
-pub fn suggest_next_action(
-    state: &TableGameState,
-    actor: Seat,
-) -> Result<PlayerAction, String> {
+/// - Playing: JS decision flow (lead → score_lead max; follow → pass/play heuristic,
+///   then findBestPlay guards).
+/// - Tribute/Return: smaller card value first (unchanged, out of JS scope).
+pub fn suggest_next_action(state: &TableGameState, actor: Seat) -> Result<PlayerAction, String> {
     let legal = enumerate_legal_actions(state, actor)?;
     if legal.is_empty() {
         return Err("no legal actions".into());
@@ -568,7 +600,7 @@ pub fn suggest_next_action(
     };
 
     match state.phase {
-        GamePhase::Playing => pick_playing_with_context(&legal, ctx, hand, actor),
+        GamePhase::Playing => pick_playing(hand, actor, &legal),
         GamePhase::Tribute => pick_tribute(&legal, ctx),
         GamePhase::Exchange => pick_return(&legal, ctx),
         _ => Err("suggest_next_action: not in tribute, exchange, or playing".into()),
@@ -622,1167 +654,1340 @@ fn pick_lowest_card_action<'a>(
         .ok_or_else(|| no_action_error.into())
 }
 
-// ── Playing phase: context-aware selection ─────────────────────────────
+// ── Playing phase: JS decision flow ────────────────────────────────────
 
-fn pick_playing_with_context(
-    legal: &[PlayerAction],
-    ctx: RuleContext,
+/// Parsed candidate: the [`PlayerAction`] plus its resolved [`Combination`].
+struct Candidate<'a> {
+    action: &'a PlayerAction,
+    cards: &'a [String],
+    combo: Combination,
+}
+
+fn parse_candidates<'a>(legal: &'a [PlayerAction], ctx: RuleContext) -> Vec<Candidate<'a>> {
+    let mut out = Vec::new();
+    for a in legal {
+        if let PlayerAction::Play { cards, wild_targets } = a {
+            if let Ok(combo) = CombinationParser::parse(cards, wild_targets.as_deref(), ctx) {
+                out.push(Candidate {
+                    action: a,
+                    cards,
+                    combo,
+                });
+            }
+        }
+    }
+    out
+}
+
+fn pick_playing(
     hand: &HandState,
     actor: Seat,
+    legal: &[PlayerAction],
 ) -> Result<PlayerAction, String> {
-    let plays: Vec<&PlayerAction> = legal
-        .iter()
-        .filter(|a| matches!(a, PlayerAction::Play { .. }))
-        .collect();
+    let ctx = RuleContext {
+        hand_level: hand.hand_level,
+    };
+    let my_hand = hand
+        .hands
+        .get(&actor)
+        .ok_or_else(|| "missing actor hand".to_string())?;
+    let top = hand.trick.top_play.as_ref();
+    let pass_action = legal.iter().find(|a| matches!(a, PlayerAction::Pass));
+    let candidates = parse_candidates(legal, ctx);
 
-    let pass_action = legal
-        .iter()
-        .find(|a| matches!(a, PlayerAction::Pass));
-
-    if plays.is_empty() {
-        return pass_action
-            .cloned()
-            .ok_or_else(|| "suggest: no pass in legal".into());
-    }
-
-    let pctx = build_play_context(hand, actor);
-
-    // ══ 房规：只剩最后1张时，能压就立即打出清空夺头游，任何启发式不得拦截 ══
-    if pass_action.is_some() && pctx.my_remaining == 1 && !plays.is_empty() {
-        return Ok(plays[0].clone());
-    }
-
-    // Score each play with context, then pick the best (lowest score).
-    let mut scored: Vec<(PlayScore, &PlayerAction)> = Vec::with_capacity(plays.len() + 1);
-    for a in &plays {
-        let score = score_play(a, ctx, &pctx);
-        scored.push((score, *a));
-    }
-
-    // Include Pass as a scored option so bomb conservation can actually trigger passing.
-    // Pass tier 5: beats tier 6+ (bomb conservation, partner big card, joker respect)
-    // but loses to tier 0-4 (normal plays, partner following, endgame bomb with 2+ bombs).
-    if let Some(pass) = pass_action {
-        let mut strategic_tier = 5u8;
-        
-        // 应用学习参数对 Pass 的调整（使用 seat-specific 参数打破对称性）
-        if let Some(lp) = get_learn_params_for_seat(actor) {
-            let scale = lp.team_win_weight.clamp(0.1, 10.0);
-            let pass_penalty = lp.pass_stall_penalty.clamp(0.1, 10.0);
-            strategic_tier = ((strategic_tier as f32 * pass_penalty * scale).round() as u8).min(255);
+    // ── 领牌（无 lastPlay）：全部候选用 score_lead 打分取最大（JS findBestLeadPlay）──
+    let Some(top) = top else {
+        if candidates.is_empty() {
+            return Err("suggest: no lead play available".into());
         }
-        
-        let pass_score = PlayScore {
-            strategic_tier,
-            split_penalty: 0,
-            wild_count: 0,
-            is_bomb: false,
-            is_non_level: true,
-            primary: 0,
-            cards_len: std::cmp::Reverse(0),
-            sorted_cards: vec![],
-        };
-        scored.push((pass_score, pass));
-    }
-
-    scored.sort_by(|a, b| a.0.cmp(&b.0));
-
-    // ══ 房规硬守卫：残局保留最后一个炸弹——最优解若为「非清空用最后炸弹」且对手未冲刺，强制过牌 ══
-    if let Some((_, best_act)) = scored.first() {
-        if let PlayerAction::Play { cards: best_cards, .. } = best_act {
-            if best_cards.len() < pctx.my_remaining
-                && pctx.combos.bomb_count == 1
-                && pctx.my_remaining <= 6
-                && pctx.min_opp_remaining > 3
-                && pctx.my_remaining - best_cards.len() > 2
-            {
-                let looks_bomb = CombinationParser::parse(best_cards, None, ctx)
-                    .map(|c| matches!(c.class(), CombinationClass::Bomb))
-                    .unwrap_or(false);
-                if looks_bomb {
-                    if let Some(pass) = pass_action {
-                        return Ok(pass.clone());
-                    }
-                }
+        let p = build_play_context(hand, actor, ctx);
+        let mut best: Option<(f32, &Candidate)> = None;
+        for cand in &candidates {
+            let s = score_lead(cand.cards, &cand.combo, &p);
+            if best.map_or(true, |(bs, _)| s > bs) {
+                best = Some((s, cand));
             }
         }
-    }
-
-    scored
-        .first()
-        .map(|(_, a)| (*a).clone())
-        .ok_or_else(|| "suggest: empty play list".into())
-}
-
-// ── Play scoring ───────────────────────────────────────────────────────
-
-/// Composite sort key for a play candidate. Lower = better.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct PlayScore {
-    /// Strategic tier: 0=normal, 1=teammate support, 2=endgame clear, 3=opponent intercept
-    strategic_tier: u8,
-    /// Split penalty: 0=no split, 1=minor, 2=medium, 3=heavy
-    split_penalty: u8,
-    /// Fewer wildcards = better
-    wild_count: usize,
-    /// Non-bomb (false) before bomb (true)
-    is_bomb: bool,
-    /// Level card combo (false) before non-level (true): level cards should be preferred
-    is_non_level: bool,
-    /// Smaller primary value = better
-    primary: u8,
-    /// More cards = better (Reverse makes larger sort first)
-    cards_len: std::cmp::Reverse<usize>,
-    /// Lexicographic tie-break
-    sorted_cards: Vec<String>,
-}
-
-fn score_play(a: &PlayerAction, ctx: RuleContext, pctx: &PlayContext) -> PlayScore {
-    let (cards, wild_targets) = match a {
-        PlayerAction::Play {
-            cards,
-            wild_targets,
-        } => (cards, wild_targets),
-        _ => {
-            return PlayScore {
-                strategic_tier: 255,
-                split_penalty: 0,
-                wild_count: 0,
-                is_bomb: true,
-                is_non_level: true,
-                primary: 255,
-                cards_len: std::cmp::Reverse(0),
-                sorted_cards: vec![],
-            }
-        }
+        return Ok(best.expect("candidates non-empty").1.action.clone());
     };
 
-    let combo = CombinationParser::parse(cards, wild_targets.as_deref(), ctx).unwrap_or_else(|_| {
-        // Fallback: treat as single with max value
-        CombinationParser::parse(&[cards[0].clone()], None, ctx).unwrap()
-    });
+    // 跟牌：Pass 必然在合法动作中（movegen 保证）
+    let pass = pass_action.ok_or_else(|| "suggest: no pass in legal".to_string())?;
 
-    let wild_count = cards
-        .iter()
-        .filter_map(|s| pctx.card_info.get(s).map(|ci| usize::from(ci.is_wild)))
-        .sum::<usize>();
+    // ── 房规：只剩最后 1 张时，只要能合法压过就立即打出清空（JS 488-497）──
+    if my_hand.len() == 1 {
+        if let Some(cand) = candidates.first() {
+            return Ok(cand.action.clone());
+        }
+    }
 
-    let is_bomb = matches!(combo.class(), CombinationClass::Bomb);
-    let penalty = split_penalty(cards, &pctx.combos, ctx);
+    if candidates.is_empty() {
+        return Ok(pass.clone());
+    }
 
-    // ── 炸弹拆分兜底检查（直接解析卡片rank，不依赖card_to_rank映射）──
-    // 如果手牌中有4+张同rank且本次出牌只用了其中部分 → 判定为拆炸弹
-    let mut direct_bomb_penalty = 0u8;
+    let p = build_play_context(hand, actor, ctx);
+
+    // ── JS decideAdvancedPlay：pass/play 启发式（概率项置 0，确定性项全保留）──
+    if decide_follow(top, &p, actor) == FollowDecision::Pass {
+        return Ok(pass.clone());
+    }
+
+    // ── JS findBestPlay：全部候选 score_follow 取最大 + 硬守卫 ──
+    find_best_play_follow(&candidates, top, &p)
+}
+
+// ── JS decideAdvancedPlay (L460-611): pass/play 启发式 ──────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FollowDecision {
+    Pass,
+    Play,
+}
+
+/// JS `extractTopRank` (L445-448): 取 top 第一张牌的 rank。
+fn extract_top_rank(top: &PlayState) -> Option<Rank> {
+    top.cards.first().and_then(|c| parse_card_symbol(c).ok()).map(|c| c.rank)
+}
+
+fn decide_follow(top: &PlayState, p: &PlayContext, actor: Seat) -> FollowDecision {
+    let params = &p.params;
+    let top_play_seat = top.seat;
+    let partner_leading = top_play_seat == p.teammate_seat;
+    let enemy_leading = top_play_seat != p.teammate_seat && top_play_seat != actor;
+
+    let mut pass_score = 0.0f32;
+    let mut play_score = 0.0f32;
+
+    if partner_leading {
+        // Partner is leading — be conservative about overriding (JS 509-561)
+        let top_is_bomb = top.combination.class() == CombinationClass::Bomb;
+        if top_is_bomb {
+            return FollowDecision::Pass; // NEVER override teammate's bomb
+        }
+
+        let top_rank = extract_top_rank(top);
+        let top_is_level = top_rank == Some(p.level_rank);
+        if top_is_level {
+            return FollowDecision::Pass; // NEVER override teammate's level card
+        }
+
+        let top_is_joker = top_rank.map_or(false, |r| matches!(r, Rank::RedJoker | Rank::BlackJoker))
+            || top.cards.iter().any(|c| is_joker_sym(c));
+        if top_is_joker {
+            return FollowDecision::Pass; // NEVER override teammate's joker
+        }
+
+        // 钢板(Plate)和木板(Tube)绝对不能压队友的牌
+        match top.combination.kind {
+            CombinationKind::Ordinary(OrdinaryKind::Plate)
+            | CombinationKind::Ordinary(OrdinaryKind::Tube) => {
+                return FollowDecision::Pass;
+            }
+            _ => {}
+        }
+
+        let trv = top_rank.map(rank_value_js).unwrap_or(0);
+        // 队友的对子大于12（K、A、2）不能压
+        if matches!(
+            top.combination.kind,
+            CombinationKind::Ordinary(OrdinaryKind::Pair)
+        ) && trv > 12
+        {
+            return FollowDecision::Pass;
+        }
+        // 队友的三带二大于10（J、Q、K、A、2）不能压
+        if matches!(
+            top.combination.kind,
+            CombinationKind::Ordinary(OrdinaryKind::FullHouse)
+        ) && trv > 10
+        {
+            return FollowDecision::Pass;
+        }
+
+        let top_is_big = trv >= 12; // Q or higher
+        if top_is_big {
+            return FollowDecision::Pass; // Do not override teammate's big card
+        }
+
+        // 概率项 probOpponentCanFollow：无牌踪器，概率项置 0（贡献 0，跳过）
+    } else if enemy_leading {
+        // Enemy is leading — try to follow (JS 562-580)
+        play_score += 2.0;
+
+        // 概率项 probOpponentHasBomb：无牌踪器，概率项置 0（贡献 0，跳过）
+
+        let enemy_low = p.min_opp_remaining <= params.enemy_low_cards_threshold as usize;
+        if enemy_low {
+            play_score += params.bomb_aggression_when_enemy_low;
+        }
+
+        if p.is_endgame {
+            play_score += params.endgame_clear_hand_bias;
+        }
+    } else {
+        // Self is leading (shouldn't happen with lastPlay, but fallback)
+        play_score += params.proactive_play_bias;
+    }
+
+    // Partner sprinting check (JS 587-590)
+    let partner_sprinting = p.teammate_remaining <= params.partner_sprint_threshold as usize;
+    if partner_sprinting && !enemy_leading {
+        pass_score += 2.0 * params.second_out_weight;
+    }
+
+    // 概率项 calculateGameWinProb：无牌踪器，概率项置 0（贡献 0，跳过）
+
+    // Decision: pass if passScore > playScore, else find best play (JS 605-610)
+    if pass_score > play_score {
+        FollowDecision::Pass
+    } else {
+        FollowDecision::Play
+    }
+}
+
+// ── JS findBestPlay (L622-725): 打分 + 硬守卫 ───────────────────────────
+
+fn find_best_play_follow<'a>(
+    candidates: &[Candidate<'a>],
+    top: &PlayState,
+    p: &PlayContext,
+) -> Result<PlayerAction, String> {
+    // Score each possible play and pick the best one (ties → first in order, JS stable sort)
+    let mut best: Option<(f32, &Candidate)> = None;
+    for cand in candidates {
+        let s = score_follow(cand.cards, &cand.combo, top, p);
+        if best.map_or(true, |(bs, _)| s > bs) {
+            best = Some((s, cand));
+        }
+    }
+    let Some((best_score, best)) = best else {
+        return Ok(PlayerAction::Pass);
+    };
+    let best_cards = best.cards;
+    let best_is_bomb = best.combo.class() == CombinationClass::Bomb;
+
+    // JS 硬编码：isEndgame = myRemaining <= 6；冲刺 = 任一对手 ≤ 6（用户房规，原 JS 为 3）
+    let my_remaining = p.my_remaining;
+    let is_endgame = my_remaining <= 6;
+    let is_opp_sprinting = p.min_opp_remaining <= 6;
+
+    // ① 炸弹保留：非残局、非对手冲刺、手里炸弹总数 = 1 个时，不出炸弹，直接过。
+    //    （用户房规改自 JS 647-655：JS 为 bombCount<=2，现为 =1——
+    //      2 个炸弹不再拦；"手里 ≥3 个炸可用"的豁免由条件 =1 自然排除）
+    if best_is_bomb && !is_endgame && !is_opp_sprinting && p.combos.bomb_count == 1 {
+        return Ok(PlayerAction::Pass);
+    }
+
+    // ③ 绝对禁止：队友出牌时，绝不能使用炸弹压队友的牌 (JS 664-669)
+    if top.seat == p.teammate_seat && best_is_bomb {
+        return Ok(PlayerAction::Pass);
+    }
+
+    // ④ 王和级牌之外的任何单张禁止使用炸弹 (JS 671-685)
+    if best_is_bomb
+        && matches!(
+            top.combination.kind,
+            CombinationKind::Ordinary(OrdinaryKind::Single)
+        )
+        && top.cards.len() == 1
     {
-        let level_rank_val = pctx.level_rank;
-        let mut play_rank_counts: HashMap<u8, usize> = HashMap::new();
-        for card in cards {
-            if let Some(ci) = pctx.card_info.get(card) {
-                if !ci.is_wild {
-                    *play_rank_counts.entry(ci.rank).or_default() += 1;
-                }
-            }
-        }
-        // 房规三豁免（mirror JS classifyBombSplit）：①清空手牌 ②中盘带出≥3张单牌
-        // ③中盘同花顺且剩余单张≤2。残局一律禁止。
-        let split_clearing = cards.len() >= pctx.my_remaining;
-        let split_endgame = pctx.my_remaining <= 6;
-        let mut carried_singles = 0usize;
-        for (&r, &pc) in &play_rank_counts {
-            if pctx.combos.rank_to_count.get(&r).copied().unwrap_or(0) == 1 {
-                carried_singles += pc;
-            }
-        }
-        let is_sf_play = matches!(combo.kind, CombinationKind::Bomb(BombKind::StraightFlush));
-        let mut singles_after_sf = usize::MAX;
-        if is_sf_play {
-            let mut s = pctx.singles_count;
-            for c in cards {
-                if let Some(ci) = pctx.card_info.get(c) {
-                    if pctx.combos.rank_to_count.get(&ci.rank).copied().unwrap_or(0) == 1 {
-                        s = s.saturating_sub(1);
-                    }
-                }
-            }
-            singles_after_sf = s;
-        }
-        for (rank, play_count) in &play_rank_counts {
-            if *rank == level_rank_val {
-                continue; // 级牌炸弹允许拆
-            }
-            let hand_total = pctx.combos.rank_to_count.get(rank).copied().unwrap_or(0);
-            if hand_total >= 4 && *play_count < hand_total {
-                let exempt = split_clearing
-                    || (!split_endgame && carried_singles >= 3)
-                    || (!split_endgame && is_sf_play && singles_after_sf <= 2);
-                if !exempt {
-                    direct_bomb_penalty = 100; // 拆炸弹，极高惩罚
-                }
-                break;
-            }
+        let last = &top.cards[0];
+        let is_joker = is_joker_sym(last);
+        let is_level_card = parse_card_symbol(last).map(|c| c.rank) == Ok(p.level_rank);
+        if !is_joker && !is_level_card {
+            return Ok(PlayerAction::Pass);
         }
     }
 
-    // ── 房规公共量：是否清空手牌 ──
-    let clearing = cards.len() >= pctx.my_remaining;
-
-    let mut sorted = cards.clone();
-    sorted.sort();
-
-    // Determine strategic tier based on game context
-    let mut strategic_tier = determine_strategic_tier(is_bomb, pctx);
-
-    // 级牌和大小王仅领牌时禁止空出（除非出到最后）
-    // 炸弹领牌时不能空炸，跟牌时炸弹可以夺牌权
-    // 这些牌应该留着压牌，绝对不能空出浪费
-    // 只有最后出牌（cards.len() == my_remaining）时才允许
-    if cards.len() < pctx.my_remaining {
-        let has_level = cards.iter().any(|c| {
-            pctx.card_info.get(c).map(|ci| ci.is_level).unwrap_or(false)
-        });
-        let has_joker = cards.iter().any(|c| c.starts_with("🃏") || c.starts_with("👑"));
-        // 级牌和大小王：仅领牌时禁止空出
-        if pctx.is_leading && (has_level || has_joker) {
-            strategic_tier = strategic_tier.saturating_add(100); // 绝对不能空出
-        }
-        // 炸弹：领牌时不能空炸，跟牌时炸弹可以夺牌权
-        // 房规豁免（mirror JS「空出炸弹重罚」例外2）：剩余手牌全是炸弹（各组≥4张，
-        // 王/百搭按其rank键单独成组也需≥4张）→ 领炸连出不受罚
-        if is_bomb && pctx.is_leading {
-            let mut rest_counts: HashMap<u8, usize> = HashMap::new();
-            for (card_str, ci) in &pctx.card_info {
-                if cards.contains(card_str) {
-                    continue;
-                }
-                *rest_counts.entry(ci.rank).or_default() += 1;
-            }
-            let rest_all_bombs = rest_counts.values().all(|&n| n >= 4);
-            if !rest_all_bombs {
-                strategic_tier = strategic_tier.saturating_add(100); // 领牌空炸，绝对禁止
-            }
-        }
-    }
-
-    // 逢人配不能单出，尽量配成炸弹/同花顺/木板/钢板/杂顺等组合
-    // 逢人配极其珍贵，单出/对子/三张同中浪费逢人配 → 极高惩罚；用于组合牌型 → 不惩罚
-    // 房规豁免（mirror JS finishingPlay）：清空手牌时百搭任意用法全部豁免
-    if wild_count > 0 && !is_bomb && !clearing {
-        let waste = match combo.kind {
-            CombinationKind::Ordinary(OrdinaryKind::Single) => 100, // 逢人配绝不能单出，极高惩罚
-            CombinationKind::Ordinary(OrdinaryKind::Pair) => 50,    // 对子中浪费逢人配，极高惩罚
-            CombinationKind::Ordinary(OrdinaryKind::Triple) => 30,  // 三张同中浪费逢人配，高惩罚
-            // 顺子/木板/钢板/三带二等组合牌型：逢人配用于构成合理牌型 → 不惩罚
-            _ => 0,
-        };
-        strategic_tier = strategic_tier.saturating_add(waste);
-    }
-
-    // ══ 房规：百搭分级惩罚（mirror JS DUAL_WILD_* / WILD_ON_LEVEL_* / UPGRADED_BOMB_*）══
-    // 清空手牌豁免所有百搭罚分（上面已挡）；此处覆盖双百搭矩阵与升档炸。
-    if wild_count >= 2 && !clearing {
-        let endgame_hand = pctx.my_remaining <= 6;
-        let touches_level_natural = cards.iter().any(|c| {
-            pctx.card_info.get(c).map(|ci| ci.is_level && !ci.is_wild).unwrap_or(false)
-        });
-        let nonwild_count = cards.len() - wild_count;
-        // 白名单（mirror JS pushDualWildSanctioned）：残局≤6、非级牌参与、
-        // 四头炸(非级牌对+2百搭)/三带二/木板/钢板 → 仅轻罚
-        let sanctioned_shape = endgame_hand && !touches_level_natural && match combo.kind {
-            CombinationKind::Bomb(BombKind::SameRank { n }) => n == 4 && nonwild_count == 2,
-            CombinationKind::Ordinary(OrdinaryKind::FullHouse) => nonwild_count == 3,
-            CombinationKind::Ordinary(OrdinaryKind::Plate) => true,
-            CombinationKind::Ordinary(OrdinaryKind::Tube) => true,
-            _ => false,
-        };
-        if sanctioned_shape {
-            strategic_tier = strategic_tier.saturating_add(1); // 白名单用法：仅 −10 级别
-        } else {
-            // 其余一律重罚：中盘 −600 / 残局 −60；裸双百搭再叠 −200；沾级牌再叠 −250/−20
-            let bare = nonwild_count == 0;
-            let mut pen: u8 = if endgame_hand { 6 } else { 40 };
-            if bare {
-                pen = pen.saturating_add(12);
-            }
-            if touches_level_natural {
-                pen = pen.saturating_add(if endgame_hand { 4 } else { 22 });
-            }
-            strategic_tier = strategic_tier.saturating_add(pen);
-        }
-    }
-
-    // 升档炸弹（3自然+1百搭）：轻罚（−150/−10）；对手冲刺≤6豁免；级牌rank走沾级罚
-    if wild_count == 1 && is_bomb && cards.len() == 4 && !clearing && pctx.min_opp_remaining > 6 {
-        let mut nat_rank_count: HashMap<u8, usize> = HashMap::new();
-        for c in cards {
-            if let Some(ci) = pctx.card_info.get(c) {
-                if !ci.is_wild {
-                    *nat_rank_count.entry(ci.rank).or_default() += 1;
-                }
-            }
-        }
-        let up_three = nat_rank_count.values().max().copied().unwrap_or(0) == 3;
-        let up_level = nat_rank_count.keys().any(|&r| r == pctx.level_rank);
-        if up_three && !up_level {
-            strategic_tier = strategic_tier.saturating_add(if pctx.my_remaining <= 6 { 2 } else { 12 });
-        }
-    }
-
-    // 王对子惩罚：不能用一对王（大小王）去打小对子
-    if matches!(combo.kind, CombinationKind::Ordinary(OrdinaryKind::Pair)) {
-        let has_joker = cards.iter().any(|c| c.starts_with("🃏") || c.starts_with("👑"));
-        if has_joker {
-            strategic_tier = strategic_tier.saturating_add(5);
-        }
-    }
-
-    // ══ 房规：先出小牌，不要空出大牌（J以上按点数递增罚；清空豁免）══
-    // mirror JS scoreLeadPlay「先出小牌」：J −18 / Q −36 / K −54 / A −72 / 王 −108 / 百搭 −90
-    if pctx.is_leading && !clearing {
-        let has_joker_card = cards.iter().any(|c| c.starts_with("🃏") || c.starts_with("👑"));
-        let has_wild = cards.iter().any(|c| pctx.card_info.get(c).map(|ci| ci.is_wild).unwrap_or(false));
-        let max_nat = cards
+    // ⑤ 王和级牌之外的任何对子禁止使用炸弹 (JS 687-699)
+    if best_is_bomb
+        && matches!(
+            top.combination.kind,
+            CombinationKind::Ordinary(OrdinaryKind::Pair)
+        )
+    {
+        let is_joker = top.cards.iter().any(|c| is_joker_sym(c));
+        let is_level = top
+            .cards
             .iter()
-            .filter_map(|c| pctx.card_info.get(c))
-            .filter(|ci| !ci.is_wild && !ci.is_joker)
-            .map(|ci| ci.rank)
-            .max()
-            .unwrap_or(0);
-        let max_any = if has_joker_card { 16 } else if has_wild { 15 } else { max_nat };
-        if max_any >= 11 {
-            strategic_tier = strategic_tier.saturating_add((max_any - 10).saturating_mul(2));
+            .all(|c| parse_card_symbol(c).map(|c| c.rank) == Ok(p.level_rank));
+        if !is_joker && !is_level {
+            return Ok(PlayerAction::Pass);
         }
     }
 
-    // ══ 房规：接风重奖——队友已全部出完（mirror JS +120 首出 / +180 压敌）══
-    if pctx.teammate_remaining == 0 {
-        if pctx.is_leading {
-            strategic_tier = strategic_tier.saturating_sub(12);
-        } else if !pctx.partner_leading {
-            strategic_tier = strategic_tier.saturating_sub(18);
-        }
-    }
-
-    // 级牌炸弹惩罚：级牌应拆开出，不应形成炸弹
-    // 房规（mirror JS 天然级牌炸弹规则）：天然级牌四炸中盘近乎禁绝(+50)，残局留作万不得已(+8)
-    if is_bomb {
-        let all_level_natural = cards.iter().all(|c| {
-            pctx.card_info.get(c).map(|ci| ci.is_level && !ci.is_wild).unwrap_or(false)
-        });
-        if all_level_natural {
-            let tier_add = if !clearing && pctx.my_remaining > 6 { 50 } else { 8 };
-            strategic_tier = strategic_tier.saturating_add(tier_add);
-        }
-    }
-
-    // 三带二带级牌对或王对惩罚：一般不这样用，除非万不得已
-    if matches!(combo.kind, CombinationKind::Ordinary(OrdinaryKind::FullHouse)) {
-        let has_level_pair = cards.iter().filter(|c| {
-            pctx.card_info.get(c.as_str()).map(|ci| ci.is_level).unwrap_or(false)
-        }).count() >= 2;
-        let has_joker_pair = cards.iter().filter(|c| c.starts_with("🃏") || c.starts_with("👑")).count() >= 2;
-
-        if has_level_pair || has_joker_pair {
-            let mut penalty = 20;
-
-            let is_last_play = cards.len() >= pctx.my_remaining;
-            let opponent_will_win = pctx.opponent_1 && !pctx.is_leading && !is_last_play;
-
-            if is_last_play {
-                penalty = 2;
-            } else if opponent_will_win {
-                penalty = 5;
-            }
-
-            strategic_tier = strategic_tier.saturating_add(penalty);
-        }
-
-        // 三带二中使用逢人配：逢人配默认应配在大对子上形成更大的三张同
-        // 例如：两张9和两张6，逢人配红桃5应配在9上形成3张9的三带二，而非配在6上
-        // PlayScore排序中primary越小越好，会导致逢人配配小对子反而优先。
-        // 通过给primary更低的FullHouse加惩罚（逆反排序），确保逢人配优先配大对子。
-        if wild_count > 0 {
-            // primary越小（配小对子）→ penalty越大 → 越不被优先
-            // primary越大（配大对子）→ penalty越小 → 越被优先
-            let penalty = 20u8.saturating_sub(combo.primary);
-            strategic_tier = strategic_tier.saturating_add(penalty);
-        }
-    }
-
-    // 逢人配不要配在已经是炸弹的牌上：非逢人配已构成炸弹时，逢人配浪费
-    if is_bomb && wild_count > 0 {
-        let non_wild_count = cards.len() - wild_count;
-        if non_wild_count >= 4 {
-            let mut rank_counts: HashMap<u8, usize> = HashMap::new();
-            for c in cards {
-                if let Some(ci) = pctx.card_info.get(c) {
-                    if !ci.is_wild {
-                        *rank_counts.entry(ci.rank).or_default() += 1;
-                    }
-                }
-            }
-            if rank_counts.values().any(|&c| c >= 4) {
-                strategic_tier = strategic_tier.saturating_add(3);
-            }
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 逢人配使用原则：优先组合多数量炸弹或同花顺
-    // 红桃级牌优先组合多数量炸弹（4张+逢人配变5炸）或同花顺
-    // 手里仅有1张逢人配，不要为凑4张炸浪费，留到残局凑同花顺更大收益
-    // 逢人配组成的同花顺＞普通5炸，但低于6张纯炸弹
-    // ══════════════════════════════════════════════════════════════
-    if wild_count > 0 && is_bomb {
-        // 逢人配用于炸弹：如果是4张+逢人配→5炸，这是好的使用方式
-        let non_wild = cards.len() - wild_count;
-        if non_wild == 3 && wild_count == 1 {
-            // 3张+1逢人配=4炸，如果只有1张逢人配，浪费了
-            // 只有1张逢人配时，优先留到残局凑同花顺
-            if pctx.combos.bomb_count <= 2 {
-                strategic_tier = strategic_tier.saturating_add(2); // 仅1张逢人配，不凑4炸
-            }
-        }
-        // 逢人配组成的同花顺：优先级高于普通5炸但低于6张纯炸弹
-        if matches!(combo.kind, CombinationKind::Bomb(BombKind::StraightFlush)) {
-            // 同花顺是好的逢人配使用方式，给予奖励
-            strategic_tier = strategic_tier.saturating_sub(1); // 略微降低tier，鼓励逢人配组同花顺
-        }
-
-        // 三同张带2张逢人配：3张同rank + 2张逢人配 = 5张炸弹
-        // 不推荐同时使用2张逢人配（但允许，非禁止）：有更好选择时优先不用
-        if matches!(combo.kind, CombinationKind::Bomb(BombKind::SameRank { n: 5 })) && wild_count == 2 {
-            let non_wild = cards.len() - wild_count;
-            if non_wild == 3 {
-                // 惩罚值:轻微不推荐(而非禁止)
-                // 原值过重(15/8/5/2)，等同禁止；现改为"不推荐"级别
-                let mut penalty = 6;
-
-                let is_last_play = cards.len() >= pctx.my_remaining;
-                let opponent_will_win = pctx.opponent_1 && !pctx.is_leading;
-
-                if is_last_play {
-                    penalty = 0; // 最后一手完全允许(清牌优先)
-                } else if opponent_will_win {
-                    penalty = 2; // 关键时刻允许
-                } else if pctx.combos.bomb_count == 0 && pctx.min_opp_remaining <= 3 {
-                    penalty = 4; // 中等不推荐
-                }
-
-                strategic_tier = strategic_tier.saturating_add(penalty);
-            }
-        }
-    }
-
-    // 炸弹绝不能空出，能用小炸弹压牌绝不能用大炸弹压牌
-    // 小炸弹（4张）优先于大炸弹（5张+）、同花顺、王炸
-    if is_bomb {
-        let bomb_size_penalty: u8 = match combo.kind {
-            CombinationKind::Bomb(BombKind::SameRank { n }) => {
-                n.saturating_sub(4) // 4-card=0, 5-card=1, 6-card=2, ...
-            }
-            CombinationKind::Bomb(BombKind::StraightFlush) => 4, // 同花顺优先级低于4-7张炸
-            CombinationKind::Bomb(BombKind::FourJoker) => 6,      // 王炸最后才用
-            _ => 0,
-        };
-        strategic_tier = strategic_tier.saturating_add(bomb_size_penalty);
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 炸弹使用原则：红线2 - 炸完后全是单张小散，无法连续出牌
-    // 炸完后自己全是单张小散，无法连续出牌，不炸，放过本轮
-    // ══════════════════════════════════════════════════════════════
-    let is_last_play = cards.len() >= pctx.my_remaining;
-
-    // ══ 房规：避免把自己打到「只剩小单张」——非清空出牌后剩余≥3张且全为≤10散单张时递增罚 ══
-    // mirror JS −22/张。仅中盘生效（>6张）：残局以多清牌为先，不与此冲突。
-    if !is_last_play && pctx.my_remaining > 6 {
-        let remaining_after = pctx.my_remaining - cards.len();
-        if remaining_after >= 3 {
-            let played_set: std::collections::HashSet<&String> = cards.iter().collect();
-            let mut rest_cnt: HashMap<u8, usize> = HashMap::new();
-            let mut bad_remainder = false;
-            for (card_str, ci) in &pctx.card_info {
-                if played_set.contains(card_str) {
-                    continue;
-                }
-                if ci.is_wild || ci.is_joker {
-                    bad_remainder = true;
-                    break;
-                }
-                *rest_cnt.entry(ci.rank).or_default() += 1;
-            }
-            if !bad_remainder {
-                let mut distinct_singles = 0usize;
-                for (&r, &n) in &rest_cnt {
-                    if n == 0 {
-                        continue;
-                    }
-                    if n != 1 || r == pctx.level_rank || r > 10 {
-                        bad_remainder = true;
-                        break;
-                    }
-                    distinct_singles += 1;
-                }
-                if !bad_remainder && distinct_singles >= 3 {
-                    strategic_tier = strategic_tier.saturating_add(distinct_singles.min(8) as u8);
-                }
-            }
-        }
-    }
-
-    // ══ 房规：残局保留最后一个炸弹（mirror JS −400）：清空/对手冲刺≤3/打完剩≤2张 豁免 ══
-    if is_bomb && !clearing && !is_last_play
-        && pctx.combos.bomb_count == 1
-        && pctx.my_remaining <= 6
-        && pctx.min_opp_remaining > 3
-        && pctx.my_remaining - cards.len() > 2
+    // ⑥ 绝对禁止：用炸弹压三张（太浪费，除非对手冲刺或残局）(JS 701-711)
+    if best_is_bomb
+        && matches!(
+            top.combination.kind,
+            CombinationKind::Ordinary(OrdinaryKind::Triple)
+        )
+        && !is_endgame
+        && !is_opp_sprinting
     {
-        strategic_tier = strategic_tier.saturating_add(40);
+        return Ok(PlayerAction::Pass);
     }
 
-    // 红线2：炸完后全是单张小散，无法连续出牌，不炸放过本轮
-    if is_bomb && !is_last_play {
-        let remaining_after = pctx.my_remaining - cards.len();
-        // 计算炸完后手牌中单张的数量
-        let mut remaining_singles = pctx.singles_count;
-        // 减去本次出牌中消耗的单张
-        for card in cards {
-            if let Some(ci) = pctx.card_info.get(card) {
-                let count = pctx.combos.rank_to_count.get(&ci.rank).copied().unwrap_or(0);
-                if count == 1 {
-                    remaining_singles = remaining_singles.saturating_sub(1);
+    // ⑦ 绝对禁止：拆牌惩罚得分极低时，过牌比出牌更好 (JS 713-718)
+    if best_score < -1000.0 {
+        return Ok(PlayerAction::Pass);
+    }
+
+    Ok(best.action.clone())
+}
+
+// ── JS scorePlay (L732-1157): 跟牌打分，base 100，越高越好 ──────────────
+
+fn score_follow(
+    play_cards: &[String],
+    play_combo: &Combination,
+    top: &PlayState,
+    p: &PlayContext,
+) -> f32 {
+    let kind = &play_combo.kind;
+    let mut score = BASE_FOLLOW_SCORE; // JS L734 base score
+
+    let my_remaining = p.my_remaining;
+    let is_endgame = p.is_endgame;
+    let combos = &p.combos;
+
+    // ── Hand combo analysis & split penalty (JS 740-756) ──
+    let bomb_split_verdict =
+        classify_bomb_split(play_cards, &p.my_hand, kind, my_remaining);
+    let play_is_bomb = play_combo.class() == CombinationClass::Bomb;
+    let mut penalty =
+        split_penalty(play_cards, combos, p.level_nat, p.has_level_card_or_joker, kind) as f32;
+    if !play_is_bomb {
+        if bomb_split_verdict == BombSplitVerdict::Exempt && penalty >= BANNED_SCORE {
+            penalty = 0.0; // 房规豁免：放行拆炸
+        }
+        if bomb_split_verdict == BombSplitVerdict::Banned {
+            penalty = penalty.max(BANNED_SCORE); // 双保险
+        }
+    }
+    score -= penalty * SPLIT_PENALTY_SCALE; // Heavy penalty for splitting good combos
+
+    let is_bomb = play_is_bomb;
+    let is_last_play = play_cards.len() >= my_remaining; // JS L759
+
+    // ── Bomb conservation (JS 762-807) ──
+    if is_bomb {
+        // Bomb size: prefer smaller bombs
+        match kind {
+            CombinationKind::Bomb(BombKind::SameRank { n: 4 }) => score += 5.0,
+            CombinationKind::Bomb(BombKind::SameRank { n: 5 }) => score -= 3.0,
+            CombinationKind::Bomb(BombKind::StraightFlush) => score -= 12.0,
+            CombinationKind::Bomb(BombKind::FourJoker) => score -= 20.0,
+            _ => score -= 6.0, // other bombs: slightly penalized
+        }
+
+        let min_opp_remaining = p.min_opp_remaining;
+        if is_last_play {
+            score += 20.0; // Bonus: clearing hand with bomb
+        } else if min_opp_remaining <= 6 {
+            score += 15.0; // 对手≤6张，炸弹拦截是好选择
+        } else if combos.bomb_count >= 3 && !is_endgame {
+            score -= 10.0; // 3+炸弹，留至少1个到残局
+        }
+
+        // 只有1-2个炸弹时，非残局非对手冲刺不能用炸弹
+        if !is_endgame && !is_last_play && min_opp_remaining > 6 {
+            if combos.bomb_count < 2 {
+                score -= 200.0; // 仅1个炸弹，绝对保留
+            } else if combos.bomb_count < 3 {
+                score -= 50.0; // 2个炸弹，至少留1个
+            }
+        }
+
+        // 房规：残局保留最后一个炸弹——非清空不轻出 (JS 800-806)
+        let rest_cards_after_bomb = my_remaining.saturating_sub(play_cards.len());
+        if is_endgame
+            && !is_last_play
+            && combos.bomb_count == 1
+            && min_opp_remaining > 3
+            && rest_cards_after_bomb > 2
+        {
+            score -= 400.0; // 留炸保底
+        }
+    }
+
+    // ── 禁止出级牌炸弹 (JS 809-818) ──
+    if is_bomb {
+        let level_cards = play_cards
+            .iter()
+            .filter(|c| {
+                p.meta_for(c)
+                    .map(|m| m.rank == p.level_rank && !m.is_wild)
+                    .unwrap_or(false)
+            })
+            .count();
+        if level_cards >= 4 {
+            score -= BANNED_SCORE; // 级牌炸弹，直接禁止
+        }
+    }
+
+    // 手牌≤6张时必须保留至少1个炸弹 → 非炸弹出牌重奖 (JS 822-827)
+    if !is_bomb && !is_last_play {
+        let remaining_after = my_remaining.saturating_sub(play_cards.len());
+        if remaining_after <= 6 && combos.bomb_count >= 1 {
+            score += 500.0; // 保留炸弹到残局，重奖！
+        }
+    }
+
+    // ── 炸弹压非炸弹牌型扣分 (JS 831-855) ──
+    if is_bomb {
+        let last_is_bomb = top.combination.class() == CombinationClass::Bomb;
+        if !last_is_bomb {
+            let min_opp_rem = p.min_opp_remaining;
+            if !is_last_play && min_opp_rem > 6 && !is_endgame {
+                match top.combination.kind {
+                    CombinationKind::Ordinary(OrdinaryKind::Single) => score -= 300.0,
+                    CombinationKind::Ordinary(OrdinaryKind::Pair) => score -= 200.0,
+                    CombinationKind::Ordinary(OrdinaryKind::Straight)
+                    | CombinationKind::Ordinary(OrdinaryKind::Tube)
+                    | CombinationKind::Ordinary(OrdinaryKind::Plate) => score -= 80.0,
+                    // 炸弹可以压三张/三带二，不扣分
+                    _ => {}
                 }
             }
         }
-        // 如果炸完后剩余牌中单张占比超过60%，说明全是散牌，不应炸
-        // 剩余1张时不罚（1张牌永远是单张，且是最后一张牌）
-        if remaining_after > 1 && remaining_singles as f64 / remaining_after as f64 > 0.6 {
-            strategic_tier = strategic_tier.saturating_add(20); // 炸完全是散牌，重罚
+    }
+
+    // ── 逢人配优先组成炸弹/同花顺奖励 (JS 864-881) ──
+    let has_wildcard = play_cards
+        .iter()
+        .any(|c| p.meta_for(c).map(|m| m.is_wild).unwrap_or(false));
+    if has_wildcard {
+        if is_bomb
+            || matches!(kind, CombinationKind::Bomb(BombKind::StraightFlush))
+        {
+            score += 100.0; // 逢人配配炸弹/同花顺：重奖！
+        } else {
+            match kind {
+                CombinationKind::Ordinary(OrdinaryKind::Straight)
+                | CombinationKind::Ordinary(OrdinaryKind::Plate)
+                | CombinationKind::Ordinary(OrdinaryKind::Tube)
+                | CombinationKind::Ordinary(OrdinaryKind::FullHouse) => score += 30.0,
+                CombinationKind::Ordinary(OrdinaryKind::Triple) => score += 20.0,
+                _ => {}
+            }
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
-    // 通用残局散牌惩罚：残局出组合牌型后，剩余手牌全是散牌，应避免
-    // 解决"牌局最后剩小牌和单张"问题：防止残局拆组合出大牌后留下无法组合的小散牌。
-    // 仅对非炸弹、非单张、非最后出牌生效：单张是在消化散牌（不罚），组合拆散才罚。
-    // ══════════════════════════════════════════════════════════════
-    if !is_bomb && !is_last_play && pctx.my_remaining <= 8 {
-        let remaining_after = pctx.my_remaining - cards.len();
+    // ── 房规：已是天然炸弹再贴百搭升档 = 浪费 (JS 886-908) ──
+    if has_wildcard && play_cards.len() < my_remaining {
+        let wild_cnt = play_cards
+            .iter()
+            .filter(|c| p.meta_for(c).map(|m| m.is_wild).unwrap_or(false))
+            .count();
+        let naturals: Vec<CardMeta> = play_cards
+            .iter()
+            .filter_map(|c| p.meta_for(c))
+            .filter(|m| !m.is_wild && !m.is_joker)
+            .collect();
+        let uniq: HashSet<Rank> = naturals.iter().map(|m| m.rank).collect();
+        let naturals_already_bomb = naturals.len() >= 4
+            && uniq.len() == 1
+            && naturals.len() == play_cards.len() - wild_cnt;
+        if naturals_already_bomb && naturals[0].rank != p.level_rank {
+            if p.min_opp_remaining > DUAL_WILD_HAND_ENDGAME {
+                if my_remaining <= DUAL_WILD_HAND_ENDGAME {
+                    score -= UPGRADED_BOMB_WILD_PENALTY_ENDGAME; // 残局升档：轻罚
+                } else {
+                    score -= UPGRADED_BOMB_WILD_PENALTY_MIDGAME; // 中盘无场景升档：浪费重罚
+                }
+            }
+        }
+    }
+
+    // Prefer playing the minimum needed to beat (smallest margin) (JS 911-914)
+    let margin = play_combo.primary as i32 - top.combination.primary as i32;
+    score -= margin as f32 * 2.0;
+
+    // Prefer fewer cards when not endgame (JS 917-919)
+    if !is_endgame || !is_bomb {
+        score -= play_cards.len() as f32 * 3.0;
+    }
+
+    // Endgame: prefer clearing hand (JS 922-924)
+    if is_endgame {
+        score += p.params.endgame_clear_hand_bias * 10.0;
+    }
+
+    // ── 残局散牌惩罚: bomb leaves scattered singles (JS 928-943) ──
+    if is_bomb && play_cards.len() < my_remaining {
+        let remaining_after = my_remaining - play_cards.len();
         if remaining_after > 1 {
-            let mut remaining_singles = pctx.singles_count;
-            for card in cards {
-                if let Some(ci) = pctx.card_info.get(card) {
-                    let count = pctx.combos.rank_to_count.get(&ci.rank).copied().unwrap_or(0);
-                    if count == 1 {
+            let mut remaining_singles = combos.singles_count;
+            for card in play_cards {
+                if let Some(&nv) = combos.card_to_rank.get(card) {
+                    if combos.rank_to_count.get(&nv).copied().unwrap_or(0) == 1 {
                         remaining_singles = remaining_singles.saturating_sub(1);
                     }
                 }
             }
-            let ratio_after = remaining_singles as f64 / remaining_after as f64;
-            let is_single_play = matches!(combo.kind, CombinationKind::Ordinary(OrdinaryKind::Single));
-            // 出非单张组合后剩余散牌占比 > 60%，说明拆了组合留散牌，惩罚
-            if ratio_after > 0.6 && !is_single_play {
-                strategic_tier = strategic_tier.saturating_add(5);
+            let ratio_after = remaining_singles as f32 / remaining_after as f32;
+            if ratio_after > 0.6 {
+                score -= 30.0; // Heavy penalty: bomb leaves scattered singles
             }
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
-    // 炸弹使用原则：红线3 - 对手只剩1张，炸完不能一手清完
-    // 对手只剩1张牌，你炸完不能一手清完，不要开炸，留给队友拦截
-    // ══════════════════════════════════════════════════════════════
-    if is_bomb && pctx.opponent_1 && !is_last_play {
-        strategic_tier = strategic_tier.saturating_add(25); // 对手1张，炸不完不炸
+    // ── Team awareness: 联邦接风重奖 (JS 947-957) ──
+    let top_is_teammate = top.seat == p.teammate_seat;
+    if top_is_teammate && !is_bomb {
+        score += 300.0; // 给联邦接风，重奖！
+    }
+    if p.teammate_remaining == 1 && !is_bomb {
+        score += 10.0;
+    } else if p.teammate_remaining <= 6 && !is_bomb {
+        score += 5.0;
     }
 
-    // ── 精准残局送牌/卡牌：根据敌我剩牌数决定出牌型偏好 ──
-
-    // 对手剩1张 + 领牌：绝不放单张，重罚单张
-    if pctx.opponent_1 && pctx.is_leading && !is_last_play {
-        if matches!(combo.kind, CombinationKind::Ordinary(OrdinaryKind::Single)) {
-            strategic_tier = strategic_tier.saturating_add(30); // 绝不放单
-        }
-    }
-
-    // 对手剩2张 + 领牌：少放对子，多打单/三带/顺子
-    if pctx.opponent_2 && pctx.is_leading && !is_last_play {
-        if matches!(combo.kind, CombinationKind::Ordinary(OrdinaryKind::Pair)) {
-            strategic_tier = strategic_tier.saturating_add(15); // 少放对子
-        }
-    }
-
-    // 队友剩1张 + 领牌：全程出单，拆对子、拆三带也要送单
-    if pctx.teammate_1 && pctx.is_leading && !is_last_play {
-        if matches!(combo.kind, CombinationKind::Ordinary(OrdinaryKind::Single)) {
-            strategic_tier = strategic_tier.saturating_sub(10); // 强烈偏好单张
-        }
-    }
-
-    // 队友剩2张 + 领牌：只打对子
-    if pctx.teammate_2 && pctx.is_leading && !is_last_play {
-        if matches!(combo.kind, CombinationKind::Ordinary(OrdinaryKind::Pair)) {
-            strategic_tier = strategic_tier.saturating_sub(10); // 强烈偏好对子
-        }
-    }
-
-    // 队友剩3张 + 领牌：打三不带/三带二
-    if pctx.teammate_3 && pctx.is_leading && !is_last_play {
-        if matches!(combo.kind, CombinationKind::Ordinary(OrdinaryKind::Triple)) {
-            strategic_tier = strategic_tier.saturating_sub(10); // 强烈偏好三张
-        }
-    }
-
-    // Merge split_penalty into strategic_tier for correct ranking.
-    // Previously split_penalty was a separate field compared AFTER strategic_tier,
-    // which meant a play that breaks a bomb (tier 0, penalty 3) could outrank
-    // playing the bomb intact (tier 5, penalty 0).
-    // Now penalty is added to tier so the ranking is correct:
-    // e.g. breaking only bomb: 0+10=10 > playing bomb: 5+0=5 (break is worse)
-    strategic_tier = strategic_tier.saturating_add(penalty);
-    strategic_tier = strategic_tier.saturating_add(direct_bomb_penalty); // 兜底：拆炸弹惩罚
-
-    // ── 顺子优先消灭单张 ──
-    // 组顺子的原则是尽量消灭单张，比如有三个单张4、6、8，就可以组成45678，
-    // 此时可以拆牌优先组顺子。顺子包含≥3个手牌单张时，给予奖励（降低tier）。
-    if matches!(combo.kind, CombinationKind::Ordinary(OrdinaryKind::Straight)) {
-        let mut singles_consumed = 0u8;
-        for card in cards {
-            if let Some(&rank) = pctx.combos.card_to_rank.get(card) {
-                if pctx.combos.rank_to_count.get(&rank).copied().unwrap_or(0) == 1 {
-                    singles_consumed += 1;
+    // ── 残局移除单张奖励 (JS 960-984) ──
+    if my_remaining <= 6 && !is_bomb {
+        let mut singles_removed = 0usize;
+        let mut small_singles_removed = 0usize;
+        for card in play_cards {
+            let Some(m) = p.meta_for(card) else { continue };
+            if m.is_joker || m.is_wild || m.rank == p.level_rank {
+                continue;
+            }
+            let Some(nv) = m.natural else { continue };
+            if combos.rank_to_count.get(&nv).copied().unwrap_or(0) == 1 {
+                singles_removed += 1;
+                if m.rank_value <= 10 {
+                    small_singles_removed += 1;
                 }
             }
         }
-        if singles_consumed >= 3 {
-            let bonus = singles_consumed - 2; // 3单张→bonus=1, 4→2, 5→3
-            strategic_tier = strategic_tier.saturating_sub(bonus);
+        if singles_removed > 0 {
+            score += singles_removed as f32 * 400.0; // 残局跟牌移除单张，重奖！
+        }
+        if small_singles_removed > 0 {
+            score += small_singles_removed as f32 * 300.0; // 残局跟牌移除小单张，额外重奖！
         }
     }
 
-    // ── 学习参数调整：仅在自对弈训练时生效 ──
-    // 当学习参数被设置时，使用学习到的权重调整策略评分。
-    // 使用 seat-specific 参数（NS/EW 各自一套），打破自对弈对称性，让优化器能区分参数好坏。
-    if let Some(lp) = get_learn_params_for_seat(pctx.actor) {
-        let mut multiplier = lp.team_win_weight.clamp(0.1, 10.0);
-
-        if is_bomb {
-            if pctx.is_leading {
-                // 炸弹保守：领牌出炸弹应更保守（tier↑），避免乱炸。
-                // 修复原方向错误：原 *= 0.8 会降tier鼓励出炸弹，与"保守"语义相反。
-                multiplier /= lp.bomb_conserve_bias.clamp(0.1, 10.0);
+    // ── 对手≤6张时强制拦截 (JS 987-1013) ──
+    let min_opp_remaining = p.min_opp_remaining;
+    if min_opp_remaining <= 6 && !is_bomb {
+        match top.combination.kind {
+            CombinationKind::Ordinary(OrdinaryKind::Single)
+            | CombinationKind::Ordinary(OrdinaryKind::Pair) => {
+                if play_combo.primary > 10 {
+                    score += 15.0; // 出大牌阻止对手送牌
+                }
             }
-            if pctx.min_opp_remaining <= lp.enemy_low_cards_threshold as usize {
-                // 对手少牌时激进出炸弹拦截（tier↓）
-                multiplier /= lp.bomb_aggression_when_enemy_low.clamp(0.1, 10.0);
-            }
-        }
-
-        if pctx.my_remaining <= lp.endgame_hand_count_threshold as usize {
-            // 残局更谨慎（tier↑）：避免盲目出牌拆散组合导致残局剩散牌。
-            // 修复原方向错误：原 /= 1.2 会降tier鼓励出牌，反而导致拆大牌、剩小单张。
-            // determine_strategic_tier 残局领牌出非炸弹已是 tier=0（最高优先），
-            // 此处 ×1.2 对 tier=0 无影响，但会提高炸弹 tier，避免残局乱炸。
-            multiplier *= lp.endgame_clear_hand_bias.clamp(0.1, 10.0);
-        }
-
-        if pctx.partner_leading {
-            multiplier *= lp.yield_to_partner_bias.clamp(0.1, 10.0);
-        }
-
-        if pctx.is_leading {
-            multiplier /= lp.proactive_play_bias.clamp(0.1, 10.0);
-
-            if matches!(combo.kind, CombinationKind::Ordinary(OrdinaryKind::Single)) {
-                multiplier /= lp.low_card_dump_bias.clamp(0.1, 10.0);
+            _ => {
+                score += 10.0; // 对手出其他牌型，跟牌压住
             }
         }
-
-        if pctx.teammate_remaining <= lp.partner_sprint_threshold as usize && pctx.is_leading {
-            multiplier /= lp.first_out_weight.clamp(0.1, 10.0);
-        }
-
-        if pctx.teammate_remaining <= lp.partner_sprint_threshold as usize + 2 && !pctx.is_leading {
-            multiplier *= lp.second_out_weight.clamp(0.1, 10.0);
-        }
-
-        // 用 round 替代 as u8 截断，减少低 tier 值的取整信息丢失。
-        strategic_tier = ((strategic_tier as f32 * multiplier).round() as u8).min(255);
+    } else if min_opp_remaining <= 6 && is_bomb {
+        score += 10.0; // 对手≤6张，用炸弹拦截也是好选择
     }
 
-    let is_non_level = !cards.iter().any(|c| {
-        pctx.card_info.get(c).map(|ci| ci.is_level).unwrap_or(false)
-    });
+    // ── 逢人配不能浪费（惩罚性检查）(JS 1018-1057) ──
+    if has_wildcard {
+        let finishing_play = play_cards.len() >= my_remaining; // 清空手牌：全部豁免
+        let endgame_hand = my_remaining <= DUAL_WILD_HAND_ENDGAME;
 
-    PlayScore {
-        strategic_tier,
-        split_penalty: 0, // merged into strategic_tier above
-        wild_count,
-        is_bomb,
-        is_non_level,
-        primary: combo.primary,
-        cards_len: std::cmp::Reverse(cards.len()),
-        sorted_cards: sorted,
-    }
-}
-
-/// Determine the strategic priority tier for a play.
-/// Lower tier = higher priority.
-///
-/// Bomb conservation strategy:
-/// - 0 bombs in hand: normal play
-/// - 1 bomb in hand: save for endgame; only use when opponent sprinting or in endgame
-/// - 2+ bombs in hand: can use one in early/mid, keep at least one for endgame
-///
-/// Tier 0: Highest priority (always pick)
-/// Tier 1-2: Normal priority
-/// Tier 3: Low priority (use only when necessary)
-/// Tier 5: Very low priority (essentially never use)
-fn determine_strategic_tier(is_bomb: bool, pctx: &PlayContext) -> u8 {
-    let endgame = pctx.my_remaining <= 6;
-    let approaching_endgame = pctx.my_remaining <= 10 && pctx.my_remaining > 6;
-    let teammate_sprinting = pctx.teammate_remaining <= 3;
-    let teammate_few = pctx.teammate_remaining <= 6;
-    let opponent_sprinting = pctx.min_opp_remaining <= 6;
-    let opponent_last = pctx.min_opp_remaining <= 2;
-    let bombs = pctx.bomb_count;
-
-    // ══════════════════════════════════════════════════════════════
-    // 铁律：绝不能压队友的钢板(Plate)、木板(Tube)、杂顺(Straight)
-    // 无论队友剩几张牌、牌值大小，这三种牌型绝对不压
-    // ══════════════════════════════════════════════════════════════
-    if pctx.partner_leading && !pctx.is_leading {
-        let is_partner_special = matches!(pctx.top_play_kind.as_deref(),
-            Some(k) if k.contains("Plate") || k.contains("Tube") ||
-                (k.contains("Straight") && !k.contains("StraightFlush"))
-        );
-        if is_partner_special {
-            return 6; // 绝不压队友的钢板/木板/杂顺
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 铁律：不能压队友的级牌
-    // 级牌是当前打几的关键牌，压队友级牌等于浪费我方资源
-    // 例外：如果是让队友接牌（队友出小级牌，你出大级牌，队友再出更大的→协同夺牌权）
-    //   目前统一禁止压队友级牌，避免误判
-    // ══════════════════════════════════════════════════════════════
-    if pctx.partner_leading && !pctx.is_leading {
-        let top_is_level = pctx.top_play_value.map(|v| v == pctx.level_rank).unwrap_or(false);
-        if top_is_level {
-            return 6; // 绝不压队友的级牌
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 炸弹使用原则：队友打出炸弹，你有更大炸弹不要随便盖
-    // 队友炸完刚拿到牌权，你再盖炸会夺走他的出牌机会
-    // 除非对手马上要反炸队友，才续炸控场
-    // ══════════════════════════════════════════════════════════════
-    if is_bomb && pctx.partner_just_bombed && !pctx.is_leading {
-        return 6; // 队友刚出炸弹拿牌权，不要盖
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 铁律：队友出大小王，绝对不能压
-    // 大小王是最大单牌，队友出王说明有明确意图，压队友王等于内耗
-    // ══════════════════════════════════════════════════════════════
-    if pctx.partner_leading && !pctx.is_leading {
-        let top_is_joker = pctx.top_play_value.map(|v| v >= 15).unwrap_or(false);
-        if top_is_joker {
-            return 6; // 绝不压队友的大小王
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 炸弹使用原则：对手出炸弹压制队友，必须反炸
-    // 队友被敌方炸弹压住，你持有更大炸弹时立刻跟炸，夺回牌权给队友跑牌
-    // ══════════════════════════════════════════════════════════════
-    let top_is_opponent_bomb = !pctx.is_leading && !pctx.partner_leading &&
-        pctx.top_play_kind.as_deref().map(|k| k.starts_with("Bomb")).unwrap_or(false);
-    if is_bomb && top_is_opponent_bomb {
-        return 0; // 对手炸弹压队友，必须反炸
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 残局拦截：对方发小牌（小单张/小对子），最后一家必须压牌
-    // 对手剩≤6张且牌值≤8时，无条件压牌拦截，绝不让对方顺牌出完
-    // ══════════════════════════════════════════════════════════════
-    if opponent_sprinting && !pctx.is_leading && !pctx.partner_leading {
-        if pctx.top_play_value.unwrap_or(15) <= 8 {
-            return 0; // 残局拦截对手小牌，必须压
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 最高优先级：对手只剩1张 → 必须全力拦截，绝不放单
-    // 但队友领牌时不能压队友的牌
-    // ══════════════════════════════════════════════════════════════
-    if pctx.opponent_1 && !pctx.is_leading && !pctx.partner_leading {
-        // 对手剩1张，跟牌时必须出牌压住
-        if is_bomb {
-            return 0; // 炸弹拦截，最高优先级
-        } else {
-            return 0; // 任何牌都出，绝不让对手走单
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 对手剩1张 + 领牌：绝不放单张，打对子/三带/顺子逼对手拆牌
-    // ══════════════════════════════════════════════════════════════
-    if pctx.opponent_1 && pctx.is_leading {
-        // 领牌时绝不放单，出对子/三带/顺子等牌型
-        if is_bomb {
-            // 如果队友牌差（≥6张），直接开炸控场
-            if pctx.teammate_remaining >= 6 {
-                return 0; // 开炸控场，打对子/三带
-            }
-            return 3; // 保留炸弹，不出炸弹
-        } else {
-            return 0; // 出非炸弹牌型（对子/三带/顺子优先，单张会受惩罚）
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 对手剩2张 → 少放对子，多打单/三带/顺子，逼对手拆牌
-    // 但队友领牌时不能压队友的牌
-    // ══════════════════════════════════════════════════════════════
-    if pctx.opponent_2 && !pctx.is_leading && !pctx.partner_leading {
-        if is_bomb {
-            return 0; // 炸弹拦截
-        } else {
-            return 0; // 出牌拦截
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 对手剩3-5张（危险区间）→ 手里留炸弹防守，不放小牌型
-    // 但队友领牌时不能压队友的牌
-    // ══════════════════════════════════════════════════════════════
-    if pctx.opponent_3_5 && !pctx.is_leading && !pctx.partner_leading {
-        if is_bomb {
-            return 0; // 炸弹拦截
-        } else {
-            return 0; // 出牌拦截
-        }
-    }
-    if pctx.opponent_3_5 && pctx.is_leading {
-        // 对手3-5张，领牌时保留炸弹防守
-        if is_bomb {
-            return 3; // 保留炸弹
-        } else {
-            return 0; // 出非炸弹
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 炸弹使用原则：炸五不炸四，炸七不炸八
-    // 对手剩5张（大概率4炸+单）→ 必炸拦截
-    // 对手剩7张（多为一炸+两手牌）→ 必炸拦截
-    // 对手剩4张（极可能本身就是4张炸）→ 慎炸，炸完无牌收尾等于白送
-    // 对手剩8张（可能是两炸或炸+牌）→ 缓观，不急炸
-    // ══════════════════════════════════════════════════════════════
-    if is_bomb && !pctx.is_leading && !pctx.partner_leading {
-        if pctx.opponent_5 || pctx.opponent_7 {
-            return 0; // 必炸：5/7张大概率一炸+散牌，不炸直接头游
-        }
-        if pctx.opponent_4 || pctx.opponent_8 {
-            return 4; // 慎炸/缓观：4张可能是炸弹，8张可能是两炸
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 队友剩1张 → 全程出单，拆对子、拆三带也要送单
-    // ══════════════════════════════════════════════════════════════
-    if pctx.teammate_1 && pctx.is_leading {
-        // 队友剩1张，领牌时优先出单张送队友
-        if is_bomb {
-            return 5; // 不出炸弹，送单张
-        } else {
-            return 0; // 出单张送队友（单张会获得bonus）
-        }
-    }
-    if pctx.teammate_1 && !pctx.is_leading {
-        if pctx.partner_leading {
-            return 6; // 队友领牌，不压
-        } else {
-            // 对手领牌，用最小牌压，然后出单张送队友
-            if is_bomb {
-                return 4; // 不乱用炸弹
+        // 房规：百搭落在级牌上 = 不合理，重罚
+        let same_rank_type = matches!(
+            kind,
+            CombinationKind::Ordinary(OrdinaryKind::Pair)
+                | CombinationKind::Ordinary(OrdinaryKind::Triple)
+        ) || is_bomb;
+        let touches_level_natural = play_cards.iter().any(|c| {
+            p.meta_for(c)
+                .map(|m| m.rank == p.level_rank && !m.is_wild)
+                .unwrap_or(false)
+        });
+        if !finishing_play && same_rank_type && touches_level_natural {
+            score -= if endgame_hand {
+                WILD_ON_LEVEL_PENALTY_ENDGAME
             } else {
-                return 0; // 压牌后出单送队友
-            }
+                WILD_ON_LEVEL_PENALTY_MIDGAME
+            };
         }
-    }
 
-    // ══════════════════════════════════════════════════════════════
-    // 队友剩2张 → 只打对子
-    // ══════════════════════════════════════════════════════════════
-    if pctx.teammate_2 && pctx.is_leading {
-        if is_bomb {
-            return 5; // 不出炸弹，送对子
-        } else {
-            return 0; // 出对子送队友（对子会获得bonus）
-        }
-    }
-    if pctx.teammate_2 && !pctx.is_leading {
-        if pctx.partner_leading {
-            return 6; // 队友领牌，不压
-        } else {
-            if is_bomb {
-                return 4;
+        // 房规：天然级牌炸弹（百搭当级牌面值凑炸）= 严重浪费
+        let lvl_face_bomb = is_bomb
+            && play_cards.iter().all(|c| {
+                p.meta_for(c)
+                    .map(|m| m.is_wild || m.rank == p.level_rank)
+                    .unwrap_or(false)
+            });
+        if !finishing_play && lvl_face_bomb {
+            score -= if endgame_hand {
+                DUAL_WILD_PENALTY_ENDGAME
             } else {
-                return 0; // 压牌后出对子送队友
+                DUAL_WILD_PENALTY_MIDGAME
+            };
+        }
+
+        if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Single)) && !finishing_play {
+            score -= BANNED_SCORE; // 逢人配绝不能单出——清空手牌绝对豁免
+        } else if is_bomb || matches!(kind, CombinationKind::Bomb(BombKind::StraightFlush)) {
+            // 逢人配配非级牌炸弹、同花顺：最优使用，不罚
+        } else if matches!(
+            kind,
+            CombinationKind::Ordinary(OrdinaryKind::Plate)
+                | CombinationKind::Ordinary(OrdinaryKind::Tube)
+                | CombinationKind::Ordinary(OrdinaryKind::FullHouse)
+                | CombinationKind::Ordinary(OrdinaryKind::Triple)
+                | CombinationKind::Ordinary(OrdinaryKind::Straight)
+        ) {
+            // 合理使用，不罚
+        } else if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Pair)) {
+            // 房规：百搭配普通单张成普通对 = 又弱又废，重罚
+            if !finishing_play {
+                let pair_naturals: Vec<CardMeta> = play_cards
+                    .iter()
+                    .filter_map(|c| p.meta_for(c))
+                    .filter(|m| !m.is_wild && !m.is_joker)
+                    .collect();
+                let pair_rank = pair_naturals.first().map(|m| m.rank).unwrap_or(p.level_rank);
+                if pair_rank != p.level_rank {
+                    score -= if endgame_hand {
+                        WILD_PAIR_PENALTY_ENDGAME
+                    } else {
+                        WILD_PLAIN_PAIR_PENALTY_MIDGAME
+                    };
+                }
             }
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 队友剩3张 → 打三不带/三带二
-    // ══════════════════════════════════════════════════════════════
-    if pctx.teammate_3 && pctx.is_leading {
-        if is_bomb {
-            return 5; // 不出炸弹，送三张
         } else {
-            return 0; // 出三张送队友（三张会获得bonus）
-        }
-    }
-    if pctx.teammate_3 && !pctx.is_leading {
-        if pctx.partner_leading {
-            return 6;
-        } else {
-            if is_bomb {
-                return 4;
-            } else {
-                return 0;
-            }
+            score -= 10.0; // 其他非最优使用
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
-    // 通用残局逻辑（兜底）
-    // ══════════════════════════════════════════════════════════════
+    // ── 双百搭同出 (JS 1061-1086) ──
+    let dw_finishing = play_cards.len() >= my_remaining;
+    let dw_endgame = my_remaining <= DUAL_WILD_HAND_ENDGAME;
 
-    // 残局对手冲刺：必须拦截
-    if opponent_last && !pctx.is_leading {
-        if is_bomb { return 0; } else { return 0; }
-    }
-    if opponent_sprinting && !pctx.is_leading {
-        if is_bomb { return 0; } else { return 0; }
+    // 房规：拆炸弹兜底补罚 (JS 1065-1067)
+    if !is_bomb && bomb_split_verdict == BombSplitVerdict::Banned {
+        score -= BANNED_SCORE; // 拆炸弹绝对禁止
     }
 
-    // 残局队友冲刺：领牌时送队友需要的牌型
-    if teammate_sprinting && pctx.is_leading {
-        if is_bomb { return 3; } else { return 0; }
-    }
-
-    // 残局队友冲刺：跟牌时判断队友要什么
-    if teammate_sprinting && !pctx.is_leading {
-        if pctx.partner_leading {
-            return 6;
-        } else {
-            if is_bomb { return 4; } else { return 0; }
-        }
-    }
-
-    // 残局领牌：对手冲刺时出大牌，队友冲刺时出小牌
-    if endgame && pctx.is_leading {
-        if opponent_sprinting {
-            if is_bomb { return 0; } else { return 0; }
-        }
-        if teammate_sprinting {
-            if is_bomb { return 3; } else { return 0; }
-        }
-        if is_bomb { return 1; } else { return 0; }
-    }
-
-    // 铁律：队友领牌时，大牌不压，小牌可顺
-    if pctx.partner_leading && !pctx.is_leading {
-        let top_is_bomb = pctx.top_play_kind.as_deref()
-            .map(|k| k.starts_with("Bomb"))
-            .unwrap_or(false);
-        if top_is_bomb {
-            return 6; // 绝不压队友的炸弹
-        }
-        let big_threshold: u8 = match pctx.top_play_kind.as_deref() {
-            Some(kind) if kind.contains("Single") => 13,
-            _ => 10,
-        };
-        let top_is_big = pctx.top_play_value.unwrap_or(0) >= big_threshold;
-        // 队友出了大牌 → 绝不压，即使是残局对手冲刺也不压（队友有能力处理）
-        if top_is_big {
-            return 6;
-        }
-        // 队友出了小牌且对手冲刺 → 需要拦截，但要先判定是否压队友
-        if opponent_sprinting {
-            if is_bomb { return 6; } else { return 0; }
-        }
-        if is_bomb { return 6; } else { return 0; }
-    }
-
-    // 开局炸弹少时不压王和级牌
-    let top_is_joker_or_level = matches!(pctx.top_play_value, Some(14 | 15 | 16));
-    let early_game = pctx.my_remaining > 10;
-    if is_bomb && top_is_joker_or_level && bombs < 3 && early_game {
-        if opponent_sprinting { return 0; }
-        return 7;
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 炸弹使用原则：红线1 - 顺风大优不浪炸
-    // 仅当炸弹稀缺（1个）时严格保留；2+个炸弹时即使顺风也要积极夺牌权
-    // ══════════════════════════════════════════════════════════════
-    if is_bomb && pctx.is_wind_advantage && !opponent_sprinting && bombs == 1 {
-        return 7; // 仅1个炸弹+顺风大优，保留防突袭
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 炸弹使用原则：少炸不主动开花
-    // 全场仅持有1颗炸弹，绝不主动先出炸弹，留作残局拦截用
-    // ══════════════════════════════════════════════════════════════
-    if is_bomb && bombs == 1 && pctx.is_leading {
-        return 8; // 仅1颗炸弹，绝不主动开花
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 炸弹使用原则：队友牌烂，主动开炸铺路
-    // 队友全程过小牌、无上手机会，主动用炸弹拿权，持续打队友适配牌型
-    // ══════════════════════════════════════════════════════════════
-    if is_bomb && pctx.teammate_weak && !pctx.is_leading && !pctx.partner_leading {
-        if bombs >= 2 {
-            return 0; // 队友牌烂，主动开炸拿牌权铺路
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // 炸弹使用原则：大炸封头（炸弹分级留存）
-    // 6张及以上大炸、天王炸：全程保留，只用来拦截对手最后冲刺
-    // 注意：具体炸弹大小惩罚在score_play中通过bomb_size_penalty实现
-    // 仅当只有大炸没有小炸时保留；有小炸时优先用小炸
-    // ══════════════════════════════════════════════════════════════
-    if is_bomb && !endgame && !opponent_sprinting {
-        if pctx.big_bomb_count > 0 && pctx.small_bomb_count == 0 {
-            return 6; // 只有大炸没有小炸，非残局非冲刺时保留
-        }
-    }
-
-    // Bomb conservation: 2+ bombs（优先判断，确保积极夺牌权）
-    // 有2个及以上炸弹时，只保留1个到残局控牌，其他炸弹及时夺取出牌权
-    if is_bomb && bombs >= 2 {
-        if opponent_sprinting { return 0; }
-        if endgame { return 2; }          // 残局保留1个炸弹控牌
-        if approaching_endgame { return 2; } // 接近残局时更积极使用炸弹
-        return 1;                          // 非残局积极使用炸弹夺取出牌权
-    }
-
-    // Bomb conservation: only 1 bomb
-    if is_bomb && bombs == 1 {
-        if opponent_sprinting { return 0; }
-        if endgame { return 2; }
-        if approaching_endgame { return 6; }
-        // 非残局非冲刺，1个炸弹谨慎使用
-        if pctx.is_leading {
-            return 5; // 领牌时1个炸弹保留
-        } else {
-            return 3; // 跟牌时1个炸弹可适度使用夺牌权
-        }
-    }
-
-    // Normal (non-bomb or 0 bombs)
-    if opponent_sprinting {
-        if is_bomb { 0 } else { 1 }
-    } else if endgame && !pctx.is_leading {
-        if is_bomb { 2 } else { 0 }
-    } else if teammate_few && pctx.is_leading {
-        if is_bomb { 2 } else { 0 }
-    } else {
-        if is_bomb { 1 } else { 0 }
-    }
-}
-
-// ── Legacy API (kept for backward compatibility with tests) ────────────
-
-/// Legacy pick_playing without game context. Used by tests.
-/// Prefer `pick_playing_with_context` for production use.
-#[allow(dead_code)]
-fn pick_playing(legal: &[PlayerAction], ctx: RuleContext) -> Result<PlayerAction, String> {
-    let plays: Vec<&PlayerAction> = legal
+    let wild_count_in_play = play_cards
         .iter()
-        .filter(|a| matches!(a, PlayerAction::Play { .. }))
-        .collect();
-
-    if plays.is_empty() {
-        return legal
+        .filter(|c| p.meta_for(c).map(|m| m.is_wild).unwrap_or(false))
+        .count();
+    if !dw_finishing && wild_count_in_play >= 2 {
+        let dw_naturals: Vec<CardMeta> = play_cards
             .iter()
-            .find(|a| matches!(a, PlayerAction::Pass))
-            .cloned()
-            .ok_or_else(|| "suggest: no pass in legal".into());
-    }
-
-    let mut best: Option<&PlayerAction> = None;
-    for a in plays {
-        if playing_cmp(a, best, ctx)? == Ordering::Less {
-            best = Some(a);
+            .filter_map(|c| p.meta_for(c))
+            .filter(|m| !m.is_wild && !m.is_joker)
+            .collect();
+        let dw_ranks: HashSet<Rank> = dw_naturals.iter().map(|m| m.rank).collect();
+        let bare_dual = dw_naturals.is_empty();
+        let sanctioned_endgame = dw_endgame
+            && !bare_dual
+            && !dw_ranks.is_empty()
+            && !dw_ranks.contains(&p.level_rank)
+            && (is_bomb
+                || matches!(
+                    kind,
+                    CombinationKind::Ordinary(OrdinaryKind::FullHouse)
+                        | CombinationKind::Ordinary(OrdinaryKind::Plate)
+                        | CombinationKind::Ordinary(OrdinaryKind::Tube)
+                ));
+        if sanctioned_endgame {
+            score -= 10.0; // 残局唯一合法用法：轻微不鼓励
+        } else {
+            score -= if dw_endgame {
+                DUAL_WILD_PENALTY_ENDGAME
+            } else {
+                DUAL_WILD_PENALTY_MIDGAME
+            };
+            if bare_dual {
+                score -= BARE_DUAL_WILD_EXTRA_PENALTY; // 裸双百搭：额外重罚
+            }
         }
     }
-    best.cloned()
-        .ok_or_else(|| "suggest: empty play list".into())
-}
 
-/// Prefer `a` over `b` if Ordering::Less.
-fn playing_cmp(
-    a: &PlayerAction,
-    b: Option<&PlayerAction>,
-    ctx: RuleContext,
-) -> Result<Ordering, String> {
-    let Some(b) = b else {
-        return Ok(Ordering::Less);
-    };
-    Ok(play_key(a, ctx)?.cmp(&play_key(b, ctx)?))
-}
-
-/// Sort key for preferred playing suggestion:
-/// 1) fewer wildcard cards first (0 < 1 < 2 ...)
-/// 2) non-bomb before bomb
-/// 3) smaller combination primary value first
-/// 4) if same primary, more cards first
-/// 5) lexicographic card symbols for deterministic tie-break
-fn play_key(
-    a: &PlayerAction,
-    ctx: RuleContext,
-) -> Result<(usize, bool, u8, std::cmp::Reverse<usize>, Vec<String>), String> {
-    match a {
-        PlayerAction::Play {
-            cards,
-            wild_targets,
-        } => {
-            let combo = CombinationParser::parse(cards, wild_targets.as_deref(), ctx)?;
-            let wild_count = cards.iter().try_fold(0usize, |acc, s| {
-                let c = parse_card_symbol(s)?;
-                Ok::<usize, String>(acc + usize::from(is_wild(c, ctx)))
-            })?;
-            let is_bomb = matches!(combo.class(), CombinationClass::Bomb);
-            let mut sorted = cards.clone();
-            sorted.sort();
-            Ok((
-                wild_count,
-                is_bomb,
-                combo.primary,
-                std::cmp::Reverse(cards.len()),
-                sorted,
-            ))
+    // ── 三带二不能带两张级牌 (JS 1089-1096) ──
+    if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::FullHouse))
+        && play_cards.len() >= 5
+    {
+        let mut rank_counts: HashMap<Rank, usize> = HashMap::new();
+        for c in play_cards {
+            if is_joker_sym(c) {
+                continue;
+            }
+            if let Ok(card) = parse_card_symbol(c) {
+                *rank_counts.entry(card.rank).or_default() += 1;
+            }
         }
-        _ => Err("suggest: play_key expects Play action".into()),
+        let pair_part = rank_counts.iter().find(|&(_, &n)| n == 2).map(|(r, _)| *r);
+        if pair_part == Some(p.level_rank) {
+            score -= BANNED_SCORE; // 三带二不能带两张级牌，直接禁止
+        }
     }
+
+    // ── 4张级牌不能同时出 (JS 1099-1104) ──
+    if play_cards.len() < my_remaining {
+        let level_card_count = play_cards
+            .iter()
+            .filter(|c| {
+                p.meta_for(c)
+                    .map(|m| m.rank == p.level_rank && !m.is_wild)
+                    .unwrap_or(false)
+            })
+            .count();
+        if level_card_count >= 4 {
+            score -= BANNED_SCORE; // 4张级牌不能同时出，直接禁止
+        }
+    }
+
+    // ── 出炸弹要先小后大 (JS 1107-1117) ──
+    if is_bomb {
+        match kind {
+            CombinationKind::Bomb(BombKind::SameRank { n: 5 }) => score -= 5.0,
+            CombinationKind::Bomb(BombKind::SameRank { n: 6..=10 }) => score -= 15.0,
+            _ => {}
+        }
+    }
+
+    // ── 房规：接风重奖——队友已全部出完 (JS 1120-1125) ──
+    if !is_last_play && p.teammate_remaining == 0 {
+        score += 180.0; // 为队友接风：压制敌人拿回出牌权，重奖
+    }
+
+    // ── 房规：避免把自己打到「只剩小单张」(JS 1128-1148) ──
+    if play_cards.len() < my_remaining {
+        let mut used: HashMap<Rank, i32> = HashMap::new();
+        for c in play_cards {
+            if let Ok(card) = parse_card_symbol(c) {
+                *used.entry(card.rank).or_default() += 1;
+            }
+        }
+        let mut rest: HashMap<Rank, usize> = HashMap::new();
+        let mut sm_has_bad = false;
+        for hc in &p.my_hand {
+            let Ok(card) = parse_card_symbol(hc) else { continue };
+            let cnt = used.entry(card.rank).or_default();
+            if *cnt > 0 {
+                *cnt -= 1;
+                continue;
+            }
+            let m = p.meta_for(hc);
+            if m.map(|m| m.is_joker || m.is_wild).unwrap_or(false)
+                || m.and_then(|m| m.natural).map_or(true, |nv| nv > 10)
+            {
+                sm_has_bad = true;
+                break;
+            }
+            *rest.entry(card.rank).or_default() += 1;
+        }
+        let sm_vals: Vec<usize> = rest.values().copied().collect();
+        if !sm_has_bad && sm_vals.len() >= 3 && sm_vals.iter().all(|&n| n == 1) {
+            score -= sm_vals.len() as f32 * 22.0;
+        }
+    }
+
+    // ── 清空手牌重奖 (JS 1152-1154) ──
+    if play_cards.len() >= my_remaining {
+        score += CLEAR_HAND_BONUS; // 清空手牌！重奖！
+    }
+
+    score
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────
+// ── JS scoreLeadPlay (L1465-1992): 领牌打分，base 50 ────────────────────
+
+fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) -> f32 {
+    let kind = &play_combo.kind;
+    let mut score = BASE_LEAD_SCORE; // JS L1466 base score
+
+    let my_remaining = p.my_remaining;
+    let is_endgame = p.is_endgame;
+    let combos = &p.combos;
+
+    // ── Hand combo analysis & split penalty (JS 1473-1489) ──
+    let bomb_split_verdict =
+        classify_bomb_split(play_cards, &p.my_hand, kind, my_remaining);
+    let play_is_bomb = play_combo.class() == CombinationClass::Bomb;
+    let mut penalty =
+        split_penalty(play_cards, combos, p.level_nat, p.has_level_card_or_joker, kind) as f32;
+    if !play_is_bomb {
+        if bomb_split_verdict == BombSplitVerdict::Exempt && penalty >= BANNED_SCORE {
+            penalty = 0.0; // 房规豁免：放行拆炸
+        }
+        if bomb_split_verdict == BombSplitVerdict::Banned {
+            penalty = penalty.max(BANNED_SCORE); // 双保险
+        }
+    }
+    score -= penalty * SPLIT_PENALTY_SCALE;
+
+    let is_bomb = play_is_bomb;
+
+    // ── 手牌大于6张禁止空出王和级牌 (JS 1492-1502) ──
+    if my_remaining > 6 && matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Single)) {
+        if let Some(first) = play_cards.first() {
+            let m = p.meta_for(first);
+            if m.map(|m| m.is_joker).unwrap_or(false) {
+                score -= BANNED_SCORE; // 空出王：绝对禁止
+            } else if m.map(|m| m.rank == p.level_rank).unwrap_or(false) {
+                score -= BANNED_SCORE; // 空出级牌：绝对禁止
+            }
+        }
+    }
+
+    // ── Bomb conservation (JS 1505-1528) ──
+    if is_bomb {
+        if combos.bomb_count < 2 {
+            score -= 30.0; // 必须留到残局，不能先出炸弹
+        } else {
+            score -= 40.0; // 留至少1个到残局控牌
+        }
+
+        if play_cards.len() >= my_remaining {
+            score += 30.0; // Bonus: last card(s) played with bomb is ideal
+        }
+
+        match kind {
+            CombinationKind::Bomb(BombKind::SameRank { n: 4 }) => score += 10.0,
+            CombinationKind::Bomb(BombKind::StraightFlush) => score -= 15.0,
+            CombinationKind::Bomb(BombKind::FourJoker) => score -= 30.0,
+            _ => {}
+        }
+    }
+
+    // ── 禁止出级牌炸弹 (JS 1531-1538) ──
+    if is_bomb {
+        let level_cards = play_cards
+            .iter()
+            .filter(|c| {
+                p.meta_for(c)
+                    .map(|m| m.rank == p.level_rank && !m.is_wild)
+                    .unwrap_or(false)
+            })
+            .count();
+        if level_cards >= 4 {
+            score -= BANNED_SCORE; // 级牌炸弹，直接禁止
+        }
+    }
+
+    // 手牌≤6张时必须保留至少1个炸弹 → 非炸弹出牌重奖 (JS 1541-1546)
+    if !is_bomb && play_cards.len() < my_remaining {
+        let remaining_after = my_remaining - play_cards.len();
+        if remaining_after <= 6 && combos.bomb_count >= 1 {
+            score += 500.0; // 保留炸弹到残局，重奖！
+        }
+    }
+
+    // ── Team awareness: teammate sprinting (JS 1550-1571) ──
+    let teammate_remaining = p.teammate_remaining;
+    if teammate_remaining == 1 {
+        if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Single)) {
+            score += 40.0; // Strongly prefer singles to feed teammate
+        } else if !is_bomb {
+            score -= 20.0; // Discourage non-single plays when teammate has 1 card
+        }
+    } else if teammate_remaining == 2 {
+        if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Pair)) {
+            score += 40.0; // Strongly prefer pairs to feed teammate
+        }
+    } else if teammate_remaining == 3 {
+        if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Triple)) {
+            score += 40.0; // Strongly prefer triples to feed teammate
+        }
+    } else if teammate_remaining <= 6 {
+        if matches!(
+            kind,
+            CombinationKind::Ordinary(OrdinaryKind::Pair)
+                | CombinationKind::Ordinary(OrdinaryKind::Straight)
+                | CombinationKind::Ordinary(OrdinaryKind::Tube)
+                | CombinationKind::Ordinary(OrdinaryKind::Plate)
+                | CombinationKind::Ordinary(OrdinaryKind::FullHouse)
+        ) {
+            score += 15.0; // Prefer combos to help teammate
+        }
+    }
+
+    // ── Opponent interception: opponent sprinting (JS 1575-1619) ──
+    let min_opp_remaining = p.min_opp_remaining;
+    if min_opp_remaining == 1 {
+        if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Single)) {
+            score -= 50.0; // NEVER lead singles when opponent has 1 card
+        }
+        if !is_bomb {
+            score += 10.0; // Prefer non-bomb plays to intercept
+        }
+    } else if min_opp_remaining == 2 {
+        if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Pair)) {
+            score -= 20.0; // Avoid leading pairs when opponent has 2 cards
+        }
+    } else if min_opp_remaining <= 6 {
+        if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Single)) {
+            if play_combo.primary <= 10 {
+                score -= 30.0; // 不出小单张，对手可能吃单张
+            } else {
+                score += 15.0; // 出大单张阻止对手
+            }
+        }
+        if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Pair)) {
+            if play_combo.primary <= 10 {
+                score -= 15.0; // 不出小对子
+            } else {
+                score += 15.0; // 出大对子阻止对手
+            }
+        }
+        if matches!(
+            kind,
+            CombinationKind::Ordinary(OrdinaryKind::Straight)
+                | CombinationKind::Ordinary(OrdinaryKind::Tube)
+                | CombinationKind::Ordinary(OrdinaryKind::Plate)
+                | CombinationKind::Ordinary(OrdinaryKind::FullHouse)
+        ) && !is_bomb
+        {
+            score += 20.0; // 出组合牌型让对手拆牌，更难接
+        }
+    }
+
+    // ── Endgame: play small cards first, keep big cards (JS 1623-1634) ──
+    if is_endgame && !is_bomb {
+        score += play_cards.len() as f32 * 5.0;
+        score -= play_combo.primary as f32 * 1.5;
+    } else {
+        score += play_cards.len() as f32 * 8.0;
+        score -= play_combo.primary as f32 * 0.5;
+    }
+
+    // ── 残局散牌处理：重奖移除单张的出牌 (JS 1638-1686) ──
+    if my_remaining <= 6 && !is_bomb {
+        let mut singles_removed = 0usize;
+        let mut small_singles_removed = 0usize;
+        for card in play_cards {
+            let Some(m) = p.meta_for(card) else { continue };
+            if m.is_joker || m.is_wild || m.rank == p.level_rank {
+                continue;
+            }
+            let Some(nv) = m.natural else { continue };
+            if combos.rank_to_count.get(&nv).copied().unwrap_or(0) == 1 {
+                singles_removed += 1;
+                if m.rank_value <= 10 {
+                    small_singles_removed += 1;
+                }
+            }
+        }
+        if singles_removed > 0 {
+            score += singles_removed as f32 * 400.0; // 残局移除单张，重奖！
+        }
+        if small_singles_removed > 0 {
+            score += small_singles_removed as f32 * 300.0; // 残局移除小单张，额外重奖！
+        }
+        // 基础惩罚，让移除单张的出牌有净正收益
+        let mut bad_singles = 0usize;
+        let mut small_cards = 0usize;
+        for card in &p.my_hand {
+            let Some(m) = p.meta_for(card) else { continue };
+            if m.is_joker || m.is_wild || m.rank == p.level_rank {
+                continue;
+            }
+            let Some(nv) = m.natural else { continue };
+            if combos.rank_to_count.get(&nv).copied().unwrap_or(0) == 1 {
+                bad_singles += 1;
+                if m.rank_value <= 10 {
+                    small_cards += 1;
+                }
+            }
+        }
+        if bad_singles >= 1 {
+            score -= 100.0; // 基础惩罚（远小于移除奖励）
+        }
+        if small_cards >= 1 {
+            score -= 150.0; // 基础惩罚（远小于移除奖励）
+        }
+    }
+
+    // ── 手牌有≥3张单牌能通过拆牌组成顺子奖励 (JS 1690-1715) ──
+    if combos.singles_count >= 3 && !is_bomb {
+        let mut single_natural_ranks: Vec<u8> = Vec::new();
+        for card in &p.my_hand {
+            if is_joker_sym(card) {
+                continue;
+            }
+            if let Ok(c) = parse_card_symbol(card) {
+                if let Ok(nv) = natural_rank_value(c.rank) {
+                    if combos.rank_to_count.get(&nv).copied().unwrap_or(0) == 1 {
+                        single_natural_ranks.push(nv);
+                    }
+                }
+            }
+        }
+        single_natural_ranks.sort_unstable();
+        let mut consecutive_count = 1usize;
+        let mut max_consecutive = 1usize;
+        for i in 1..single_natural_ranks.len() {
+            if single_natural_ranks[i] - single_natural_ranks[i - 1] == 1 {
+                consecutive_count += 1;
+                max_consecutive = max_consecutive.max(consecutive_count);
+            } else {
+                consecutive_count = 1;
+            }
+        }
+        if max_consecutive >= 3 {
+            score += 30.0; // 单牌能组成顺子，奖励
+        }
+    }
+
+    // ── 残局散牌惩罚: plays that leave scattered singles (JS 1719-1737) ──
+    let remaining_after = my_remaining.saturating_sub(play_cards.len());
+    if remaining_after > 1 && !is_bomb {
+        let mut remaining_singles = combos.singles_count;
+        for card in play_cards {
+            if let Some(&nv) = combos.card_to_rank.get(card) {
+                if combos.rank_to_count.get(&nv).copied().unwrap_or(0) == 1 {
+                    remaining_singles = remaining_singles.saturating_sub(1);
+                }
+            }
+        }
+        let ratio_after = remaining_singles as f32 / remaining_after as f32;
+        if ratio_after > 0.6 {
+            score -= 150.0; // Heavy penalty: scattered singles
+        } else if ratio_after > 0.4 {
+            score -= 80.0; // Medium penalty
+        } else if ratio_after > 0.2 {
+            score -= 20.0; // Light penalty
+        }
+    }
+
+    // ── 主动出牌：先出单张和小牌 (JS 1741-1754) ──
+    if !is_bomb {
+        let primary = play_combo.primary;
+        if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Single)) {
+            score += 20.0; // 单张优先出
+            if primary <= 10 {
+                score += 15.0; // 小单张更优先
+            }
+        }
+        if primary > 10 {
+            score -= 30.0; // 大牌绝不能先出
+        } else {
+            score += 10.0; // 小牌奖励
+        }
+    }
+
+    // ── 逢人配优先组成炸弹、同花顺、顺子、钢板、木板 (JS 1759-1774) ──
+    let has_wildcard = play_cards
+        .iter()
+        .any(|c| p.meta_for(c).map(|m| m.is_wild).unwrap_or(false));
+    if has_wildcard {
+        if is_bomb || matches!(kind, CombinationKind::Bomb(BombKind::StraightFlush)) {
+            score += 100.0; // 逢人配配炸弹/同花顺：重奖！
+        } else {
+            match kind {
+                CombinationKind::Ordinary(OrdinaryKind::Straight)
+                | CombinationKind::Ordinary(OrdinaryKind::Plate)
+                | CombinationKind::Ordinary(OrdinaryKind::Tube)
+                | CombinationKind::Ordinary(OrdinaryKind::FullHouse) => score += 30.0,
+                CombinationKind::Ordinary(OrdinaryKind::Triple) => score += 20.0,
+                _ => {}
+            }
+        }
+    }
+
+    // ── 房规：已是天然炸弹再贴百搭升档 = 浪费 (JS 1779-1801) ──
+    if has_wildcard && play_cards.len() < my_remaining {
+        let wild_cnt = play_cards
+            .iter()
+            .filter(|c| p.meta_for(c).map(|m| m.is_wild).unwrap_or(false))
+            .count();
+        let naturals: Vec<CardMeta> = play_cards
+            .iter()
+            .filter_map(|c| p.meta_for(c))
+            .filter(|m| !m.is_wild && !m.is_joker)
+            .collect();
+        let uniq: HashSet<Rank> = naturals.iter().map(|m| m.rank).collect();
+        let naturals_already_bomb = naturals.len() >= 4
+            && uniq.len() == 1
+            && naturals.len() == play_cards.len() - wild_cnt;
+        if naturals_already_bomb && naturals[0].rank != p.level_rank {
+            if p.min_opp_remaining > DUAL_WILD_HAND_ENDGAME {
+                if my_remaining <= DUAL_WILD_HAND_ENDGAME {
+                    score -= UPGRADED_BOMB_WILD_PENALTY_ENDGAME;
+                } else {
+                    score -= UPGRADED_BOMB_WILD_PENALTY_MIDGAME;
+                }
+            }
+        }
+    }
+
+    // ── 逢人配不能浪费（惩罚性检查）(JS 1804-1843) ──
+    if has_wildcard {
+        let finishing_play = play_cards.len() >= my_remaining;
+        let endgame_hand = my_remaining <= DUAL_WILD_HAND_ENDGAME;
+
+        let same_rank_type = matches!(
+            kind,
+            CombinationKind::Ordinary(OrdinaryKind::Pair)
+                | CombinationKind::Ordinary(OrdinaryKind::Triple)
+        ) || is_bomb;
+        let touches_level_natural = play_cards.iter().any(|c| {
+            p.meta_for(c)
+                .map(|m| m.rank == p.level_rank && !m.is_wild)
+                .unwrap_or(false)
+        });
+        if !finishing_play && same_rank_type && touches_level_natural {
+            score -= if endgame_hand {
+                WILD_ON_LEVEL_PENALTY_ENDGAME
+            } else {
+                WILD_ON_LEVEL_PENALTY_MIDGAME
+            };
+        }
+
+        let lvl_face_bomb = is_bomb
+            && play_cards.iter().all(|c| {
+                p.meta_for(c)
+                    .map(|m| m.is_wild || m.rank == p.level_rank)
+                    .unwrap_or(false)
+            });
+        if !finishing_play && lvl_face_bomb {
+            score -= if endgame_hand {
+                DUAL_WILD_PENALTY_ENDGAME
+            } else {
+                DUAL_WILD_PENALTY_MIDGAME
+            };
+        }
+
+        if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Single)) && !finishing_play {
+            score -= BANNED_SCORE; // 逢人配绝不能单出——清空手牌绝对豁免
+        } else if is_bomb || matches!(kind, CombinationKind::Bomb(BombKind::StraightFlush)) {
+            // 最优使用，不罚
+        } else if matches!(
+            kind,
+            CombinationKind::Ordinary(OrdinaryKind::Plate)
+                | CombinationKind::Ordinary(OrdinaryKind::Tube)
+                | CombinationKind::Ordinary(OrdinaryKind::FullHouse)
+                | CombinationKind::Ordinary(OrdinaryKind::Triple)
+                | CombinationKind::Ordinary(OrdinaryKind::Straight)
+        ) {
+            // 合理使用，不罚
+        } else if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Pair)) {
+            if !finishing_play {
+                let pair_naturals: Vec<CardMeta> = play_cards
+                    .iter()
+                    .filter_map(|c| p.meta_for(c))
+                    .filter(|m| !m.is_wild && !m.is_joker)
+                    .collect();
+                let pair_rank = pair_naturals.first().map(|m| m.rank).unwrap_or(p.level_rank);
+                if pair_rank != p.level_rank {
+                    score -= if endgame_hand {
+                        WILD_PAIR_PENALTY_ENDGAME
+                    } else {
+                        WILD_PLAIN_PAIR_PENALTY_MIDGAME
+                    };
+                }
+            }
+        } else {
+            score -= 10.0; // 其他非最优使用
+        }
+    }
+
+    // ── 双百搭同出 (JS 1847-1872) ──
+    let dw_finishing = play_cards.len() >= my_remaining;
+    let dw_endgame = my_remaining <= DUAL_WILD_HAND_ENDGAME;
+
+    if !is_bomb && bomb_split_verdict == BombSplitVerdict::Banned {
+        score -= BANNED_SCORE; // 拆炸弹绝对禁止
+    }
+
+    let wild_count_in_play = play_cards
+        .iter()
+        .filter(|c| p.meta_for(c).map(|m| m.is_wild).unwrap_or(false))
+        .count();
+    if !dw_finishing && wild_count_in_play >= 2 {
+        let dw_naturals: Vec<CardMeta> = play_cards
+            .iter()
+            .filter_map(|c| p.meta_for(c))
+            .filter(|m| !m.is_wild && !m.is_joker)
+            .collect();
+        let dw_ranks: HashSet<Rank> = dw_naturals.iter().map(|m| m.rank).collect();
+        let bare_dual = dw_naturals.is_empty();
+        let sanctioned_endgame = dw_endgame
+            && !bare_dual
+            && !dw_ranks.is_empty()
+            && !dw_ranks.contains(&p.level_rank)
+            && (is_bomb
+                || matches!(
+                    kind,
+                    CombinationKind::Ordinary(OrdinaryKind::FullHouse)
+                        | CombinationKind::Ordinary(OrdinaryKind::Plate)
+                        | CombinationKind::Ordinary(OrdinaryKind::Tube)
+                ));
+        if sanctioned_endgame {
+            score -= 10.0; // 残局唯一合法用法：轻微不鼓励
+        } else {
+            score -= if dw_endgame {
+                DUAL_WILD_PENALTY_ENDGAME
+            } else {
+                DUAL_WILD_PENALTY_MIDGAME
+            };
+            if bare_dual {
+                score -= BARE_DUAL_WILD_EXTRA_PENALTY; // 裸双百搭：额外重罚
+            }
+        }
+    }
+
+    // ── 三带二不能带两张级牌 (JS 1875-1884) ──
+    if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::FullHouse))
+        && play_cards.len() >= 5
+    {
+        let mut rank_counts: HashMap<Rank, usize> = HashMap::new();
+        for c in play_cards {
+            if is_joker_sym(c) {
+                continue;
+            }
+            if let Ok(card) = parse_card_symbol(c) {
+                *rank_counts.entry(card.rank).or_default() += 1;
+            }
+        }
+        let pair_part = rank_counts.iter().find(|&(_, &n)| n == 2).map(|(r, _)| *r);
+        if pair_part == Some(p.level_rank) {
+            score -= BANNED_SCORE;
+        }
+    }
+
+    // ── 4张级牌不能同时出 (JS 1887-1892) ──
+    if play_cards.len() < my_remaining {
+        let level_card_count = play_cards
+            .iter()
+            .filter(|c| {
+                p.meta_for(c)
+                    .map(|m| m.rank == p.level_rank && !m.is_wild)
+                    .unwrap_or(false)
+            })
+            .count();
+        if level_card_count >= 4 {
+            score -= BANNED_SCORE;
+        }
+    }
+
+    // ── 出炸弹要先小后大 (JS 1895-1908) ──
+    if is_bomb {
+        match kind {
+            CombinationKind::Bomb(BombKind::SameRank { n: 5 }) => score -= 5.0,
+            CombinationKind::Bomb(BombKind::SameRank { n: 6..=10 }) => score -= 15.0,
+            _ => {}
+        }
+    }
+
+    // Don't lead with level cards or jokers (save for intercepting) (JS 1911-1917)
+    if play_cards.len() < my_remaining {
+        let has_level = play_cards.iter().any(|c| {
+            p.meta_for(c)
+                .map(|m| m.rank == p.level_rank && !m.is_wild)
+                .unwrap_or(false)
+        });
+        let has_joker = play_cards.iter().any(|c| is_joker_sym(c));
+        if has_level || has_joker {
+            score -= 40.0; // Never lead with level cards or jokers
+        }
+    }
+
+    // ── 房规：先出小牌，不要空出大牌 (JS 1920-1930) ──
+    if play_cards.len() < my_remaining {
+        let mut lead_max_nv = 0u8;
+        for c in play_cards {
+            let m = p.meta_for(c);
+            let nv = if m.map(|m| m.is_joker).unwrap_or(false) {
+                16
+            } else if m.map(|m| m.is_wild).unwrap_or(false) {
+                15
+            } else {
+                m.and_then(|m| m.natural).unwrap_or(0)
+            };
+            lead_max_nv = lead_max_nv.max(nv);
+        }
+        if lead_max_nv >= 11 {
+            score -= (lead_max_nv - 10) as f32 * 18.0; // J −18 / Q −36 / K −54 / A −72 / 王 −108
+        }
+    }
+
+    // ── 房规：接风重奖——队友已全部出完，本圈由我接风先出 (JS 1933-1937) ──
+    if p.teammate_remaining == 0 {
+        score += 120.0; // 接风首出权重奖
+    }
+
+    // ── 房规：空出炸弹重罚 (JS 1940-1960) ──
+    if is_bomb && play_cards.len() < my_remaining {
+        let mut used: HashMap<Rank, i32> = HashMap::new();
+        for c in play_cards {
+            if let Ok(card) = parse_card_symbol(c) {
+                *used.entry(card.rank).or_default() += 1;
+            }
+        }
+        let mut rest_groups: HashMap<Rank, usize> = HashMap::new();
+        let mut rest_has_joker = false;
+        for hc in &p.my_hand {
+            let Ok(card) = parse_card_symbol(hc) else { continue };
+            let cnt = used.entry(card.rank).or_default();
+            if *cnt > 0 {
+                *cnt -= 1;
+                continue;
+            }
+            if card.suit == Suit::Joker {
+                rest_has_joker = true;
+                continue;
+            }
+            *rest_groups.entry(card.rank).or_default() += 1;
+        }
+        let rest_vals: Vec<usize> = rest_groups.values().copied().collect();
+        let all_bombs_rest = !rest_has_joker
+            && (rest_vals.is_empty() || rest_vals.iter().all(|&n| n >= 4));
+        if !all_bombs_rest {
+            score -= 450.0; // 空出炸弹：手里还有非炸弹牌却主动领炸，严重浪费
+        }
+    }
+
+    // ── 房规：避免把自己打到「只剩小单张」(JS 1963-1983) ──
+    if play_cards.len() < my_remaining {
+        let mut used: HashMap<Rank, i32> = HashMap::new();
+        for c in play_cards {
+            if let Ok(card) = parse_card_symbol(c) {
+                *used.entry(card.rank).or_default() += 1;
+            }
+        }
+        let mut rest: HashMap<Rank, usize> = HashMap::new();
+        let mut sm_has_bad = false;
+        for hc in &p.my_hand {
+            let Ok(card) = parse_card_symbol(hc) else { continue };
+            let cnt = used.entry(card.rank).or_default();
+            if *cnt > 0 {
+                *cnt -= 1;
+                continue;
+            }
+            let m = p.meta_for(hc);
+            if m.map(|m| m.is_joker || m.is_wild).unwrap_or(false)
+                || m.and_then(|m| m.natural).map_or(true, |nv| nv > 10)
+            {
+                sm_has_bad = true;
+                break;
+            }
+            *rest.entry(card.rank).or_default() += 1;
+        }
+        let sm_vals: Vec<usize> = rest.values().copied().collect();
+        if !sm_has_bad && sm_vals.len() >= 3 && sm_vals.iter().all(|&n| n == 1) {
+            score -= sm_vals.len() as f32 * 22.0; // 剩3张-66 … 剩5张-110
+        }
+    }
+
+    // ── 清空手牌重奖 (JS 1987-1989) ──
+    if play_cards.len() == my_remaining {
+        score += CLEAR_HAND_BONUS; // 清空手牌！重奖！
+    }
+
+    score
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::game::card::HandLevel;
-    use crate::game::rules::combination_parser::CombinationParser;
-    use crate::game::types::{HandState, PlayState};
+    use crate::game::types::PlayState;
 
     fn ctx() -> RuleContext {
         RuleContext {
@@ -1825,71 +2030,42 @@ mod tests {
         s
     }
 
-    #[test]
-    fn prefers_non_bomb_over_bomb() {
-        let legal = vec![
-            PlayerAction::Play {
-                cards: vec!["♠3".into()],
-                wild_targets: None,
-            },
-            PlayerAction::Play {
-                cards: vec!["♠4".into(), "♥4".into(), "♦4".into(), "♣4".into()],
-                wild_targets: None,
-            },
-        ];
-        let picked = pick_playing(&legal, ctx()).unwrap();
-        assert_eq!(
-            picked,
-            PlayerAction::Play {
-                cards: vec!["♠3".into()],
-                wild_targets: None,
-            }
-        );
+    fn fill_seats(
+        state: &mut TableGameState,
+        n_cards: Vec<&str>,
+        s_cards: Vec<&str>,
+        w_cards: Vec<&str>,
+    ) {
+        if let Some(hand) = state.hand.as_mut() {
+            hand.hands.insert(Seat::N, n_cards.into_iter().map(ToString::to_string).collect());
+            hand.hands.insert(Seat::S, s_cards.into_iter().map(ToString::to_string).collect());
+            hand.hands.insert(Seat::W, w_cards.into_iter().map(ToString::to_string).collect());
+        }
     }
 
-    #[test]
-    fn prefers_smaller_primary_value() {
-        let legal = vec![
-            PlayerAction::Play {
-                cards: vec!["♠7".into()],
-                wild_targets: None,
-            },
-            PlayerAction::Play {
-                cards: vec!["♠9".into()],
-                wild_targets: None,
-            },
-        ];
-        let picked = pick_playing(&legal, ctx()).unwrap();
-        assert_eq!(
-            picked,
-            PlayerAction::Play {
-                cards: vec!["♠7".into()],
-                wild_targets: None,
-            }
-        );
+    fn mk_top(seat: Seat, cards: Vec<&str>) -> PlayState {
+        let cards: Vec<String> = cards.into_iter().map(ToString::to_string).collect();
+        let combo = CombinationParser::parse(&cards, None, ctx()).unwrap();
+        PlayState {
+            seat,
+            cards,
+            wild_targets: None,
+            combination: combo,
+        }
     }
 
-    #[test]
-    fn prefers_more_cards_when_primary_is_same() {
-        let legal = vec![
-            PlayerAction::Play {
-                cards: vec!["♠7".into()],
-                wild_targets: None,
-            },
-            PlayerAction::Play {
-                cards: vec!["♠7".into(), "♥7".into()],
-                wild_targets: None,
-            },
-        ];
-        let picked = pick_playing(&legal, ctx()).unwrap();
-        assert_eq!(
-            picked,
-            PlayerAction::Play {
-                cards: vec!["♠7".into(), "♥7".into()],
-                wild_targets: None,
-            }
-        );
+    fn pctx_of(state: &TableGameState, actor: Seat) -> PlayContext {
+        let hand = state.hand.as_ref().unwrap();
+        build_play_context(hand, actor, ctx())
     }
+
+    fn combo_of(cards: Vec<&str>, targets: Vec<&str>) -> Combination {
+        let cards: Vec<String> = cards.into_iter().map(ToString::to_string).collect();
+        let targets: Vec<String> = targets.into_iter().map(ToString::to_string).collect();
+        CombinationParser::parse(&cards, Some(&targets), ctx()).unwrap()
+    }
+
+    // ══ JS 兼容存量测试（行为与 JS 规则一致，保持原样）══
 
     #[test]
     fn suggest_follow_play_prefers_non_bomb_when_both_legal() {
@@ -1916,22 +2092,9 @@ mod tests {
     }
 
     #[test]
-    fn prefers_level_cards_before_non_level() {
-        let state = mk_playing_state(Seat::E, vec!["♠2", "♠7"], Some((Seat::N, vec!["♠6"])));
-        let picked = suggest_next_action(&state, Seat::E).unwrap();
-        assert_eq!(
-            picked,
-            PlayerAction::Play {
-                cards: vec!["♠2".into()],
-                wild_targets: None,
-            }
-        );
-    }
-
-    #[test]
     fn avoids_splitting_bomb_when_leading() {
-        // Hand has ♠3,♥3,♦3,♣3 (bomb) + ♠5 (single)
-        // When leading, should prefer ♠5 over ♠3 (breaking bomb)
+        // 手 [♠3,♥3,♦3,♣3(炸弹),♠5] 领出：JS 领牌分下 ♠5（单张+45 且不拆炸）
+        // 胜过拆/出炸弹（空出炸弹 −450）。
         let state = mk_playing_state(
             Seat::E,
             vec!["♠3", "♥3", "♦3", "♣3", "♠5"],
@@ -1946,6 +2109,8 @@ mod tests {
             }
         );
     }
+
+    // ══ 存量失败测试：按任务要求原样保留、必须继续失败 ══
 
     #[test]
     fn endgame_leading_prefers_larger_non_bomb_combos() {
@@ -1966,29 +2131,727 @@ mod tests {
         }
     }
 
+    // ══ 房规回归测试：不得把百搭（逢人配）留成最后一张孤牌 ══
+
     #[test]
-    fn opponent_sprinting_prefers_bomb_intercept() {
-        // Hand: bomb + single. Opponent has 2 cards.
-        let mut state = mk_playing_state(
-            Seat::E,
-            vec!["♠3", "♥3", "♦3", "♣3", "♠5"],
-            Some((Seat::N, vec!["♠K"])), // opponent leading with K
-        );
-        // Set opponent to 2 cards
-        if let Some(ref mut hand) = state.hand {
-            hand.hands.insert(Seat::N, vec!["♠A".to_string(), "♠K".to_string()]);
-        }
+    fn two_card_wild_hand_pairs_out_instead_of_stranding() {
+        // [♦9, ♥2(级2百搭)] 领出：必须出对 9（百搭当 9）一手清空获胜
+        //（清空 +10000 自然产生，JS 语义）。
+        let state = mk_playing_state(Seat::E, vec!["♦9", "♥2"], None);
         let picked = suggest_next_action(&state, Seat::E).unwrap();
-        // Should prefer bomb to intercept
+        match &picked {
+            PlayerAction::Play { cards, wild_targets } => {
+                assert_eq!(
+                    cards.len(), 2,
+                    "must pair out with wild instead of stranding it: {:?}",
+                    picked
+                );
+                assert!(wild_targets.is_some(), "wild pair must declare targets");
+            }
+            _ => panic!("Expected Play action, got {:?}", picked),
+        }
+    }
+
+    #[test]
+    fn clearing_triple_with_wild_beats_natural_pair() {
+        // [♠9, ♥9, ♥2(百搭)] 领出：三张 999（清空即胜 +10000）必须压过对 99。
+        let state = mk_playing_state(Seat::E, vec!["♠9", "♥9", "♥2"], None);
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
         match &picked {
             PlayerAction::Play { cards, .. } => {
-                assert!(
-                    cards.len() >= 4,
-                    "Opponent sprinting should prefer bomb, got {} cards",
-                    cards.len()
+                assert_eq!(
+                    cards.len(), 3,
+                    "clearing triple (instant win) must beat non-clearing pair: {:?}",
+                    picked
                 );
             }
             _ => panic!("Expected Play action, got {:?}", picked),
+        }
+    }
+
+    #[test]
+    fn never_leaves_wild_as_lone_leftover() {
+        // [♠3,♥3,♦3,♣3,♥2(百搭)] 领出：JS 清空 +10000 → 3333+百搭成 5 炸清空
+        //（对手剩 0 张不触发升档罚），绝不留 [♥2] 孤张。
+        let state = mk_playing_state(Seat::E, vec!["♠3", "♥3", "♦3", "♣3", "♥2"], None);
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        if let PlayerAction::Play { cards, .. } = &picked {
+            let mut left: Vec<&str> = vec!["♠3", "♥3", "♦3", "♣3", "♥2"]
+                .into_iter()
+                .filter(|c| !cards.iter().any(|s| s.as_str() == *c))
+                .collect();
+            left.sort();
+            assert_ne!(
+                left,
+                vec!["♥2"],
+                "must not strand the wild as the lone leftover: picked {:?}",
+                cards
+            );
+        } else {
+            panic!("Expected Play action, got {:?}", picked);
+        }
+    }
+
+    #[test]
+    fn endgame_wild_converts_to_straight_or_straight_flush() {
+        // [♠5,♠6,♠7,♠8,♠9,♥2(级2百搭)] 残局（6张）领出：JS 百搭并入杂顺
+        //（+30 且 +400/张 移除单张奖励）远胜同花顺（空出炸弹 −450）。
+        let state = mk_playing_state(Seat::E, vec!["♠5", "♠6", "♠7", "♠8", "♠9", "♥2"], None);
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { cards, wild_targets } => {
+                let combo = CombinationParser::parse(cards, wild_targets.as_deref(), ctx())
+                    .expect("candidate must parse");
+                let premium = matches!(
+                    combo.kind,
+                    CombinationKind::Bomb(BombKind::StraightFlush)
+                        | CombinationKind::Ordinary(OrdinaryKind::Straight)
+                );
+                assert!(
+                    premium && cards.iter().any(|s| s.as_str() == "♥2"),
+                    "endgame wild must convert to a straight / straight flush, got {:?}",
+                    picked
+                );
+            }
+            _ => panic!("Expected Play action, got {:?}", picked),
+        }
+    }
+
+    // ══ JS 行为测试 ①：百搭配炸弹 +100 应胜过百搭配顺子 +30（同手牌两候选）══
+
+    #[test]
+    fn wild_bomb_bonus_beats_wild_straight_bonus() {
+        // JS scorePlay：百搭进炸弹 +100 vs 百搭进顺子 +30。
+        // 同手牌 [♠5,♥5,♦5,♠6..♠A,♠3,♥2]（14张中盘），对单张4：
+        // 555+百搭（炸弹4）得分必须高于 百搭补4 的 4-8 顺子。
+        // （手牌 14 张 → 两候选出后均剩 >6 张，+500 保留炸弹奖励对二者皆不触发。）
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec![
+                "♠5", "♥5", "♦5", "♠6", "♠7", "♠8", "♠9", "♠10", "♠J", "♠Q", "♠K", "♠A", "♠3",
+                "♥2",
+            ],
+            Some((Seat::N, vec!["♠4"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♦4", "♣4", "♦5", "♣5", "♦6"], // N 5 (minOpp ≤ 6 → 无 −200 保留罚)
+            vec!["♥6", "♣6", "♦7", "♣7", "♦8"], // S 5
+            vec!["♥9", "♦9", "♣9", "♥10", "♦10", "♣10", "♦J", "♣J", "♣Q"], // W 9
+        );
+        let p = pctx_of(&state, Seat::E);
+        let top = mk_top(Seat::N, vec!["♠4"]);
+
+        let bomb_cards = vec!["♠5".to_string(), "♥5".to_string(), "♦5".to_string(), "♥2".to_string()];
+        let bomb_combo = combo_of(vec!["♠5", "♥5", "♦5", "♥2"], vec!["♣5"]);
+        let straight_cards = vec![
+            "♥2".to_string(),
+            "♠5".to_string(),
+            "♠6".to_string(),
+            "♠7".to_string(),
+            "♠8".to_string(),
+        ];
+        let straight_combo = combo_of(vec!["♥2", "♠5", "♠6", "♠7", "♠8"], vec!["♦4"]);
+
+        let bomb_score = score_follow(&bomb_cards, &bomb_combo, &top, &p);
+        let straight_score = score_follow(&straight_cards, &straight_combo, &top, &p);
+        assert!(
+            bomb_score > straight_score,
+            "wild-in-bomb (+100) must outscore wild-in-straight (+30): bomb={bomb_score} straight={straight_score}"
+        );
+    }
+
+    // ══ JS 行为测试 ②：百搭单出 −99999 禁止（清空豁免）══
+
+    #[test]
+    fn wild_single_banned_unless_clearing() {
+        // 跟牌单元：百搭单出（非清空）→ −99999 绝对禁止。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♥2", "♠3", "♠4"],
+            Some((Seat::N, vec!["♠5"])),
+        );
+        fill_seats(&mut state, vec!["♦5"], vec!["♥5"], vec!["♦6"]);
+        let p = pctx_of(&state, Seat::E);
+        let top = mk_top(Seat::N, vec!["♠5"]);
+
+        let single_cards = vec!["♥2".to_string()];
+        let single_combo = combo_of(vec!["♥2"], vec!["♠K"]);
+        let s = score_follow(&single_cards, &single_combo, &top, &p);
+        assert!(s < -50000.0, "wild single (non-clearing) must be banned: {s}");
+
+        // 清空豁免：手中只剩 1 张百搭时，单出 = 清空 → +10000。
+        let mut clear_state = mk_playing_state(Seat::E, vec!["♥2"], Some((Seat::N, vec!["♠3"])));
+        fill_seats(&mut clear_state, vec!["♦5"], vec!["♥5"], vec!["♦6"]);
+        let cp = pctx_of(&clear_state, Seat::E);
+        let ctop = mk_top(Seat::N, vec!["♠3"]);
+        let clear_cards = vec!["♥2".to_string()];
+        let clear_combo = combo_of(vec!["♥2"], vec!["♠K"]);
+        let cs = score_follow(&clear_cards, &clear_combo, &ctop, &cp);
+        assert!(cs > 9000.0, "clearing wild single must be exempt: {cs}");
+
+        // 端到端：全百搭两手牌领出 → 必须出对子清空（单出 −99999 被自然排除）。
+        let wild_pair_state = mk_playing_state(Seat::E, vec!["♥2", "♥2"], None);
+        let picked = suggest_next_action(&wild_pair_state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 2, "all-wild hand must pair out, got {:?}", picked);
+            }
+            other => panic!("Expected Play (pair), got {:?}", other),
+        }
+    }
+
+    // ══ JS 行为测试 ③：天然炸弹+百搭升档 中盘 −150 / 残局 −10（非级牌）══
+
+    #[test]
+    fn upgraded_bomb_wild_penalty_midgame_vs_endgame() {
+        let play_cards = vec!["♠5", "♥5", "♦5", "♣5", "♥2"];
+        let bomb5 = combo_of(play_cards.clone(), vec!["♦5"]);
+        let top = mk_top(Seat::N, vec!["♦4", "♣4", "♥4", "♠9", "♦9"]); // FH 444+99
+
+        // 中盘（7 张，minOpp 9 > 6）：升档 −150 + 炸弹保留 −200
+        let mut mid = mk_playing_state(
+            Seat::E,
+            vec!["♠5", "♥5", "♦5", "♣5", "♥2", "♠8", "♠9"],
+            None,
+        );
+        fill_seats(
+            &mut mid,
+            vec!["♠4", "♥4", "♣5", "♥5", "♦6", "♣6", "♥6", "♦7", "♣7"],
+            vec!["♠6", "♥7", "♦8", "♣8", "♠10", "♥10", "♦10", "♣10", "♠J"],
+            vec!["♥J", "♦J", "♣J", "♠Q", "♥Q", "♦Q", "♣Q", "♠K", "♦K"],
+        );
+        let mid_p = pctx_of(&mid, Seat::E);
+        let mid_cards: Vec<String> = play_cards.iter().map(|s| s.to_string()).collect();
+        let mid_score = score_follow(&mid_cards, &bomb5, &top, &mid_p);
+
+        // 残局（6 张，minOpp 9 > 3 → 守卫②豁免：打完剩 1 张 ≤ 2）：升档仅 −10
+        let mut endg = mk_playing_state(
+            Seat::E,
+            vec!["♠5", "♥5", "♦5", "♣5", "♥2", "♠8"],
+            None,
+        );
+        fill_seats(
+            &mut endg,
+            vec!["♠4", "♥4", "♣5", "♥5", "♦6", "♣6", "♥6", "♦7", "♣7"],
+            vec!["♠6", "♥7", "♦8", "♣8", "♠10", "♥10", "♦10", "♣10", "♠J"],
+            vec!["♥J", "♦J", "♣J", "♠Q", "♥Q", "♦Q", "♣Q", "♠K", "♦K"],
+        );
+        let end_p = pctx_of(&endg, Seat::E);
+        let end_score = score_follow(&mid_cards, &bomb5, &top, &end_p);
+
+        assert!(mid_score < 0.0, "midgame upgraded bomb must be heavily penalized: {mid_score}");
+        assert!(end_score > 0.0, "endgame upgraded bomb must stay viable: {end_score}");
+        assert!(
+            end_score - mid_score > 100.0,
+            "endgame (−10) must beat midgame (−150) by >100: {end_score} vs {mid_score}"
+        );
+    }
+
+    // ══ JS 行为测试 ④：残局移除单张 +400/张（小单张另 +300/张）══
+
+    #[test]
+    fn endgame_lead_single_removal_reward() {
+        // 残局（6张）领出，手 [♠3,♥3,♠7,♠K,♠8,♠9]：JS +400/+300 使小单张
+        // （♠7/♠8/♠9）远胜对子/大牌单张；♠7（primary 最小）胜出。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♠3", "♥3", "♠7", "♠K", "♠8", "♠9"],
+            None,
+        );
+        fill_seats(
+            &mut state,
+            vec!["♦3", "♣3", "♦7", "♣7", "♦8", "♣8", "♦9", "♣9", "♦4"],
+            vec!["♠4", "♥4", "♠5", "♥5", "♦5", "♣5", "♠6", "♥6", "♦6"],
+            vec!["♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J", "♣J", "♠Q"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        assert_eq!(
+            picked,
+            PlayerAction::Play {
+                cards: vec!["♠7".into()],
+                wild_targets: None,
+            },
+            "endgame removal reward must prefer the small single, got {:?}",
+            picked
+        );
+    }
+
+    // ══ JS 行为测试 ⑤：拆炸弹 banned —— 残局拆炸必须禁止（Pass 或换牌）══
+
+    #[test]
+    fn endgame_split_bomb_banned_prefers_alternative() {
+        // 残局（6张）跟对6：拆 5555 出对 55 被 classify_bomb_split=Banned 绝对禁止；
+        // 结果只能是 Pass（炸弹压对子被守卫⑤拦截）或换对 77。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♠5", "♥5", "♦5", "♣5", "♠7", "♥7"],
+            Some((Seat::N, vec!["♠6", "♥6"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♦6", "♣6", "♦8", "♣8", "♦9", "♣9", "♦10", "♣10", "♦J"],
+            vec!["♠8", "♥8", "♠9", "♥9", "♠10", "♥10", "♣10", "♠J", "♥J"],
+            vec!["♠Q", "♥Q", "♦Q", "♣Q", "♠K", "♥K", "♦K", "♣K", "♠A"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Pass => {}
+            PlayerAction::Play { cards, .. } => {
+                let is_banned_split = cards.len() == 2
+                    && cards.iter().all(|c| c.ends_with('5'));
+                assert!(
+                    !is_banned_split,
+                    "splitting the bomb into a pair is banned in endgame, got {:?}",
+                    picked
+                );
+            }
+            other => panic!("Unexpected action, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn endgame_split_bomb_banned_forces_pass() {
+        // 残局（6张）跟对6：手 [5555,K,A] 无合法替牌 → 炸弹被守卫⑤拦截 → 必须 Pass。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♠5", "♥5", "♦5", "♣5", "♠K", "♠A"],
+            Some((Seat::N, vec!["♠6", "♥6"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♦6", "♣6", "♦8", "♣8", "♦9", "♣9", "♦10", "♣10", "♦J"],
+            vec!["♠8", "♥8", "♠9", "♥9", "♠10", "♥10", "♣10", "♠J", "♥J"],
+            vec!["♠Q", "♥Q", "♦Q", "♣Q", "♥K", "♦K", "♣K", "♠A", "♥A"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        assert_eq!(picked, PlayerAction::Pass, "no legal alternative → must Pass");
+    }
+
+    // ══ JS 行为测试 ⑥：双百搭矩阵（残局 −10 轻罚 / 其余 −60、−600、裸出 −200）══
+
+    #[test]
+    fn dual_wild_penalty_matrix() {
+        let top = mk_top(Seat::N, vec!["♦4", "♣4", "♥4", "♠9", "♦9"]); // FH 444+99
+        let fills = |st: &mut TableGameState| {
+            fill_seats(
+                st,
+                vec!["♠3", "♥3", "♦3", "♣3", "♠4", "♥4", "♠6", "♥6", "♦6"],
+                vec!["♣6", "♠7", "♥7", "♦7", "♣7", "♠10", "♥10", "♦10", "♣10"],
+                vec!["♠J", "♥J", "♦J", "♣J", "♠Q", "♥Q", "♦Q", "♣Q", "♠A"],
+            );
+        };
+
+        // 残局 sanctioned：非级牌对 + 双百搭 = 四头炸（−10 轻罚）
+        let mut end_state = mk_playing_state(Seat::E, vec!["♠5", "♦5", "♥2", "♥2", "♠9", "♠8"], None);
+        fills(&mut end_state);
+        let end_p = pctx_of(&end_state, Seat::E);
+        let bomb4_cards = vec!["♠5".to_string(), "♦5".to_string(), "♥2".to_string(), "♥2".to_string()];
+        let bomb4 = combo_of(vec!["♠5", "♦5", "♥2", "♥2"], vec!["♣5", "♥5"]);
+        let sanctioned_end = score_follow(&bomb4_cards, &bomb4, &top, &end_p);
+
+        // 中盘同型（8 张）：双百搭同出 −600 重罚
+        let mut mid_state = mk_playing_state(
+            Seat::E,
+            vec!["♠5", "♦5", "♥2", "♥2", "♠9", "♠8", "♠7", "♠6"],
+            None,
+        );
+        fills(&mut mid_state);
+        let mid_p = pctx_of(&mid_state, Seat::E);
+        let sanctioned_mid = score_follow(&bomb4_cards, &bomb4, &top, &mid_p);
+
+        // 残局落级牌：百搭+级牌同点炸 → 不 sanctioned（−60）+ 落级牌（−20）+ 级牌面值炸（−60）
+        let mut lvl_state = mk_playing_state(Seat::E, vec!["♠2", "♦2", "♥2", "♥2", "♠9", "♠8"], None);
+        fills(&mut lvl_state);
+        let lvl_p = pctx_of(&lvl_state, Seat::E);
+        let lvl_bomb_cards = vec!["♠2".to_string(), "♦2".to_string(), "♥2".to_string(), "♥2".to_string()];
+        let lvl_bomb = combo_of(vec!["♠2", "♦2", "♥2", "♥2"], vec!["♣2", "♦2"]);
+        let level_end = score_follow(&lvl_bomb_cards, &lvl_bomb, &top, &lvl_p);
+
+        // 残局裸双百搭成普通对：−60 −200，必然低于 sanctioned
+        let mut bare_state = mk_playing_state(Seat::E, vec!["♥2", "♥2", "♠9", "♠8", "♠7", "♠6"], None);
+        fills(&mut bare_state);
+        let bare_p = pctx_of(&bare_state, Seat::E);
+        let bare_cards = vec!["♥2".to_string(), "♥2".to_string()];
+        let bare_pair = combo_of(vec!["♥2", "♥2"], vec!["♠3", "♥3"]);
+        let bare_end = score_follow(&bare_cards, &bare_pair, &top, &bare_p);
+
+        // 中盘裸双百搭：−600 −200，更差（避免 5 连同花 → 不产生 bombCount）
+        let mut bare_mid_state = mk_playing_state(
+            Seat::E,
+            vec!["♥2", "♥2", "♠9", "♠8", "♠7", "♠6", "♦5", "♣4"],
+            None,
+        );
+        fills(&mut bare_mid_state);
+        let bare_mid_p = pctx_of(&bare_mid_state, Seat::E);
+        let bare_mid = score_follow(&bare_cards, &bare_pair, &top, &bare_mid_p);
+
+        assert!(
+            sanctioned_end - sanctioned_mid > 500.0,
+            "endgame sanctioned dual-wild bomb (−10) must beat midgame (−600) by >500: {sanctioned_end} vs {sanctioned_mid}"
+        );
+        assert!(
+            sanctioned_end > level_end,
+            "non-level dual-wild bomb (−10) must beat level-touching dual-wild bomb: {sanctioned_end} vs {level_end}"
+        );
+        assert!(
+            bare_end < sanctioned_end - 200.0,
+            "bare dual wild (−60−200) must be worse than sanctioned: {bare_end} vs {sanctioned_end}"
+        );
+        assert!(
+            bare_mid < bare_end - 400.0,
+            "midgame bare dual wild (−600−200) must be far worse: {bare_mid} vs {bare_end}"
+        );
+    }
+
+    // ══ −99999 禁令：级牌炸弹 / 三带二带级牌对 ══
+
+    #[test]
+    fn level_bomb_and_four_level_cards_are_banned() {
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♠2", "♠2", "♦2", "♣2", "♠8", "♠9"],
+            None,
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠4", "♥4", "♦4", "♣4", "♠6", "♥6", "♦6", "♣6", "♠7"],
+            vec!["♥7", "♦7", "♣7", "♠8", "♥8", "♦8", "♣8", "♠10", "♥10"],
+            vec!["♦10", "♣10", "♠J", "♥J", "♦J", "♣J", "♠Q", "♥Q", "♦Q"],
+        );
+        let p = pctx_of(&state, Seat::E);
+        let top = mk_top(Seat::N, vec!["♦4", "♣4", "♥4", "♠9", "♦9"]);
+        let lvl_bomb_cards = vec!["♠2".to_string(), "♠2".to_string(), "♦2".to_string(), "♣2".to_string()];
+        let lvl_bomb = CombinationParser::parse(&lvl_bomb_cards, None, ctx()).unwrap();
+        let s = score_follow(&lvl_bomb_cards, &lvl_bomb, &top, &p);
+        assert!(s < -50000.0, "level bomb (4 level cards) must be banned: {s}");
+    }
+
+    #[test]
+    fn fullhouse_with_level_pair_banned() {
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♠5", "♥5", "♦5", "♠2", "♦2", "♠8"],
+            None,
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠4", "♥4", "♦4", "♣4", "♣5", "♥5", "♦5", "♣5", "♠6"],
+            vec!["♥6", "♦6", "♣6", "♠7", "♥7", "♦7", "♣7", "♠10", "♥10"],
+            vec!["♦10", "♣10", "♠J", "♥J", "♦J", "♣J", "♠Q", "♥Q", "♦Q"],
+        );
+        let p = pctx_of(&state, Seat::E);
+        let top = mk_top(Seat::N, vec!["♦4", "♣4", "♥4", "♠9", "♦9"]);
+        let fh_cards = vec![
+            "♠5".to_string(),
+            "♥5".to_string(),
+            "♦5".to_string(),
+            "♠2".to_string(),
+            "♦2".to_string(),
+        ];
+        let fh = CombinationParser::parse(&fh_cards, None, ctx()).unwrap();
+        let s = score_follow(&fh_cards, &fh, &top, &p);
+        assert!(s < -50000.0, "full house carrying a level pair must be banned: {s}");
+    }
+
+    // ══ 房规：剩 1 张强制打出（JS 488-497）══
+
+    #[test]
+    fn last_card_forced_play_when_beatable() {
+        let state = mk_playing_state(Seat::E, vec!["♠9"], Some((Seat::N, vec!["♠3"])));
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        assert_eq!(
+            picked,
+            PlayerAction::Play {
+                cards: vec!["♠9".into()],
+                wild_targets: None,
+            },
+            "last card must be forced out when it beats the top"
+        );
+    }
+
+    // ══ 队友硬禁压（JS decideAdvancedPlay 确定性项）══
+
+    #[test]
+    fn partner_big_pair_cannot_be_overridden() {
+        // 队友领出大对 KK（rankValue 13 > 12）→ 绝对不能压，即使我有 AA。
+        let state = mk_playing_state(
+            Seat::E,
+            vec!["♠A", "♥A", "♠5", "♠6"],
+            Some((Seat::W, vec!["♠K", "♥K"])),
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        assert_eq!(picked, PlayerAction::Pass, "never override teammate's big pair");
+    }
+
+    #[test]
+    fn enemy_big_pair_can_be_taken() {
+        // 敌家领出大对 KK → 可以用 AA 接（JS 无敌家硬禁压）。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♠A", "♥A", "♠5", "♠6"],
+            Some((Seat::N, vec!["♠K", "♥K"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♦K", "♣K", "♦A", "♣A", "♦5", "♣5", "♦6", "♣6", "♦7"],
+            vec!["♠7", "♥7", "♦7", "♣7", "♠8", "♥8", "♦8", "♣8", "♠9"],
+            vec!["♥9", "♦9", "♣9", "♠10", "♥10", "♦10", "♣10", "♠J", "♥J"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(
+                    cards.len(),
+                    2,
+                    "enemy big pair may be overtaken with AA, got {:?}",
+                    picked
+                );
+            }
+            other => panic!("Expected Play (pair AA), got {:?}", other),
+        }
+    }
+
+    // ══ JS 硬守卫回归（改写为 JS 语义）══
+
+    #[test]
+    fn midgame_follow_small_pair_prefers_pass_over_bomb() {
+        // 中盘（我11张，对手各9张无人冲刺）：对手领出小对44，
+        // 我方唯一能压的是炸弹3333 → JS 守卫①（bombCount≤2 非残局非冲刺）→ Pass。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♠3", "♥3", "♦3", "♣3", "♠8", "♠9", "♠10", "♠J", "♠Q", "♠K", "♠A"],
+            Some((Seat::N, vec!["♠4", "♥4"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♦4", "♣4", "♦5", "♥5", "♦6", "♣6", "♦7", "♣7", "♦8"],
+            vec!["♠5", "♥6", "♦7", "♣8", "♠9", "♥10", "♦J", "♣Q", "♦K"],
+            vec!["♥7", "♦9", "♣10", "♠J", "♥Q", "♦K", "♣A", "♥8", "♠6"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        assert_eq!(
+            picked,
+            PlayerAction::Pass,
+            "mid-game must pass instead of bombing a small pair"
+        );
+    }
+
+    #[test]
+    fn opponent_sprinting_prefers_bomb_intercept() {
+        // JS：绝不炸单张/对子，但对手冲刺（S 剩2张）时允许炸三张拦截。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♠3", "♥3", "♦3", "♣3", "♠5"],
+            Some((Seat::N, vec!["♠4", "♥4", "♦4"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♣4", "♦5", "♣5", "♥5", "♦6", "♣6", "♥6", "♦7", "♣7"],
+            vec!["♠6", "♥7"], // S 冲刺（2 张）
+            vec!["♥8", "♦9", "♣10", "♠J", "♥Q", "♦K", "♣A", "♥9", "♠8"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(
+                    cards.len(), 4,
+                    "opponent sprinting exempts the bomb over a triple, got {:?}",
+                    picked
+                );
+            }
+            other => panic!("Expected Play (bomb intercept), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn last_bomb_used_when_opponent_sprinting() {
+        // JS：中盘 + 仅 1 颗炸弹 + 对手冲刺（S 剩2）→ 守卫①/⑥ 豁免 → 可炸三张。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♠3", "♥3", "♦3", "♣3", "♠8", "♠9", "♠10", "♠J", "♠Q", "♠K", "♠A"],
+            Some((Seat::N, vec!["♠4", "♥4", "♦4"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♣4", "♦5", "♣5", "♥5", "♦6", "♣6", "♥6", "♦7", "♣7"],
+            vec!["♠6", "♥7"], // S 冲刺
+            vec!["♥8", "♦9", "♣10", "♥J", "♥Q", "♦K", "♣A", "♥9", "♣9"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { cards, wild_targets } => {
+                let combo = CombinationParser::parse(cards, wild_targets.as_deref(), ctx())
+                    .expect("intercept candidate must parse");
+                assert!(
+                    matches!(combo.class(), CombinationClass::Bomb),
+                    "opponent sprinting exempts the last bomb for intercept, got {:?}",
+                    picked
+                );
+            }
+            _ => panic!("Expected Play (bomb intercept), got {:?}", picked),
+        }
+    }
+
+    #[test]
+    fn two_bombs_allow_using_one_vs_sprinting() {
+        // JS：2 颗炸弹 + 对手冲刺（S 剩2）→ 可用一颗炸三张拦截。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♠3", "♥3", "♦3", "♣3", "♠5", "♥5", "♦5", "♣5", "♠8", "♠9", "♠10"],
+            Some((Seat::N, vec!["♠4", "♥4", "♦4"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♣4", "♦6", "♣6", "♥6", "♦7", "♣7", "♥7", "♦8", "♣8"],
+            vec!["♠6", "♥9"], // S 冲刺
+            vec!["♥8", "♦9", "♣10", "♥J", "♥Q", "♦K", "♣A", "♣9", "♦10"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { cards, wild_targets } => {
+                let combo = CombinationParser::parse(cards, wild_targets.as_deref(), ctx())
+                    .expect("intercept candidate must parse");
+                assert!(
+                    matches!(combo.class(), CombinationClass::Bomb),
+                    "with 2 bombs one may be spent vs sprinting opponents, got {:?}",
+                    picked
+                );
+            }
+            _ => panic!("Expected Play (bomb intercept), got {:?}", picked),
+        }
+    }
+
+    #[test]
+    fn midgame_still_allows_bomb_on_big_top() {
+        // JS 守卫①：中盘 bombCount≤2 一律保留；3 颗炸弹时对三带二可炸。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec![
+                "♠3", "♥3", "♦3", "♣3", "♠5", "♥5", "♦5", "♣5", "♠6", "♥6", "♦6", "♣6", "♠8",
+            ],
+            Some((Seat::N, vec!["♠K", "♥K", "♦K", "♠9", "♦9"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♣4", "♥4", "♦4", "♠4", "♣7", "♥7", "♦7", "♠7", "♣8"],
+            vec!["♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J", "♣J", "♠Q"],
+            vec!["♣Q", "♥Q", "♦Q", "♠K", "♣K", "♦K", "♠A", "♥A", "♦A"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(
+                    cards.len(), 4,
+                    "with 3 bombs a mid-game bomb over a full house stays allowed"
+                );
+            }
+            _ => panic!("Expected Play (bomb on big top), got {:?}", picked),
+        }
+    }
+
+    #[test]
+    fn endgame_upgraded_wild_bomb_beats_natural_bomb() {
+        // JS 语义：残局 +100 百搭进炸弹奖励压过 −10 升档轻罚 → 5555+百搭(5炸)
+        // 胜过纯天然 5555（对手三张顶、无更优替牌）。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♠5", "♥5", "♦5", "♣5", "♥2", "♠K"],
+            Some((Seat::N, vec!["♠9", "♥9", "♦9"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♣9", "♦9", "♣4", "♦4", "♠6", "♥6", "♦6", "♣6", "♠7"],
+            vec!["♥7", "♦7", "♣7", "♠8", "♥8", "♦8", "♣8", "♠10", "♥10"],
+            vec!["♦10", "♣10", "♠J", "♥J", "♦J", "♣J", "♠Q", "♥Q", "♦Q"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { cards, wild_targets } => {
+                let combo = CombinationParser::parse(cards, wild_targets.as_deref(), ctx())
+                    .expect("candidate must parse");
+                let uses_wild = wild_targets.as_deref().map_or(false, |t| !t.is_empty());
+                assert!(
+                    matches!(combo.class(), CombinationClass::Bomb)
+                        && cards.len() == 5
+                        && uses_wild,
+                    "endgame must prefer the upgraded wild bomb (wild bonus +100 vs −10), got {:?}",
+                    picked
+                );
+            }
+            other => panic!("Expected Play (upgraded wild bomb), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn endgame_follow_single_removal_reward_beats_wild_bomb() {
+        // JS 语义：残局 +400/+300 单张移除奖励 → 百搭三带二 555+8(百搭)
+        //（移除单张8）胜过百搭炸弹 555+百搭（不移除单张）。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♠5", "♥5", "♦5", "♠8", "♠K", "♥2"],
+            Some((Seat::N, vec!["♦4", "♣4", "♥4", "♠9", "♦9"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠3", "♥3", "♦3", "♣3", "♠4", "♥4", "♠6", "♥6", "♦6"],
+            vec!["♣6", "♠7", "♥7", "♦7", "♣7", "♠10", "♥10", "♦10", "♣10"],
+            vec!["♠J", "♥J", "♦J", "♣J", "♠Q", "♥Q", "♦Q", "♣Q", "♠A"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { cards, wild_targets } => {
+                let combo = CombinationParser::parse(cards, wild_targets.as_deref(), ctx())
+                    .expect("candidate must parse");
+                assert!(
+                    matches!(combo.kind, CombinationKind::Ordinary(OrdinaryKind::FullHouse)),
+                    "endgame single-removal reward (+400/+300) must favor the full house, got {:?}",
+                    picked
+                );
+            }
+            other => panic!("Expected Play (full house), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn endgame_follow_prefers_small_single_removal_over_level_card() {
+        // JS 语义：残局跟单6，手 [♠2(级牌),♠7]：♠7 移除单张 +700 胜过级牌单张。
+        let state = mk_playing_state(Seat::E, vec!["♠2", "♠7"], Some((Seat::N, vec!["♠6"])));
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        assert_eq!(
+            picked,
+            PlayerAction::Play {
+                cards: vec!["♠7".into()],
+                wild_targets: None,
+            }
+        );
+    }
+
+    #[test]
+    fn leading_level_single_banned_when_hand_large() {
+        // JS：手牌 > 6 张时空出级牌单张 −99999。手 [♥2,♠2,♦2,♣2,♠3..♠6] 领出
+        // → 必须出小单张 ♠3，绝不能领 2 的单张。
+        let state = mk_playing_state(
+            Seat::E,
+            vec!["♥2", "♠2", "♦2", "♣2", "♠3", "♠4", "♠5", "♠6"],
+            None,
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { cards, wild_targets } => {
+                let combo = CombinationParser::parse(cards, wild_targets.as_deref(), ctx())
+                    .expect("candidate must parse");
+                let is_level_single = matches!(
+                    combo.kind,
+                    CombinationKind::Ordinary(OrdinaryKind::Single)
+                ) && cards.iter().any(|c| c.ends_with('2'));
+                assert!(
+                    !is_level_single,
+                    "must not lead a level-card single with a large hand, got {:?}",
+                    picked
+                );
+            }
+            other => panic!("Expected Play, got {:?}", other),
         }
     }
 }
