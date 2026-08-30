@@ -1103,9 +1103,39 @@ fn find_best_play_follow<'a>(
     top: &PlayState,
     p: &PlayContext,
 ) -> Result<PlayerAction, String> {
+    // JS 硬编码：isEndgame = myRemaining <= 6；冲刺 = 任一对手 ≤ 6（用户房规，原 JS 为 3）
+    let my_remaining = p.my_remaining;
+    let is_endgame = my_remaining <= 6;
+    let is_opp_sprinting = p.min_opp_remaining <= 6;
+
+    // 房规 B1（反炸省百搭）：反炸场景下，若存在"不含百搭"的候选炸能压过，
+    // 则含百搭的炸（且非清空候选）不参与最优选择——张数/点数 penalty 照旧自然选最小够用。
+    // 豁免：残局（≤6）、对手冲刺（≤6）、炸完直接清空（那时烧百搭值）。
+    // （注：不存在免百搭候选时含百搭的炸照常可选——用户未批"唯一反炸含百搭则不反"）
+    let top_is_bomb = top.combination.class() == CombinationClass::Bomb;
+    let cand_has_wild = |c: &Candidate| {
+        c.cards
+            .iter()
+            .any(|s| p.meta_for(s).map(|m| m.is_wild).unwrap_or(false))
+    };
+    let has_wildfree_bomb = candidates
+        .iter()
+        .any(|c| c.combo.class() == CombinationClass::Bomb && !cand_has_wild(c));
+
     // Score each possible play and pick the best one (ties → first in order, JS stable sort)
     let mut best: Option<(f32, &Candidate)> = None;
     for cand in candidates {
+        // 房规 B1：反炸 + 有免百搭候选 + 非豁免场景 → 跳过含百搭的炸（非清空）
+        if top_is_bomb
+            && has_wildfree_bomb
+            && !is_endgame
+            && !is_opp_sprinting
+            && cand.combo.class() == CombinationClass::Bomb
+            && cand_has_wild(cand)
+            && cand.cards.len() < my_remaining
+        {
+            continue;
+        }
         let s = score_follow(cand.cards, &cand.combo, top, p);
         if best.map_or(true, |(bs, _)| s > bs) {
             best = Some((s, cand));
@@ -1116,11 +1146,6 @@ fn find_best_play_follow<'a>(
     };
     let best_cards = best.cards;
     let best_is_bomb = best.combo.class() == CombinationClass::Bomb;
-
-    // JS 硬编码：isEndgame = myRemaining <= 6；冲刺 = 任一对手 ≤ 6（用户房规，原 JS 为 3）
-    let my_remaining = p.my_remaining;
-    let is_endgame = my_remaining <= 6;
-    let is_opp_sprinting = p.min_opp_remaining <= 6;
 
     // ① 炸弹保留：非残局、非对手冲刺、手里炸弹总数 = 1 个时，不出炸弹，直接过。
     //    （用户房规改自 JS 647-655：JS 为 bombCount<=2，现为 =1——
@@ -1187,13 +1212,17 @@ fn find_best_play_follow<'a>(
     }
 
     // ⑥ 绝对禁止：用炸弹压三张（太浪费，除非对手冲刺或残局）(JS 701-711)
+    //    房规扩展（用户 2026-08-30）：12 以下（普通点数 <Q，即 J 及以下）的三带二同样不炸；
+    //    Q/K/A/级牌 的三带二仍可炸。豁免照旧：残局（≤6）、对手冲刺（≤6）。
+    //    注：primary 为 level_order_value 尺度（Q=11, K=12, A=13, 级牌=14），故 <Q ⇔ primary<11。
     if best_is_bomb
-        && matches!(
-            top.combination.kind,
-            CombinationKind::Ordinary(OrdinaryKind::Triple)
-        )
         && !is_endgame
         && !is_opp_sprinting
+        && match top.combination.kind {
+            CombinationKind::Ordinary(OrdinaryKind::Triple) => true,
+            CombinationKind::Ordinary(OrdinaryKind::FullHouse) => top.combination.primary < 11,
+            _ => false,
+        }
     {
         return Ok(PlayerAction::Pass);
     }
@@ -1331,7 +1360,15 @@ fn score_follow(
         if is_bomb
             || matches!(kind, CombinationKind::Bomb(BombKind::StraightFlush))
         {
-            score += 100.0; // 逢人配配炸弹/同花顺：重奖！
+            // 房规 B1（用户 2026-08-30）：反炸场景取消"逢人配配炸 +100"奖励——
+            // 该奖励在反炸时主动鼓励烧百搭（如用 4个5+逢人配 反 4K）。豁免照旧：
+            // 残局（≤6）、对手冲刺（≤6）、炸完直接清空（那时烧百搭值）。
+            let counter_bomb = top.combination.class() == CombinationClass::Bomb;
+            let not_clearing = play_cards.len() < my_remaining;
+            let b1_exempt = is_endgame || p.min_opp_remaining <= 6 || !not_clearing;
+            if !(counter_bomb && !b1_exempt) {
+                score += 100.0; // 逢人配配炸弹/同花顺：重奖！
+            }
         } else {
             match kind {
                 CombinationKind::Ordinary(OrdinaryKind::Straight)
@@ -3134,6 +3171,128 @@ mod tests {
         match &picked {
             PlayerAction::Play { .. } => {}
             other => panic!("两颗独立炸中盘反炸（打完剩 1 颗）应允许，got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn small_full_house_never_bombed_midgame() {
+        // 用户房规 A（2026-08-30）：12 以下（<Q）的三带二中盘一律不炸。
+        // 敌领 777+88，我 3 颗天然炸、无人冲刺 → Pass（旧 JS 语义为可炸，已按房规收紧）。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec![
+                "♠3", "♥3", "♦3", "♣3", "♠5", "♥5", "♦5", "♣5", "♠6", "♥6", "♦6", "♣6", "♠8",
+            ],
+            Some((Seat::N, vec!["♥7", "♠7", "♦7", "♣8", "♥8"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♣4", "♥4", "♦4", "♠4", "♣7", "♠9", "♥9", "♦9", "♣9"],
+            vec!["♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J", "♣J", "♠Q"],
+            vec!["♣Q", "♦Q", "♥Q", "♠K", "♥K", "♦K", "♣K", "♠A", "♥A"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        assert_eq!(
+            picked,
+            PlayerAction::Pass,
+            "12 以下的三带二中盘不许用炸（房规 A），got {:?}",
+            picked
+        );
+    }
+
+    #[test]
+    fn counter_bomb_prefers_wildfree_candidate() {
+        // 用户房规 B1（2026-08-30）：反炸有免百搭候选时，不选含百搭的炸。
+        // 敌领 4K；我有 4A（免百搭）与 5555+♥2（五张含百搭）都能压 → 必须选 4A。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec![
+                "♠A", "♥A", "♦A", "♣A", "♠5", "♥5", "♦5", "♣5", "♥2", "♠9", "♥9", "♦9",
+            ],
+            Some((Seat::N, vec!["♠K", "♥K", "♦K", "♣K"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♣4", "♥4", "♦4", "♠4", "♣6", "♥6", "♦6", "♣6", "♠7"],
+            vec!["♥7", "♦7", "♣7", "♠8", "♥8", "♦8", "♣8", "♠10", "♥10"],
+            vec!["♣10", "♦10", "♠J", "♥J", "♦J", "♣J", "♠Q", "♥Q", "♦Q"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { cards, .. } => {
+                let mut got: Vec<String> = cards.clone();
+                got.sort();
+                assert_eq!(
+                    got,
+                    vec!["♠A", "♣A", "♥A", "♦A"],
+                    "反炸必须选免百搭的 4A，不许烧百搭（房规 B1），got {:?}",
+                    picked
+                );
+            }
+            other => panic!("Expected Play (4A counter), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn counter_bomb_wild_allowed_when_sprinting() {
+        // 房规 B1 豁免：对手冲刺（W 剩 2 张）时反炸可烧百搭（+100 奖励恢复）。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec![
+                "♠A", "♥A", "♦A", "♣A", "♠5", "♥5", "♦5", "♣5", "♥2", "♠9", "♥9", "♦9",
+            ],
+            Some((Seat::N, vec!["♠K", "♥K", "♦K", "♣K"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♣4", "♥4", "♦4", "♠4", "♣6", "♥6", "♦6", "♣6", "♠7"],
+            vec!["♥7", "♦7"],
+            vec!["♣10", "♦10", "♠J", "♥J", "♦J", "♣J", "♠Q", "♥Q", "♦Q"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(
+                    cards.len(),
+                    5,
+                    "冲刺豁免：含百搭的五张炸反炸应被允许，got {:?}",
+                    picked
+                );
+            }
+            other => panic!("Expected Play (wild bomb counter under sprint), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn counter_bomb_only_wild_option_still_plays_when_bombs_remain() {
+        // 房规 B1 边界（用户未批 B2）：唯一能反炸的候选含百搭时，只要 ①b 重算后仍剩炸
+        // （这里手里还有 3333），照常出炸——不新增"含百搭一律不反"的 Pass 规则。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♠5", "♥5", "♦5", "♣5", "♥2", "♠3", "♥3", "♦3", "♣3", "♠9"],
+            Some((Seat::N, vec!["♠K", "♥K", "♦K", "♣K"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♣4", "♥4", "♦4", "♠4", "♣6", "♥6", "♦6", "♣6", "♠7"],
+            vec!["♥7", "♦7", "♣7", "♠8", "♥8", "♦8", "♣8", "♠10", "♥10"],
+            vec!["♣10", "♦10", "♠J", "♥J", "♦J", "♣J", "♠Q", "♥Q", "♦Q"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { cards, wild_targets } => {
+                assert!(
+                    cards.len() == 5,
+                    "唯一反炸手段（含百搭五张炸）在打完仍有炸时应照常打出，got {:?}",
+                    picked
+                );
+                assert!(
+                    wild_targets.is_some() || cards.iter().any(|c| c == "♥2"),
+                    "应打出含百搭的炸，got {:?}",
+                    picked
+                );
+            }
+            other => panic!("Expected Play (only wild counter), got {:?}", other),
         }
     }
 
