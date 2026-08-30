@@ -106,8 +106,10 @@ impl AdvancedBotParams {
     pub fn mutate_random(&self, step_size: f32) -> Self {
         let mut rng = rand::rng();
         let mut cloned = self.clone();
-        // 15 个可变异参数（排除 hand_tracker_enabled 和 enable_reason_trace 两个布尔开关）
-        let idx = rng.random_range(0..15);
+        // 房规锁：可变异参数仅限 10 个 f32 权重（0-9）。
+        // 3 个 u8 阈值（冲刺/残局/队友冲刺）与 2 个概率阈值（牌踪器激活前以 0 贡献运行，
+        // 学了也是空气）不参与变异——训练不可漂移房规。
+        let idx = rng.random_range(0..10);
         match idx {
             // f32 参数：加随机浮点扰动，clamp 到合理范围
             0 => cloned.team_win_weight = (cloned.team_win_weight + rng.random_range(-step_size..step_size)).clamp(0.1, 10.0),
@@ -120,13 +122,6 @@ impl AdvancedBotParams {
             7 => cloned.proactive_play_bias = (cloned.proactive_play_bias + rng.random_range(-step_size..step_size)).clamp(0.1, 10.0),
             8 => cloned.low_card_dump_bias = (cloned.low_card_dump_bias + rng.random_range(-step_size..step_size)).clamp(0.1, 10.0),
             9 => cloned.pass_stall_penalty = (cloned.pass_stall_penalty + rng.random_range(-step_size..step_size)).clamp(0.1, 10.0),
-            // 概率阈值参数：clamp 到 [0.1, 1.0]
-            10 => cloned.prob_threshold_for_bomb = (cloned.prob_threshold_for_bomb + rng.random_range(-step_size..step_size)).clamp(0.1, 1.0),
-            11 => cloned.prob_threshold_for_intercept = (cloned.prob_threshold_for_intercept + rng.random_range(-step_size..step_size)).clamp(0.1, 1.0),
-            // u8 参数：整数步长扰动，clamp 到合理范围
-            12 => cloned.partner_sprint_threshold = (cloned.partner_sprint_threshold as i32 + rng.random_range(-2..=2)).clamp(1, 8) as u8,
-            13 => cloned.enemy_low_cards_threshold = (cloned.enemy_low_cards_threshold as i32 + rng.random_range(-2..=2)).clamp(1, 8) as u8,
-            14 => cloned.endgame_hand_count_threshold = (cloned.endgame_hand_count_threshold as i32 + rng.random_range(-2..=2)).clamp(1, 10) as u8,
             _ => unreachable!(),
         }
         cloned

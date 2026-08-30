@@ -80,7 +80,8 @@ fn get_params_for_seat(seat: Seat) -> AdvancedBotParams {
 }
 
 /// JS `TRAINED_PARAMS` (bot-advanced.js L49-69) — the rule-standard defaults.
-fn js_trained_params() -> AdvancedBotParams {
+/// 房规基线：训练器(learning)起点/评估基线也以此为准（含冲刺=6 等用户房规）。
+pub(crate) fn js_trained_params() -> AdvancedBotParams {
     AdvancedBotParams {
         team_win_weight: 1.0,
         first_out_weight: 0.7657717,

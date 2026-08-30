@@ -77,9 +77,10 @@ pub fn evaluate_params_with_progress<F: Fn(u32, u32)>(
     config: &SelfPlayConfig,
     progress_cb: Option<F>,
 ) -> EvalResult {
-    // 打破对称性：NS 用候选参数，EW 用固定基线参数(default_balanced)。
+    // 打破对称性：NS 用候选参数，EW 用固定基线参数(js_trained_params 房规基线)。
     // 这样 NS 胜率能真实反映候选参数相对基准的优劣，避免自对弈对称导致的~50%胜率随机游走。
-    let baseline = AdvancedBotParams::default_balanced();
+    // （房规：基线从 default_balanced 改为 js_trained_params，与线上实际回退一致）
+    let baseline = crate::strategy::suggest::js_trained_params();
     set_learn_params_for_teams(Some(params.clone()), Some(baseline));
 
     // 记录当前训练 generation,用于检测是否有新训练启动

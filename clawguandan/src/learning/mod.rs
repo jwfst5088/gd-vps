@@ -58,10 +58,19 @@ pub fn run_learning_with_progress(
 
     let total_matches = matches_per_eval * iterations * 2; // current + candidate per iteration
 
-    let start = AdvancedBotParams::load(output_path).unwrap_or_else(|_| {
-        println!("[learn] No existing params found at {}, starting from default balanced", output_path);
-        AdvancedBotParams::default_balanced()
+    // 房规基线：优先续训已有 checkpoint；否则从 js_trained_params（用户房规，含冲刺=6）起步。
+    // （此前回退到 default_balanced，导致训练起点冲刺=3，与房规 6 冲突——已修）
+    let mut start = AdvancedBotParams::load(output_path).unwrap_or_else(|_| {
+        println!("[learn] No existing params found at {}, starting from js_trained_params (house-rule baseline)", output_path);
+        crate::strategy::suggest::js_trained_params()
     });
+    // 房规锁：即使从旧 checkpoint 续训，阈值类参数也强制对齐房规基线（训练不可漂移）。
+    {
+        let house = crate::strategy::suggest::js_trained_params();
+        start.partner_sprint_threshold = house.partner_sprint_threshold;
+        start.enemy_low_cards_threshold = house.enemy_low_cards_threshold;
+        start.endgame_hand_count_threshold = house.endgame_hand_count_threshold;
+    }
     println!("[learn] Starting hill-climb optimization via self-play...");
     println!("[learn] Matches per evaluation: {matches_per_eval}");
     println!("[learn] Iterations: {iterations}");

@@ -124,10 +124,10 @@ fn run_single_match(engine: &GameEngine) -> Result<Option<(TeamId, TeamId, usize
 }
 
 fn evaluate_individual(params: &AdvancedBotParams, matches: u32) -> EvalResult {
-    // 打破对称性：NS 用候选参数，EW 用固定基线参数(default_balanced)。
+    // 打破对称性：NS 用候选参数，EW 用固定基线参数(js_trained_params 房规基线)。
     // 这样 NS 胜率能真实反映候选参数相对基准的优劣，避免自对弈对称导致的~50%胜率随机游走。
-    // 与 optimizer.rs 保持一致。
-    let baseline = AdvancedBotParams::default_balanced();
+    // 与 optimizer.rs 保持一致。（房规：基线从 default_balanced 改为 js_trained_params）
+    let baseline = crate::strategy::suggest::js_trained_params();
     set_learn_params_for_teams(Some(params.clone()), Some(baseline));
 
     // 记录当前训练 generation,用于检测是否有新训练启动
