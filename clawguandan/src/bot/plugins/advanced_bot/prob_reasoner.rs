@@ -124,7 +124,11 @@ impl ProbabilisticReasoner {
     pub fn is_any_enemy_sprinting(&self, my_seat: Seat, threshold: u8) -> bool {
         for seat in Seat::ALL {
             if seat != my_seat && seat != my_seat.teammate() {
-                if self.tracker.get_remaining_count(seat) <= threshold as usize {
+                // 房规（用户 2026-08-30）：已走完（剩 0 张、头游已定）的对手不算冲刺——
+                // 他不可能再赢；否则"防接风烧唯一炸"场景会因 0 张 ≤ 阈值误触发
+                // 冲刺豁免/敌方低牌奖励（与 CF bot-advanced.js 同步）。
+                let cnt = self.tracker.get_remaining_count(seat);
+                if cnt > 0 && cnt <= threshold as usize {
                     return true;
                 }
             }

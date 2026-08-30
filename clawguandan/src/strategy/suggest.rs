@@ -216,6 +216,8 @@ fn analyze_hand_combos(hand: &[String], ctx: RuleContext) -> HandCombos {
     let mut card_to_rank: HashMap<String, u8> = HashMap::new();
     let mut rank_to_count: HashMap<u8, usize> = HashMap::new();
     let mut wild_count = 0usize;
+    let mut red_joker_count = 0usize;
+    let mut black_joker_count = 0usize;
 
     for card in hand {
         let Some(c) = parse_card_symbol(card).ok() else {
@@ -223,6 +225,17 @@ fn analyze_hand_combos(hand: &[String], ctx: RuleContext) -> HandCombos {
         };
         if is_wild(c, ctx) {
             wild_count += 1;
+            continue;
+        }
+        // 天王炸（2大王+2小王）也是炸弹——此前 jokers 因无 natural_rank 被完全跳过，
+        // 导致"手里唯一的炸弹是4王"时 bomb_count=0，守卫①（唯一炸保留）从不生效
+        // （与 CF bot-advanced.js 同步修复）。
+        if c.suit == Suit::Joker {
+            match c.rank {
+                Rank::RedJoker => red_joker_count += 1,
+                Rank::BlackJoker => black_joker_count += 1,
+                _ => {}
+            }
             continue;
         }
         if let Ok(nv) = natural_rank_value(c.rank) {
@@ -303,7 +316,10 @@ fn analyze_hand_combos(hand: &[String], ctx: RuleContext) -> HandCombos {
         0
     };
 
-    let bomb_count = bomb_ranks.len() + wild_assisted_bombs + straight_flush_count;
+    let bomb_count = bomb_ranks.len()
+        + wild_assisted_bombs
+        + straight_flush_count
+        + usize::from(red_joker_count == 2 && black_joker_count == 2);
 
     // singles count (JS L1295-1302)
     let mut singles_count = 0usize;
@@ -1022,11 +1038,14 @@ fn decide_follow(top: &PlayState, p: &PlayContext, actor: Seat) -> FollowDecisio
         {
             return FollowDecision::Pass;
         }
-        // 队友的三带二大于10（J、Q、K、A、2）不能压
+        // 队友的三带二大于等于10（10、J、Q、K、A、2）不能压——用户房规"10以上不压队友"。
+        // 三张 rank 取解析后的 combination.primary（修复 extract_top_rank 只看首张牌在
+        // 乱序/百搭记录下判错致队友 JJJ 被压）。primary 为 level_order_value 刻度
+        // （10=9,J=10,Q=11,K=12,A=13,级牌=14），阈值 9 对齐 JS rankValue>=10（CF 同步）。
         if matches!(
             top.combination.kind,
             CombinationKind::Ordinary(OrdinaryKind::FullHouse)
-        ) && trv > 10
+        ) && top.combination.primary >= 9
         {
             return FollowDecision::Pass;
         }
