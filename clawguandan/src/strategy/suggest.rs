@@ -434,6 +434,7 @@ fn split_penalty(
     level_nat: u8,
     has_level_card_or_joker: bool,
     play_kind: &CombinationKind,
+    allow_endgame_split: bool,
 ) -> u32 {
     // playRankCounts via cardToRank: wilds/jokers contribute nothing (JS L1386-1392)
     let mut play_rank_counts: HashMap<u8, usize> = HashMap::new();
@@ -477,6 +478,10 @@ fn split_penalty(
                 if matches!(play_kind, CombinationKind::Ordinary(OrdinaryKind::Straight)) {
                     continue;
                 }
+                // 房规豁免（用户 2026-08-30）：残局+手牌无单张+队友本轮已过牌 → 允许拆三张同
+                if allow_endgame_split {
+                    continue;
+                }
                 if rank <= 10 {
                     return BANNED_SCORE_U32; // ABSOLUTE BAN: rank ≤ 10
                 }
@@ -502,6 +507,10 @@ fn split_penalty(
                     continue;
                 }
                 if matches!(play_kind, CombinationKind::Ordinary(OrdinaryKind::Straight)) {
+                    continue;
+                }
+                // 房规豁免（用户 2026-08-30）：残局+手牌无单张+队友本轮已过牌 → 允许拆对子
+                if allow_endgame_split {
                     continue;
                 }
                 if rank <= 10 {
@@ -602,6 +611,8 @@ struct PlayContext {
     has_level_card_or_joker: bool,
     /// 我手牌的预解析元数据
     meta: HashMap<String, CardMeta>,
+    /// 房规（2026-08-30）：本轮顶牌之后队友是否已 Pass（残局拆对豁免条件之一）
+    teammate_passed_top: bool,
     /// 牌踪器：本座（actor）
     actor_seat: Seat,
     /// 牌踪器：各座剩余张数（JS tracker.seatRemainingCounts）
@@ -658,6 +669,15 @@ fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayCo
         .expect("exactly two enemy seats");
     let pool = PoolStats::build(&my_hand, &hand.history, ctx);
 
+    // 房规（用户 2026-08-30）：残局拆对豁免需要"队友本轮已过牌（不要单张）"——
+    // 从 history 末尾向前取 Pass 条目（直到当前顶牌=最后一条 Play）看队友是否 Pass 过。
+    let teammate_passed_top = hand
+        .history
+        .iter()
+        .rev()
+        .take_while(|e| e.action_type != HistoryActionKind::Play)
+        .any(|e| e.action_type == HistoryActionKind::Pass && e.seat == teammate_seat);
+
     PlayContext {
         ctx,
         level_rank,
@@ -672,6 +692,7 @@ fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayCo
         combos,
         has_level_card_or_joker,
         meta,
+        teammate_passed_top,
         actor_seat,
         seat_remaining,
         enemy_seats,
@@ -1273,8 +1294,11 @@ fn score_follow(
     let bomb_split_verdict =
         classify_bomb_split(play_cards, &p.my_hand, kind, my_remaining);
     let play_is_bomb = play_combo.class() == CombinationClass::Bomb;
+    // 房规（用户 2026-08-30）：拆对/拆三张豁免 = 残局(≤6) + 手牌无单张 + 队友本轮已过牌。
+    let allow_endgame_split =
+        p.is_endgame && p.combos.singles_count == 0 && p.teammate_passed_top;
     let mut penalty =
-        split_penalty(play_cards, combos, p.level_nat, p.has_level_card_or_joker, kind) as f32;
+        split_penalty(play_cards, combos, p.level_nat, p.has_level_card_or_joker, kind, allow_endgame_split) as f32;
     if !play_is_bomb {
         if bomb_split_verdict == BombSplitVerdict::Exempt && penalty >= BANNED_SCORE {
             penalty = 0.0; // 房规豁免：放行拆炸
@@ -1735,8 +1759,9 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
     let bomb_split_verdict =
         classify_bomb_split(play_cards, &p.my_hand, kind, my_remaining);
     let play_is_bomb = play_combo.class() == CombinationClass::Bomb;
+    // 领出路径：拆对豁免不适用（房规豁免仅限跟牌场景，用户 2026-08-30）
     let mut penalty =
-        split_penalty(play_cards, combos, p.level_nat, p.has_level_card_or_joker, kind) as f32;
+        split_penalty(play_cards, combos, p.level_nat, p.has_level_card_or_joker, kind, false) as f32;
     if !play_is_bomb {
         if bomb_split_verdict == BombSplitVerdict::Exempt && penalty >= BANNED_SCORE {
             penalty = 0.0; // 房规豁免：放行拆炸
@@ -2319,6 +2344,44 @@ mod tests {
         RuleContext {
             hand_level: HandLevel::Two,
         }
+    }
+
+    // ══ 房规回归测试（2026-08-30）：残局拆对/拆三张豁免三条件（残局+无单张+队友过牌）══
+
+    #[test]
+    fn endgame_split_pair_requires_allow_flag() {
+        // [♠5,♥5,♠8,♥8]（残局 4 张、无单张）跟单张 3：
+        // 三条件齐（flag=true）→ 允许拆对（penalty 0）；缺任一（flag=false）→ 99999 禁止。
+        let hand: Vec<String> = vec!["♠5", "♥5", "♠8", "♥8"].into_iter().map(String::from).collect();
+        let combos = analyze_hand_combos(&hand, ctx());
+        assert_eq!(combos.singles_count, 0, "test hand must have no singles");
+        let play = vec!["♠5".to_string()];
+        let kind = CombinationKind::Ordinary(OrdinaryKind::Single);
+        assert_eq!(
+            split_penalty(&play, &combos, 2, false, &kind, true),
+            0,
+            "flag=true (残局+无单张+队友过牌) must allow pair split"
+        );
+        assert_eq!(
+            split_penalty(&play, &combos, 2, false, &kind, false),
+            BANNED_SCORE_U32,
+            "flag=false must keep the absolute ban"
+        );
+        // 拆三张同理：[♠7,♥7,♦7,♠8,♥8,♠9,♥9]（无单张）拆 7 出单
+        let hand3: Vec<String> = vec!["♠7", "♥7", "♦7", "♠8", "♥8", "♠9", "♥9"]
+            .into_iter().map(String::from).collect();
+        let combos3 = analyze_hand_combos(&hand3, ctx());
+        let play3 = vec!["♠7".to_string()];
+        assert_eq!(
+            split_penalty(&play3, &combos3, 2, false, &kind, true),
+            0,
+            "flag=true must allow triple split"
+        );
+        assert_eq!(
+            split_penalty(&play3, &combos3, 2, false, &kind, false),
+            BANNED_SCORE_U32,
+            "flag=false must keep the triple-split ban"
+        );
     }
 
     fn mk_playing_state(
