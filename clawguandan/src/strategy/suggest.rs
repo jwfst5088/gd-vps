@@ -12,8 +12,8 @@
 //! Scoring contract (mirrors JS exactly):
 //! - `f32` scores, **higher is better**.
 //! - Probability-dependent terms (`probOpponentCanFollow`, `probOpponentHasBomb`,
-//!   `calculateGameWinProb`) contribute **0** — 无牌踪器，概率项置 0 (no card tracker in
-//!   this port); every deterministic term is kept verbatim.
+//!   `calculateGameWinProb`) are ACTIVE: 牌踪器（rank 级剩余牌统计）已激活，
+//!   公式与 JS HandTracker/ProbabilisticReasoner 1:1；受 `hand_tracker_enabled` 开关控制。
 //! - Seat remaining counts are read directly from `state.hand.hands` (`len`);
 //!   `min_opp_remaining` = min of the two opponents; teammate = `Seat::teammate`.
 //!
@@ -34,7 +34,9 @@ use crate::game::engine::PlayerAction;
 use crate::game::rules::combination_parser::{
     BombKind, Combination, CombinationClass, CombinationKind, CombinationParser, OrdinaryKind,
 };
-use crate::game::types::{GamePhase, HandState, PlayState, TableGameState};
+use crate::game::types::{
+    GamePhase, HandHistoryEntry, HandState, HistoryActionKind, PlayState, TableGameState,
+};
 
 use super::enumerate_legal_actions;
 
@@ -503,6 +505,66 @@ const BANNED_SCORE_U32: u32 = 99999;
 
 // ── Play context (预计算, mirror JS build_play_context 参数面) ──────────
 
+// ── 牌踪器（JS HandTracker 的 rank 级统计，1:1 语义）────────────────────
+// 双副牌 108 张：点数 3..A、2 各 8 张（4 花色 × 2 副），黑王/红王各 2 张。
+// 已见 = 我手牌 + 全部历史出牌；剩余池 = 全部 − 已见。
+
+/// JS `rankValue` 的值域索引：3..=15 为点数（2=15），16=小王，17=大王。
+const RANK_SLOT_MAX: usize = 18;
+
+#[derive(Clone, Debug, Default)]
+struct PoolStats {
+    /// rank_value 值 → 剩余未见张数
+    rank_counts: [u16; RANK_SLOT_MAX],
+    /// suffix_ge[v] = rank 值 ≥ v 的剩余张数
+    suffix_ge: [u16; RANK_SLOT_MAX + 1],
+    /// 剩余未见总张数
+    total: u16,
+}
+
+impl PoolStats {
+    fn build(my_hand: &[String], history: &[HandHistoryEntry], ctx: RuleContext) -> Self {
+        // 已见按 rank 统计（双王/级牌/百搭都按其符号→rank 计数）
+        let mut seen_rank = [0u16; RANK_SLOT_MAX];
+        let mut bump = |sym: &str| {
+            if let Some(meta) = meta_of(sym, ctx) {
+                let v = meta.rank_value as usize;
+                if v < RANK_SLOT_MAX {
+                    seen_rank[v] += 1;
+                }
+            }
+        };
+        for c in my_hand {
+            bump(c);
+        }
+        for e in history {
+            if e.action_type == HistoryActionKind::Play {
+                for c in &e.cards {
+                    bump(c);
+                }
+            }
+        }
+        // 双副牌全量 − 已见
+        let mut s = PoolStats::default();
+        let mut total = 0u16;
+        for v in 3..=15usize {
+            s.rank_counts[v] = 8 - seen_rank[v].min(8);
+            total += s.rank_counts[v];
+        }
+        for v in 16..=17usize {
+            s.rank_counts[v] = 2 - seen_rank[v].min(2);
+            total += s.rank_counts[v];
+        }
+        s.total = total;
+        let mut running = 0u16;
+        for v in (0..RANK_SLOT_MAX).rev() {
+            running += s.rank_counts[v];
+            s.suffix_ge[v] = running;
+        }
+        s
+    }
+}
+
 struct PlayContext {
     ctx: RuleContext,
     /// 当前级牌 Rank（JS `levelRank`）
@@ -524,6 +586,14 @@ struct PlayContext {
     has_level_card_or_joker: bool,
     /// 我手牌的预解析元数据
     meta: HashMap<String, CardMeta>,
+    /// 牌踪器：本座（actor）
+    actor_seat: Seat,
+    /// 牌踪器：各座剩余张数（JS tracker.seatRemainingCounts）
+    seat_remaining: HashMap<Seat, usize>,
+    /// 牌踪器：两个对手座
+    enemy_seats: [Seat; 2],
+    /// 牌踪器：剩余未见牌的 rank 级统计
+    pool: PoolStats,
 }
 
 fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayContext {
@@ -557,6 +627,21 @@ fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayCo
         }
     });
 
+    // ── 牌踪器：各座剩余 + 剩余未见牌统计（JS HandTracker.init/updatePlay 等价）──
+    let actor_seat = actor;
+    let mut seat_remaining: HashMap<Seat, usize> = HashMap::new();
+    for s in Seat::ALL {
+        seat_remaining.insert(s, hand.remaining_count(s));
+    }
+    let enemy_seats: [Seat; 2] = Seat::ALL
+        .iter()
+        .copied()
+        .filter(|s| *s != actor && *s != teammate_seat)
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("exactly two enemy seats");
+    let pool = PoolStats::build(&my_hand, &hand.history, ctx);
+
     PlayContext {
         ctx,
         level_rank,
@@ -571,6 +656,10 @@ fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayCo
         combos,
         has_level_card_or_joker,
         meta,
+        actor_seat,
+        seat_remaining,
+        enemy_seats,
+        pool,
     }
 }
 
@@ -580,6 +669,112 @@ impl PlayContext {
             .get(sym)
             .copied()
             .or_else(|| meta_of(sym, self.ctx))
+    }
+
+    // ── 牌踪器概率接口（JS HandTracker / ProbabilisticReasoner 1:1）─────────
+
+    fn remaining_of(&self, seat: Seat) -> usize {
+        self.seat_remaining.get(&seat).copied().unwrap_or(0)
+    }
+
+    /// JS `getProbRankInHand`（L228-238）
+    fn prob_rank_in_hand(&self, seat: Seat, rank_v: usize) -> f32 {
+        if seat == self.actor_seat {
+            return 0.0;
+        }
+        let total_remaining = self.remaining_of(seat);
+        if total_remaining == 0 {
+            return 0.0;
+        }
+        let remaining_in_pool = self.pool.rank_counts.get(rank_v).copied().unwrap_or(0) as f32;
+        let total_unknown = self.pool.total as f32;
+        if total_unknown == 0.0 {
+            return 0.0;
+        }
+        (remaining_in_pool / total_unknown) * (total_remaining as f32 / total_unknown).min(1.0)
+    }
+
+    /// JS `getProbHasBomb`（L244-262）
+    fn prob_has_bomb(&self, seat: Seat) -> f32 {
+        if seat == self.actor_seat {
+            return 0.0;
+        }
+        let total_remaining = self.remaining_of(seat);
+        if total_remaining < 4 {
+            return 0.0;
+        }
+        let mut prob = 0.0f32;
+        for v in 3..=15usize {
+            // JS bombRanks '2'..'A' → rank 值 3..=15
+            let count_in_pool = self.pool.rank_counts[v];
+            if count_in_pool >= 4 {
+                prob += 0.2;
+            } else if count_in_pool >= 3 {
+                prob += 0.1;
+            } else if count_in_pool >= 2 {
+                prob += 0.05;
+            }
+        }
+        prob.min(1.0) * (total_remaining as f32 / 20.0).min(1.0)
+    }
+
+    /// JS `getProbCanFollow`（L268-278）
+    fn prob_can_follow(&self, seat: Seat, min_rank_v: usize) -> f32 {
+        if seat == self.actor_seat {
+            return 0.0;
+        }
+        let total_remaining = self.remaining_of(seat);
+        if total_remaining == 0 {
+            return 0.0;
+        }
+        let total_unknown = self.pool.total as f32;
+        if total_unknown == 0.0 {
+            return 0.0;
+        }
+        let higher_in_pool = self
+            .pool
+            .suffix_ge
+            .get(min_rank_v)
+            .copied()
+            .unwrap_or(0) as f32;
+        (higher_in_pool / total_unknown).min(1.0)
+    }
+
+    /// JS `calculateOpponentBombProb`（L320-329）：对手中最大的持炸概率
+    fn opponent_bomb_prob(&self) -> f32 {
+        self.enemy_seats
+            .iter()
+            .map(|s| self.prob_has_bomb(*s))
+            .fold(0.0f32, f32::max)
+    }
+
+    /// JS `calculateOpponentHasRank`（L335-341）：全体（含队友，自身恒 0）概率求和，封顶 1
+    fn opponent_has_rank(&self, rank_v: usize) -> f32 {
+        Seat::ALL
+            .iter()
+            .map(|s| self.prob_rank_in_hand(*s, rank_v))
+            .sum::<f32>()
+            .min(1.0)
+    }
+
+    /// JS `calculateGameWinProb`（L375-397）：团队级胜率（不含自对弈噪声）
+    fn game_win_prob(&self) -> f32 {
+        let my_remaining = self.remaining_of(self.actor_seat);
+        let partner_remaining = self.remaining_of(self.teammate_seat);
+        let team_remaining = my_remaining + partner_remaining;
+        let mut enemy_remaining = 0usize;
+        for s in self.enemy_seats {
+            enemy_remaining += self.remaining_of(s);
+        }
+        let total_cards = team_remaining + enemy_remaining;
+        if total_cards == 0 {
+            return 0.5;
+        }
+        let progress_ratio = enemy_remaining as f32 / total_cards as f32;
+        let advantage = 1.0 - progress_ratio;
+        let bomb_factor = self.opponent_bomb_prob();
+        let adjusted = advantage * (1.0 - bomb_factor * 0.3);
+        adjusted.clamp(0.0, 1.0)
     }
 }
 
@@ -841,12 +1036,28 @@ fn decide_follow(top: &PlayState, p: &PlayContext, actor: Seat) -> FollowDecisio
             return FollowDecision::Pass; // Do not override teammate's big card
         }
 
-        // 概率项 probOpponentCanFollow：无牌踪器，概率项置 0（贡献 0，跳过）
+        // 概率项 probOpponentCanFollow（JS 555-561）：对手/队友是否还接得住这个 rank
+        if p.params.hand_tracker_enabled {
+            let top_rank_v = top_rank.map(rank_value_js).unwrap_or(0) as usize;
+            let prob_opponent_can_follow = p.opponent_has_rank(top_rank_v);
+            if prob_opponent_can_follow < params.prob_threshold_for_intercept {
+                play_score += 2.0 * params.low_card_dump_bias;
+            } else {
+                pass_score += 1.0 * params.yield_to_partner_bias;
+            }
+        }
+        // （hand_tracker_enabled=false 时概率项贡献 0，维持旧行为）
     } else if enemy_leading {
         // Enemy is leading — try to follow (JS 562-580)
         play_score += 2.0;
 
-        // 概率项 probOpponentHasBomb：无牌踪器，概率项置 0（贡献 0，跳过）
+        // 概率项 probOpponentHasBomb（JS 566-569）：对手大概率持炸 → 保守
+        if p.params.hand_tracker_enabled {
+            let prob_opponent_has_bomb = p.opponent_bomb_prob();
+            if prob_opponent_has_bomb > params.prob_threshold_for_bomb {
+                pass_score += 2.0 * params.bomb_conserve_bias;
+            }
+        }
 
         let enemy_low = p.min_opp_remaining <= params.enemy_low_cards_threshold as usize;
         if enemy_low {
@@ -867,7 +1078,15 @@ fn decide_follow(top: &PlayState, p: &PlayContext, actor: Seat) -> FollowDecisio
         pass_score += 2.0 * params.second_out_weight;
     }
 
-    // 概率项 calculateGameWinProb：无牌踪器，概率项置 0（贡献 0，跳过）
+    // 概率项 calculateGameWinProb（JS 592-598）：局势占优且非敌领 → 过牌保局面；劣势 → 抢
+    if p.params.hand_tracker_enabled {
+        let game_win_prob = p.game_win_prob();
+        if game_win_prob > 0.7 && !enemy_leading {
+            pass_score += 1.0;
+        } else if game_win_prob < 0.3 {
+            play_score += 1.5;
+        }
+    }
 
     // Decision: pass if passScore > playScore, else find best play (JS 605-610)
     if pass_score > play_score {
@@ -2114,6 +2333,78 @@ mod tests {
         let cards: Vec<String> = cards.into_iter().map(ToString::to_string).collect();
         let targets: Vec<String> = targets.into_iter().map(ToString::to_string).collect();
         CombinationParser::parse(&cards, Some(&targets), ctx()).unwrap()
+    }
+
+    // ══ 牌踪器（rank 级剩余牌统计）测试 ══
+
+    use crate::game::types::{HandHistoryEntry, HistoryActionKind};
+
+    fn history_entry(seat: Seat, cards: Vec<&str>) -> HandHistoryEntry {
+        HandHistoryEntry {
+            seq: 0,
+            action_id: "t".into(),
+            seat,
+            timestamp: String::new(),
+            action_type: HistoryActionKind::Play,
+            cards: cards.into_iter().map(ToString::to_string).collect(),
+            combination_type: None,
+            wild_targets: None,
+        }
+    }
+
+    #[test]
+    fn pool_stats_counts_double_deck_correctly() {
+        // 我手 3 张 + N 已出 2 张 → 108−5=103；rank3 见 4 张余 4；红王见 1 余 1
+        let mut state = mk_playing_state(Seat::E, vec!["♠3", "♥3", "🃏R"], None);
+        fill_seats(
+            &mut state,
+            vec!["♦3", "♣3"],
+            vec!["♠4", "♥4", "♦4", "♣4", "♠5", "♥5", "♦5", "♣5", "♠6"],
+            vec!["♥6", "♦6", "♣6", "♠7", "♥7", "♦7", "♣7", "♠8", "♥8"],
+        );
+        state.hand.as_mut().unwrap().history = vec![history_entry(Seat::N, vec!["♦3", "♣3"])];
+        let p = pctx_of(&state, Seat::E);
+        assert_eq!(p.pool.total, 103, "双副牌108 − 已见5");
+        assert_eq!(p.pool.rank_counts[3], 4, "rank3: 8−4=4");
+        assert_eq!(p.pool.rank_counts[17], 1, "红王: 2−1=1");
+        assert_eq!(
+            p.pool.suffix_ge[15],
+            p.pool.rank_counts[15] + p.pool.rank_counts[16] + p.pool.rank_counts[17],
+            "≥2 = 点数2 + 双王"
+        );
+    }
+
+    #[test]
+    fn prob_functions_sanity() {
+        let mut state = mk_playing_state(Seat::E, vec!["♠3", "♥3", "🃏R"], None);
+        fill_seats(
+            &mut state,
+            vec!["♦3", "♣3", "♠4", "♥4", "♦4", "♣4", "♠5", "♥5", "♦5"],
+            vec!["♣5", "♠6", "♥6", "♦6", "♣6", "♠7", "♥7", "♦7", "♣7"],
+            vec!["♠8", "♥8", "♦8", "♣8", "♠9", "♥9", "♦9", "♣9", "♠10"],
+        );
+        state.hand.as_mut().unwrap().history = vec![history_entry(Seat::N, vec!["♦3", "♣3"])];
+        let p = pctx_of(&state, Seat::E);
+        assert_eq!(p.prob_rank_in_hand(Seat::E, 3), 0.0, "自己恒 0");
+        assert_eq!(p.prob_has_bomb(Seat::E), 0.0, "自己恒 0");
+        let has_rank3 = p.opponent_has_rank(3);
+        assert!(has_rank3 > 0.0 && has_rank3 <= 1.0, "rank3 概率 (0,1]，got {has_rank3}");
+        let bomb = p.opponent_bomb_prob();
+        assert!((0.0..=1.0).contains(&bomb), "炸弹概率 ∈[0,1], got {bomb}");
+        let win = p.game_win_prob();
+        assert!((0.0..=1.0).contains(&win), "胜率 ∈[0,1], got {win}");
+    }
+
+    #[test]
+    fn mutation_never_moves_house_thresholds() {
+        // 房规锁：mutate_random 只动 10 个 f32 权重 + 2 个概率阈值，3 个 u8 阈值不可动
+        let base = crate::strategy::suggest::js_trained_params();
+        for _ in 0..300 {
+            let m = base.mutate_random(0.05);
+            assert_eq!(m.enemy_low_cards_threshold, 6, "冲刺阈值必须锁死为 6");
+            assert_eq!(m.endgame_hand_count_threshold, 6, "残局阈值必须锁死为 6");
+            assert_eq!(m.partner_sprint_threshold, 2, "队友冲刺阈值必须锁死为 2");
+        }
     }
 
     // ══ JS 兼容存量测试（行为与 JS 规则一致，保持原样）══

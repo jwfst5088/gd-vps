@@ -106,10 +106,9 @@ impl AdvancedBotParams {
     pub fn mutate_random(&self, step_size: f32) -> Self {
         let mut rng = rand::rng();
         let mut cloned = self.clone();
-        // 房规锁：可变异参数仅限 10 个 f32 权重（0-9）。
-        // 3 个 u8 阈值（冲刺/残局/队友冲刺）与 2 个概率阈值（牌踪器激活前以 0 贡献运行，
-        // 学了也是空气）不参与变异——训练不可漂移房规。
-        let idx = rng.random_range(0..10);
+        // 房规锁：可变异参数为 10 个 f32 权重（0-9）+ 2 个概率阈值（10-11，牌踪器已激活，
+        // prob_* 重新有意义）。3 个 u8 阈值（冲刺/残局/队友冲刺）不参与变异——训练不可漂移房规。
+        let idx = rng.random_range(0..12);
         match idx {
             // f32 参数：加随机浮点扰动，clamp 到合理范围
             0 => cloned.team_win_weight = (cloned.team_win_weight + rng.random_range(-step_size..step_size)).clamp(0.1, 10.0),
@@ -122,6 +121,9 @@ impl AdvancedBotParams {
             7 => cloned.proactive_play_bias = (cloned.proactive_play_bias + rng.random_range(-step_size..step_size)).clamp(0.1, 10.0),
             8 => cloned.low_card_dump_bias = (cloned.low_card_dump_bias + rng.random_range(-step_size..step_size)).clamp(0.1, 10.0),
             9 => cloned.pass_stall_penalty = (cloned.pass_stall_penalty + rng.random_range(-step_size..step_size)).clamp(0.1, 10.0),
+            // 概率阈值参数（牌踪器已激活）：clamp 到 [0.1, 1.0]
+            10 => cloned.prob_threshold_for_bomb = (cloned.prob_threshold_for_bomb + rng.random_range(-step_size..step_size)).clamp(0.1, 1.0),
+            11 => cloned.prob_threshold_for_intercept = (cloned.prob_threshold_for_intercept + rng.random_range(-step_size..step_size)).clamp(0.1, 1.0),
             _ => unreachable!(),
         }
         cloned
