@@ -2384,6 +2384,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn never_override_teammate_plate_and_tube() {
+        // 房规：队友的钢板/木板绝对不能压——有更大同型也不行，持炸也不行。
+        // 队友 S 领出木板 334455；N 持更大木板 667788 + 炸 KKKK → 必须过。
+        let state = mk_playing_state(
+            Seat::N,
+            vec!["♠6", "♥6", "♠7", "♥7", "♠8", "♥8", "♠K", "♥K", "♦K", "♣K"],
+            Some((Seat::S, vec!["♦3", "♣3", "♦4", "♣4", "♦5", "♣5"])),
+        );
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        assert!(
+            matches!(act, PlayerAction::Pass),
+            "must pass teammate's tube, got {act:?}"
+        );
+
+        // 队友 S 领出钢板 333444；N 持更大钢板 555666 + 炸 KKKK → 必须过。
+        let state = mk_playing_state(
+            Seat::N,
+            vec!["♠5", "♥5", "♦5", "♠6", "♥6", "♦6", "♠K", "♥K", "♦K", "♣K"],
+            Some((Seat::S, vec!["♦3", "♣3", "♥3", "♦4", "♣4", "♥4"])),
+        );
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        assert!(
+            matches!(act, PlayerAction::Pass),
+            "must pass teammate's plate, got {act:?}"
+        );
+    }
+
     fn mk_playing_state(
         actor: Seat,
         actor_hand: Vec<&str>,
