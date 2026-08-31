@@ -309,9 +309,32 @@ fn analyze_hand_combos(hand: &[String], ctx: RuleContext) -> HandCombos {
         }
     }
 
-    // wildcard-assisted bombs (JS L1288-1290): ranks with exactly 3 naturals, capped by wilds
+    // 房规（用户 2026-08-30）：潜在炸/同花顺按百搭张数认定——
+    // 1 张百搭最多记 1 个潜在（三同张拼炸 或 同花4连拼同花顺），2 张最多记 2 个；
+    // 潜在合计 = min(候选数, 百搭张数)。天然炸 + 天然同花顺不占百搭额度，直接计入
+    // 炸弹总数（同花顺要计入炸弹总数）。
+    let mut wild_sf_candidates = 0usize;
+    if wild_count >= 1 {
+        for ranks in suit_to_ranks.values_mut() {
+            ranks.sort_unstable();
+            ranks.dedup();
+            let mut run = 1usize;
+            for i in 1..=ranks.len() {
+                if i < ranks.len() && ranks[i] - ranks[i - 1] == 1 {
+                    run += 1;
+                    continue;
+                }
+                // 极大连续段恰好 4 张 → 可由 1 张百搭补成同花顺；≥5 已是天然同花顺
+                if run == 4 {
+                    wild_sf_candidates += 1;
+                }
+                run = 1;
+            }
+        }
+    }
     let wild_assisted_bombs = if wild_count >= 1 {
-        rank_to_count.values().filter(|&&c| c == 3).count().min(wild_count)
+        (rank_to_count.values().filter(|&&c| c == 3).count() + wild_sf_candidates)
+            .min(wild_count)
     } else {
         0
     };
@@ -604,6 +627,11 @@ struct PlayContext {
     teammate_remaining: usize,
     /// 两个对手的最小剩余张数
     min_opp_remaining: usize,
+    /// 房规（用户 2026-08-30，同步 CF isAnyEnemySprinting）：活跃对手（剩 >0 张）中
+    /// 是否有人 ≤6 张——已走完（剩 0 张）的对手不算冲刺，他不可能再赢。
+    enemy_sprinting: bool,
+    /// 活跃对手（剩 >0 张）的剩余张数（供带阈值参数的冲刺判定用）
+    enemy_rem_active: Vec<usize>,
     /// JS `isEndgame = myRemaining <= params.endgame_hand_count_threshold`
     is_endgame: bool,
     combos: HandCombos,
@@ -635,6 +663,9 @@ fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayCo
         .map(|s| hand.remaining_count(*s))
         .collect();
     let min_opp_remaining = opp_counts.iter().min().copied().unwrap_or(0);
+    // 房规（用户 2026-08-30，同步 CF）：冲刺判定只看"活跃"对手——剩 0 张（已走完）不计入。
+    let enemy_rem_active: Vec<usize> = opp_counts.iter().copied().filter(|&c| c > 0).collect();
+    let enemy_sprinting = enemy_rem_active.iter().any(|&c| c <= 6);
 
     let params = get_params_for_seat(actor);
     let is_endgame = my_remaining <= params.endgame_hand_count_threshold as usize;
@@ -688,6 +719,8 @@ fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayCo
         teammate_seat,
         teammate_remaining,
         min_opp_remaining,
+        enemy_sprinting,
+        enemy_rem_active,
         is_endgame,
         combos,
         has_level_card_or_joker,
@@ -938,7 +971,7 @@ fn pick_playing(
         let mut best_non_bomb: Option<(f32, &Candidate)> = None;
         for cand in &candidates {
             // 房规（用户 2026-08-30）：百搭与对子配成三张同 = 浪费——领出跳过，
-            // 唯一豁免 = 清空手牌（len == remaining）或拦截对手冲刺（任一对手≤6张）。
+            // 唯一豁免 = 清空手牌（len == remaining）或拦截对手冲刺（活跃对手≤6张）。
             if matches!(cand.combo.kind, CombinationKind::Ordinary(OrdinaryKind::Triple))
                 && cand
                     .cards
@@ -947,7 +980,7 @@ fn pick_playing(
                     .count()
                     == 1
                 && cand.cards.len() < p.my_remaining
-                && p.min_opp_remaining > 6
+                && !p.enemy_sprinting
             {
                 continue;
             }
@@ -976,7 +1009,7 @@ fn pick_playing(
         //    豁免：残局（≤6 张）、对手冲刺（≤6 张）、清空出牌。
         {
             let is_endgame = p.my_remaining <= 6;
-            let is_opp_sprinting = p.min_opp_remaining <= 6;
+            let is_opp_sprinting = p.enemy_sprinting;
             if best_cand.combo.class() == CombinationClass::Bomb
                 && !is_endgame
                 && !is_opp_sprinting
@@ -1122,7 +1155,11 @@ fn decide_follow(top: &PlayState, p: &PlayContext, actor: Seat) -> FollowDecisio
             }
         }
 
-        let enemy_low = p.min_opp_remaining <= params.enemy_low_cards_threshold as usize;
+        // 冲刺判定（JS isAnyEnemySprinting）：已走完（剩0张）的对手不计入
+        let enemy_low = p
+            .enemy_rem_active
+            .iter()
+            .any(|&c| c <= params.enemy_low_cards_threshold as usize);
         if enemy_low {
             play_score += params.bomb_aggression_when_enemy_low;
         }
@@ -1166,10 +1203,11 @@ fn find_best_play_follow<'a>(
     top: &PlayState,
     p: &PlayContext,
 ) -> Result<PlayerAction, String> {
-    // JS 硬编码：isEndgame = myRemaining <= 6；冲刺 = 任一对手 ≤ 6（用户房规，原 JS 为 3）
+    // JS 硬编码：isEndgame = myRemaining <= 6；冲刺 = 活跃对手（剩>0张）任一 ≤6（用户房规，
+    // 原 JS 为 3；已走完的对手不计入——同步 CF isAnyEnemySprinting）
     let my_remaining = p.my_remaining;
     let is_endgame = my_remaining <= 6;
-    let is_opp_sprinting = p.min_opp_remaining <= 6;
+    let is_opp_sprinting = p.enemy_sprinting;
 
     // 房规 B1（2026-08-30 收紧）：反炸 + 有免百搭候选 → 跳过含百搭的炸（非清空）。
     // 原"残局/对手冲刺"豁免移除：同样赢下这一轮，免百搭方案零成本，烧百搭=浪费。
@@ -2483,6 +2521,60 @@ mod tests {
     }
 
     #[test]
+    fn bomb_count_counts_wild_potentials_by_wild_cap() {
+        // 房规（用户 2026-08-30）：潜在炸/同花顺按百搭张数封顶（1百搭最多记1个潜在，
+        // 2张最多2个）；天然炸 + 天然同花顺不占额度直接计入（同花顺要计入炸弹总数）。
+        let ctx = ctx();
+        // ① 1天然炸 + 1百搭 + 无候选（无三同张/无同花4连）→ 潜在 0 → 总数 1
+        let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♥2", "♠9", "♥9", "♠4", "♥4"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 1);
+        // ② 1天然炸 + 1百搭 + 1组三同张 → 潜在 min(1,1)=1 → 总数 2
+        let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♠9", "♥9", "♦9", "♥2", "♠K"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 2);
+        // ③ 1天然炸 + 1百搭 + 同花4连（♠6-9 极大段恰4）→ 潜在同花顺 1 → 总数 2
+        let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♠6", "♠7", "♠8", "♠9", "♥2"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 2);
+        // ④ 1天然炸 + 1百搭 + 同花仅3连（♠9-11，与炸点5不相连）→ 不构成潜在同花顺 → 总数 1
+        let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♠9", "♠10", "♠J", "♥2"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 1);
+        // ⑤ 同花4连属天然5连一部分 → 不重复记潜在；天然同花顺计入总数
+        let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♠6", "♠7", "♠8", "♠9", "♠10"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 2); // 5555 + 天然同花顺
+        // ⑥ 无百搭：三同张不记潜在
+        let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♠9", "♥9", "♦9", "♠K"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 1);
+    }
+
+    #[test]
+    fn sole_bomb_conserved_when_enemy_finished() {
+        // 房规①（用户 2026-08-30）：唯一炸保留到残局，除非对手冲刺。
+        // 已走完（剩0张）的对手不算冲刺（同步 CF isAnyEnemySprinting）：
+        // E 已走完（手牌空），W 活跃 9 张 → 非冲刺 → N 唯一炸 5555 中盘必须保留。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠5", "♥5", "♦5", "♣5", "♥2", "♠9", "♥9", "♠4", "♥4"],
+            Some((Seat::E, vec!["♠Q", "♥Q", "♦Q", "♣J", "♥J"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠5", "♥5", "♦5", "♣5", "♥2", "♠9", "♥9", "♠4", "♥4"],
+            vec!["♦3", "♣3", "♠7", "♥7", "♦9", "♣9", "♠6", "♥6", "♦6"],
+            vec!["♣10", "♦10", "♠J", "♥J", "♦J", "♣J", "♠Q", "♥Q", "♦Q"],
+        );
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        assert!(
+            matches!(act, PlayerAction::Pass),
+            "sole bomb must be conserved mid-game when no ACTIVE enemy sprints, got {act:?}"
+        );
+    }
+
+    #[test]
     fn wild_pair_triple_is_waste_unless_clearing_or_sprint() {
         // 房规（2026-08-30）：百搭配对子成三张同 = 浪费——跟牌/领出均排除，
         // 唯一豁免=清空手牌或拦截对手冲刺（残局不豁免）。
@@ -3111,7 +3203,9 @@ mod tests {
         let level_end = score_follow(&lvl_bomb_cards, &lvl_bomb, &top, &lvl_p);
 
         // 残局裸双百搭成普通对：−60 −200，必然低于 sanctioned
-        let mut bare_state = mk_playing_state(Seat::E, vec!["♥2", "♥2", "♠9", "♠8", "♠7", "♠6"], None);
+        // （2026-08-30 新口径：♠6-9 是同花4连+2百搭=1潜在同花顺，会记 bombCount——
+        //   打断 4 连（♥7）保持"无候选"本意）
+        let mut bare_state = mk_playing_state(Seat::E, vec!["♥2", "♥2", "♠9", "♠8", "♥7", "♠6"], None);
         fills(&mut bare_state);
         let bare_p = pctx_of(&bare_state, Seat::E);
         let bare_cards = vec!["♥2".to_string(), "♥2".to_string()];
@@ -3121,7 +3215,7 @@ mod tests {
         // 中盘裸双百搭：−600 −200，更差（避免 5 连同花 → 不产生 bombCount）
         let mut bare_mid_state = mk_playing_state(
             Seat::E,
-            vec!["♥2", "♥2", "♠9", "♠8", "♠7", "♠6", "♦5", "♣4"],
+            vec!["♥2", "♥2", "♠9", "♠8", "♥7", "♠6", "♦5", "♣4"],
             None,
         );
         fills(&mut bare_mid_state);
