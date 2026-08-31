@@ -1165,11 +1165,11 @@ fn find_best_play_follow<'a>(
     // Score each possible play and pick the best one (ties → first in order, JS stable sort)
     let mut best: Option<(f32, &Candidate)> = None;
     for cand in candidates {
-        // 房规 B1：反炸 + 有免百搭候选 + 非豁免场景 → 跳过含百搭的炸（非清空）
+        // 房规 B1（2026-08-30 收紧）：反炸 + 有免百搭候选 → 跳过含百搭的炸（非清空）。
+        // 原"残局/对手冲刺"豁免移除：同样赢下这一轮，免百搭方案零成本，烧百搭=浪费。
+        // 唯一豁免=该含百搭炸能直接清空手牌（len == remaining）。
         if top_is_bomb
             && has_wildfree_bomb
-            && !is_endgame
-            && !is_opp_sprinting
             && cand.combo.class() == CombinationClass::Bomb
             && cand_has_wild(cand)
             && cand.cards.len() < my_remaining
@@ -2412,6 +2412,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn counter_bomb_prefers_wildfree_even_endgame() {
+        // 房规 B1 收紧（2026-08-30）：反炸有免百搭候选时不得烧百搭（残局也不例外，
+        // 唯一豁免=清空）。对方 3333（level_order 3=2），我方 7777（LOV 7=6>2）可压。
+        // 残局：N = 7777 + ♥2(百搭) + 散张 → 必须 7777，不得 7777+百搭升档。
+        let state = mk_playing_state(
+            Seat::N,
+            vec!["♠7", "♥7", "♦7", "♣7", "♥2", "♠4"],
+            Some((Seat::E, vec!["♠3", "♥3", "♦3", "♣3"])),
+        );
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 4, "must play wild-free 7777, got {cards:?}");
+                assert!(!cards.contains(&"♥2".to_string()), "must not burn the wild, got {cards:?}");
+            }
+            other => panic!("expected play, got {other:?}"),
+        }
+        // 中盘：N = 7777 + 8888 + ♥2 + 散张 → 仍是免百搭 4 张炸
+        let state = mk_playing_state(
+            Seat::N,
+            vec!["♠7", "♥7", "♦7", "♣7", "♠8", "♥8", "♦8", "♣8", "♥2", "♠4"],
+            Some((Seat::E, vec!["♠3", "♥3", "♦3", "♣3"])),
+        );
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 4, "must play wild-free bomb4, got {cards:?}");
+                assert!(!cards.contains(&"♥2".to_string()), "must not burn the wild, got {cards:?}");
+            }
+            other => panic!("expected play, got {other:?}"),
+        }
+    }
+
     fn mk_playing_state(
         actor: Seat,
         actor_hand: Vec<&str>,
@@ -3344,8 +3378,10 @@ mod tests {
     }
 
     #[test]
-    fn counter_bomb_wild_allowed_when_sprinting() {
-        // 房规 B1 豁免：对手冲刺（W 剩 2 张）时反炸可烧百搭（+100 奖励恢复）。
+    fn counter_bomb_prefers_wildfree_even_when_sprinting() {
+        // 房规 B1 收紧（2026-08-30）：反炸有免百搭候选时不得烧百搭——对手冲刺也不例外
+        // （唯一豁免=清空）。对方 KKKK（LOV 12），E 持 4A（LOV 13 直接可压）+ ♥2 + 5555 + 999
+        // → 必须 4A 免百搭反炸，不得 4A+♥2 升档 5 炸。
         let mut state = mk_playing_state(
             Seat::E,
             vec![
@@ -3357,19 +3393,24 @@ mod tests {
             &mut state,
             vec!["♣4", "♥4", "♦4", "♠4", "♣6", "♥6", "♦6", "♣6", "♠7"],
             vec!["♥7", "♦7"],
-            vec!["♣10", "♦10", "♠J", "♥J", "♦J", "♣J", "♠Q", "♥Q", "♦Q"],
+            vec!["♣10", "♦10", "♠J", "♥J", "♦J"],
         );
         let picked = suggest_next_action(&state, Seat::E).unwrap();
         match &picked {
             PlayerAction::Play { cards, .. } => {
                 assert_eq!(
                     cards.len(),
-                    5,
-                    "冲刺豁免：含百搭的五张炸反炸应被允许，got {:?}",
+                    4,
+                    "B1收紧：免百搭 4A 可压 KKKK 时不得烧 ♥2 升档，got {:?}",
+                    picked
+                );
+                assert!(
+                    !cards.contains(&"♥2".to_string()),
+                    "不得烧百搭，got {:?}",
                     picked
                 );
             }
-            other => panic!("Expected Play (wild bomb counter under sprint), got {:?}", other),
+            other => panic!("Expected Play (wild-free 4A counter), got {:?}", other),
         }
     }
 
