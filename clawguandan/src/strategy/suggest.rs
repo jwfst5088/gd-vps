@@ -937,6 +937,20 @@ fn pick_playing(
         let mut best: Option<(f32, &Candidate)> = None;
         let mut best_non_bomb: Option<(f32, &Candidate)> = None;
         for cand in &candidates {
+            // 房规（用户 2026-08-30）：百搭与对子配成三张同 = 浪费——领出跳过，
+            // 唯一豁免 = 清空手牌（len == remaining）或拦截对手冲刺（任一对手≤6张）。
+            if matches!(cand.combo.kind, CombinationKind::Ordinary(OrdinaryKind::Triple))
+                && cand
+                    .cards
+                    .iter()
+                    .filter(|s| p.meta_for(s).map(|m| m.is_wild).unwrap_or(false))
+                    .count()
+                    == 1
+                && cand.cards.len() < p.my_remaining
+                && p.min_opp_remaining > 6
+            {
+                continue;
+            }
             let s = score_lead(cand.cards, &cand.combo, &p);
             if best.map_or(true, |(bs, _)| s > bs) {
                 best = Some((s, cand));
@@ -947,6 +961,15 @@ fn pick_playing(
                 best_non_bomb = Some((s, cand));
             }
         }
+        // 房规过滤器（百搭配三张）理论上不可能排除全部领出候选（单张/对子始终存在）；
+        // 极端手牌万一全被排除时，退回无过滤最优，保证必有出牌。
+        let best = match best {
+            Some(b) => Some(b),
+            None => candidates
+                .iter()
+                .map(|c| (score_lead(c.cards, &c.combo, &p), c))
+                .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)),
+        };
         let (_, best_cand) = best.expect("candidates non-empty");
         // ── 房规（用户）：中盘主动出炸后，剩余手牌重新清点炸弹数（含潜在炸）——
         //    剩 0 → 改出非炸最优牌；无非炸候选（整手皆炸）时维持原炸（打完仍剩其余炸）。
@@ -1148,10 +1171,9 @@ fn find_best_play_follow<'a>(
     let is_endgame = my_remaining <= 6;
     let is_opp_sprinting = p.min_opp_remaining <= 6;
 
-    // 房规 B1（反炸省百搭）：反炸场景下，若存在"不含百搭"的候选炸能压过，
-    // 则含百搭的炸（且非清空候选）不参与最优选择——张数/点数 penalty 照旧自然选最小够用。
-    // 豁免：残局（≤6）、对手冲刺（≤6）、炸完直接清空（那时烧百搭值）。
-    // （注：不存在免百搭候选时含百搭的炸照常可选——用户未批"唯一反炸含百搭则不反"）
+    // 房规 B1（2026-08-30 收紧）：反炸 + 有免百搭候选 → 跳过含百搭的炸（非清空）。
+    // 原"残局/对手冲刺"豁免移除：同样赢下这一轮，免百搭方案零成本，烧百搭=浪费。
+    // 唯一豁免=该含百搭炸能直接清空手牌（len == remaining）。
     let top_is_bomb = top.combination.class() == CombinationClass::Bomb;
     let cand_has_wild = |c: &Candidate| {
         c.cards
@@ -1173,6 +1195,20 @@ fn find_best_play_follow<'a>(
             && cand.combo.class() == CombinationClass::Bomb
             && cand_has_wild(cand)
             && cand.cards.len() < my_remaining
+        {
+            continue;
+        }
+        // 房规（用户 2026-08-30）：百搭与对子配成三张同 = 浪费——跟牌跳过，
+        // 唯一豁免 = 清空手牌（len == remaining）或拦截对手冲刺（任一对手≤6张）。
+        if matches!(cand.combo.kind, CombinationKind::Ordinary(OrdinaryKind::Triple))
+            && cand
+                .cards
+                .iter()
+                .filter(|s| p.meta_for(s).map(|m| m.is_wild).unwrap_or(false))
+                .count()
+                == 1
+            && cand.cards.len() < my_remaining
+            && !is_opp_sprinting
         {
             continue;
         }
@@ -2441,6 +2477,89 @@ mod tests {
             PlayerAction::Play { cards, .. } => {
                 assert_eq!(cards.len(), 4, "must play wild-free bomb4, got {cards:?}");
                 assert!(!cards.contains(&"♥2".to_string()), "must not burn the wild, got {cards:?}");
+            }
+            other => panic!("expected play, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wild_pair_triple_is_waste_unless_clearing_or_sprint() {
+        // 房规（2026-08-30）：百搭配对子成三张同 = 浪费——跟牌/领出均排除，
+        // 唯一豁免=清空手牌或拦截对手冲刺（残局不豁免）。
+        // 注：E 必须给真实手牌——mk_playing_state 只填 actor 手牌，E 空 = 剩0 = 误判冲刺。
+        let fill_e = |state: &mut TableGameState| {
+            if let Some(hand) = state.hand.as_mut() {
+                hand.hands.insert(
+                    Seat::E,
+                    ["♠A", "♥A", "♦A", "♣A", "♠Q", "♥Q", "♦Q", "♣Q"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                );
+            }
+        };
+        // ① 跟牌：E 领 555（LOV 4）；N = 88+♥2+散张（7张，无冲刺）→ 888+♥2 唯一能压 → 必须过。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠8", "♥8", "♥2", "♠9", "♥4", "♦6", "♣7"],
+            Some((Seat::E, vec!["♠5", "♥5", "♦5"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠8", "♥8", "♥2", "♠9", "♥4", "♦6", "♣7"],
+            vec!["♦3", "♣3", "♠7", "♥7", "♦9", "♣9", "♠6"],
+            vec!["♣10", "♦10", "♠J", "♥J", "♦J", "♣J", "♠Q"],
+        );
+        fill_e(&mut state);
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        assert!(
+            matches!(act, PlayerAction::Pass),
+            "midgame wild-pair triple is waste: must pass, got {act:?}"
+        );
+
+        // ② 冲刺豁免：W 剩 3 张 → 允许 888+♥2 拦截抢出牌权。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠8", "♥8", "♥2", "♠9", "♥4", "♦6", "♣7"],
+            Some((Seat::E, vec!["♠5", "♥5", "♦5"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠8", "♥8", "♥2", "♠9", "♥4", "♦6", "♣7"],
+            vec!["♦3", "♣3", "♠7", "♥7", "♦9", "♣9", "♠6"],
+            vec!["♣10", "♦10", "♠J"],
+        );
+        fill_e(&mut state);
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(
+                    cards,
+                    vec!["♠8", "♥8", "♥2"],
+                    "sprint allows the wild-triple intercept, got {cards:?}"
+                );
+            }
+            other => panic!("expected play under sprint, got {other:?}"),
+        }
+
+        // ③ 领出：无顶牌 → 不得领出 888+♥2（浪费）。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠8", "♥8", "♥2", "♠9", "♥4", "♦6", "♣7"],
+            None,
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠8", "♥8", "♥2", "♠9", "♥4", "♦6", "♣7"],
+            vec!["♦3", "♣3", "♠7", "♥7", "♦9", "♣9", "♠6"],
+            vec!["♣10", "♦10", "♠J", "♥J", "♦J", "♣J", "♠Q"],
+        );
+        fill_e(&mut state);
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                let is_wild_triple = cards.len() == 3 && cards.iter().any(|c| c == "♥2");
+                assert!(!is_wild_triple, "must not lead wild-pair triple, got {cards:?}");
             }
             other => panic!("expected play, got {other:?}"),
         }
