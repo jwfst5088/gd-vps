@@ -1292,6 +1292,31 @@ fn find_best_play_follow<'a>(
         {
             continue;
         }
+        // 房规（用户 2026-09-03）：对方领三带二时，禁止用"3张级牌+百搭+1张单张"的
+        // 级牌三带二去压（烧三张最强级牌+百搭补对子=太浪费）。
+        // 豁免 = 清空手牌（len == remaining）或拦截对手冲刺；队友领的三带二不受此限。
+        if matches!(cand.combo.kind, CombinationKind::Ordinary(OrdinaryKind::FullHouse))
+            && matches!(top.combination.kind, CombinationKind::Ordinary(OrdinaryKind::FullHouse))
+            && top.seat != p.actor_seat
+            && top.seat != p.teammate_seat
+        {
+            let wild_count = cand
+                .cards
+                .iter()
+                .filter(|s| p.meta_for(s).map(|m| m.is_wild).unwrap_or(false))
+                .count();
+            let nat_level_count = cand
+                .cards
+                .iter()
+                .filter(|s| {
+                    !p.meta_for(s).map(|m| m.is_wild).unwrap_or(false)
+                        && p.combos.card_to_rank.get(*s) == Some(&p.level_nat)
+                })
+                .count();
+            if wild_count == 1 && nat_level_count == 3 && cand.cards.len() < my_remaining && !is_opp_sprinting {
+                continue;
+            }
+        }
         let s = score_follow(cand.cards, &cand.combo, top, p);
         if best.map_or(true, |(bs, _)| s > bs) {
             best = Some((s, cand));
@@ -2769,6 +2794,105 @@ mod tests {
                 assert_eq!(aces, 2, "对子QQ（<K）解锁 → 拆AA跟牌, got {cards:?}");
             }
             other => panic!("对子QQ必须解锁拆A跟牌, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fh_with_level_triple_and_wild_pair_is_banned_vs_opponent() {
+        // 房规（用户 2026-09-03）：对方领三带二 → 禁"3张级牌+百搭+1张单张"级牌三带二
+        // （烧三张最强级牌+百搭补对子=太浪费）。豁免=清空手牌或拦截对手冲刺。
+        // 级别=2（百搭♥2，自然级牌=♠2♦2♣2）。E 必须给真实手牌（否则误判冲刺）。
+        let fill_e = |state: &mut TableGameState, cards: &[&str]| {
+            if let Some(hand) = state.hand.as_mut() {
+                hand.hands.insert(Seat::E, cards.iter().map(|s| s.to_string()).collect());
+            }
+        };
+        let fh_top = vec!["♠3", "♥3", "♦3", "♣5", "♥5"];
+        let s9 = ["♠9", "♥9", "♦9", "♣9", "♠8", "♥8", "♦8", "♣8", "♠7"];
+
+        // ① 禁止：3级牌+百搭+单张 → 级牌三带二被过滤；
+        //    次优=3级牌+百搭的4张炸 → ①炸弹保留（中盘7张、唯一炸、无冲刺）→ 过牌。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠2", "♦2", "♣2", "♥2", "♠5", "♥4", "♠6"],
+            Some((Seat::E, fh_top.clone())),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠2", "♦2", "♣2", "♥2", "♠5", "♥4", "♠6"],
+            vec!["♦4", "♣4", "♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J"],
+            vec!["♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♣8", "♥8", "♦8"],
+        );
+        fill_e(&mut state, &s9);
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        assert!(
+            matches!(act, PlayerAction::Pass),
+            "level-triple wild FH must be banned → pass, got {act:?}"
+        );
+
+        // ② 清空豁免：5张手牌恰好就是级牌三带二 → 放行。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠2", "♦2", "♣2", "♥2", "♠5"],
+            Some((Seat::E, fh_top.clone())),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠2", "♦2", "♣2", "♥2", "♠5"],
+            vec!["♦4", "♣4", "♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J"],
+            vec!["♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♣8", "♥8", "♦8"],
+        );
+        fill_e(&mut state, &s9);
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 5, "clearing exempts the ban, got {cards:?}");
+                assert_eq!(cards.iter().filter(|c| c.ends_with('2')).count(), 4);
+            }
+            other => panic!("clearing must allow level FH, got {other:?}"),
+        }
+
+        // ③ 冲刺豁免：E 剩1张 → 放行拦截。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠2", "♦2", "♣2", "♥2", "♠5", "♥4", "♠6"],
+            Some((Seat::E, fh_top.clone())),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠2", "♦2", "♣2", "♥2", "♠5", "♥4", "♠6"],
+            vec!["♦4", "♣4", "♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J"],
+            vec!["♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♣8", "♥8", "♦8"],
+        );
+        fill_e(&mut state, &["♠9"]);
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 5, "sprint exempts the ban, got {cards:?}");
+            }
+            other => panic!("sprint must allow level FH intercept, got {other:?}"),
+        }
+
+        // ④ 范围外：三张部分是A（非级牌）的含百搭三带二 → 不禁 → 照常出。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠A", "♥A", "♦A", "♥2", "♠5", "♥4", "♠6"],
+            Some((Seat::E, fh_top.clone())),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠A", "♥A", "♦A", "♥2", "♠5", "♥4", "♠6"],
+            vec!["♦4", "♣4", "♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J"],
+            vec!["♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♣8", "♥8", "♦8"],
+        );
+        fill_e(&mut state, &s9);
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 5, "non-level wild FH must not be banned, got {cards:?}");
+                assert!(cards.contains(&"♥2".to_string()));
+            }
+            other => panic!("non-level triple wild FH should play, got {other:?}"),
         }
     }
 
