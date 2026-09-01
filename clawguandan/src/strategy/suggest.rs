@@ -1317,6 +1317,19 @@ fn find_best_play_follow<'a>(
                 continue;
             }
         }
+        // 房规（用户 2026-09-03）：双百搭同出候选仅残局（手牌≤6张）才枚举——补齐跟牌路径
+        // （领出路径已有此门槛）。清空手牌的牌不受限。
+        if p.my_remaining > 6
+            && cand
+                .cards
+                .iter()
+                .filter(|s| p.meta_for(s).map(|m| m.is_wild).unwrap_or(false))
+                .count()
+                >= 2
+            && cand.cards.len() < my_remaining
+        {
+            continue;
+        }
         let s = score_follow(cand.cards, &cand.combo, top, p);
         if best.map_or(true, |(bs, _)| s > bs) {
             best = Some((s, cand));
@@ -2794,6 +2807,59 @@ mod tests {
                 assert_eq!(aces, 2, "对子QQ（<K）解锁 → 拆AA跟牌, got {cards:?}");
             }
             other => panic!("对子QQ必须解锁拆A跟牌, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dual_wild_follow_candidates_only_in_endgame() {
+        // 房规（用户 2026-09-03）：双百搭同出候选仅残局（手牌≤6张）才枚举——跟牌路径补门槛。
+        // 中盘：双百搭三带二不进候选 + 小三带二禁炸 → 过牌（不烧百搭）；
+        // 残局：双百搭照常可用（轻罚）→ 出级牌三带二。
+        let fh_top = vec!["♠3", "♥3", "♦3", "♣5", "♥5"];
+        let e9 = ["♠9", "♥9", "♦9", "♣9", "♠8", "♥8", "♦8", "♣8", "♠7"];
+
+        // ① 中盘9张：2级牌+2百搭+9999+♠5 → 双百搭不进候选、9999 被禁炸 → 过牌。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠2", "♦2", "♥2", "♥2", "♠9", "♥9", "♦9", "♣9", "♠5"],
+            Some((Seat::E, fh_top.clone())),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠2", "♦2", "♥2", "♥2", "♠9", "♥9", "♦9", "♣9", "♠5"],
+            vec!["♦4", "♣4", "♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J"],
+            vec!["♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♣8", "♥8", "♦8"],
+        );
+        if let Some(hand) = state.hand.as_mut() {
+            hand.hands.insert(Seat::E, e9.iter().map(|s| s.to_string()).collect());
+        }
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        assert!(
+            matches!(act, PlayerAction::Pass),
+            "midgame dual-wild candidates must not be enumerated → pass, got {act:?}"
+        );
+
+        // ② 残局6张：双百搭照常可用 → 出级牌三带二（♠2♦2+♥2 + ♥4+♥2）。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠2", "♦2", "♥2", "♥2", "♠5", "♥4"],
+            Some((Seat::E, fh_top.clone())),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠2", "♦2", "♥2", "♥2", "♠5", "♥4"],
+            vec!["♦4", "♣4", "♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J"],
+            vec!["♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♣8", "♥8", "♦8"],
+        );
+        if let Some(hand) = state.hand.as_mut() {
+            hand.hands.insert(Seat::E, e9.iter().map(|s| s.to_string()).collect());
+        }
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 5, "endgame dual-wild FH must still play, got {cards:?}");
+            }
+            other => panic!("endgame must keep dual-wild FH available, got {other:?}"),
         }
     }
 
