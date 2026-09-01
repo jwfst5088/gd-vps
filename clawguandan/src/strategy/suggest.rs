@@ -1026,6 +1026,14 @@ fn pick_playing(
             {
                 continue;
             }
+            // 房规（用户 2026-09-03）：三张天然、对子=1天然+1百搭（百搭凑对）→ 禁止领出。
+            // 豁免：清空手牌、对手冲刺。
+            if matches!(cand.combo.kind, CombinationKind::Ordinary(OrdinaryKind::FullHouse)) {
+                let (_, wild_pair_fh) = fh_wild_shape(cand.cards, &p);
+                if wild_pair_fh && cand.cards.len() < p.my_remaining && !p.enemy_sprinting {
+                    continue;
+                }
+            }
             let s = score_lead(cand.cards, &cand.combo, &p);
             if best.map_or(true, |(bs, _)| s > bs) {
                 best = Some((s, cand));
@@ -1240,6 +1248,30 @@ fn decide_follow(top: &PlayState, p: &PlayContext, actor: Seat) -> FollowDecisio
 
 // ── JS findBestPlay (L622-725): 打分 + 硬守卫 ───────────────────────────
 
+/// 房规（用户 2026-09-03）：三带二（5张）的百搭用法分类（JS fhWildShape 同源）。
+/// 返回 (三张=2天然+1百搭[对子+百搭拼三张→适当惩罚], 对子=1天然+1百搭[三张天然+百搭凑对→禁止])。
+fn fh_wild_shape(cards: &[String], p: &PlayContext) -> (bool, bool) {
+    let wild_cnt = cards
+        .iter()
+        .filter(|c| p.meta_for(c).map(|m| m.is_wild).unwrap_or(false))
+        .count();
+    if cards.len() != 5 || wild_cnt != 1 {
+        return (false, false);
+    }
+    let mut nat_cnts: HashMap<u8, u8> = HashMap::new();
+    for c in cards {
+        if let Some(r) = p.combos.card_to_rank.get(c) {
+            *nat_cnts.entry(*r).or_insert(0) += 1;
+        }
+    }
+    let mut counts: Vec<u8> = nat_cnts.values().copied().collect();
+    counts.sort_unstable_by(|a, b| b.cmp(a));
+    (
+        counts.len() == 2 && counts[0] == 2 && counts[1] == 2,
+        counts.len() == 2 && counts[0] == 3 && counts[1] == 1,
+    )
+}
+
 fn find_best_play_follow<'a>(
     candidates: &[Candidate<'a>],
     top: &PlayState,
@@ -1329,6 +1361,14 @@ fn find_best_play_follow<'a>(
             && cand.cards.len() < my_remaining
         {
             continue;
+        }
+        // 房规（用户 2026-09-03）：三张天然、对子=1天然+1百搭（百搭凑对）→ 禁止。
+        // 豁免：清空手牌、对手冲刺。领出/跟牌均禁。
+        if matches!(cand.combo.kind, CombinationKind::Ordinary(OrdinaryKind::FullHouse)) {
+            let (_, wild_pair_fh) = fh_wild_shape(cand.cards, p);
+            if wild_pair_fh && cand.cards.len() < my_remaining && !is_opp_sprinting {
+                continue;
+            }
         }
         let s = score_follow(cand.cards, &cand.combo, top, p);
         if best.map_or(true, |(bs, _)| s > bs) {
@@ -1582,8 +1622,22 @@ fn score_follow(
             match kind {
                 CombinationKind::Ordinary(OrdinaryKind::Straight)
                 | CombinationKind::Ordinary(OrdinaryKind::Plate)
-                | CombinationKind::Ordinary(OrdinaryKind::Tube)
-                | CombinationKind::Ordinary(OrdinaryKind::FullHouse) => score += 30.0,
+                | CombinationKind::Ordinary(OrdinaryKind::Tube) => score += 30.0,
+                CombinationKind::Ordinary(OrdinaryKind::FullHouse) => {
+                    // 房规（用户 2026-09-03）：三张=对子+百搭（2天然+1百搭）、对子天然
+                    // = 适当惩罚（替代原 +30）；清空手牌豁免照旧 +30；残局轻罚。
+                    // 百搭凑对子（三张天然）的三带二已被禁止过滤，仅豁免场景到此处。
+                    let (wild_triple_fh, _) = fh_wild_shape(play_cards, p);
+                    if wild_triple_fh && play_cards.len() < my_remaining {
+                        if is_endgame {
+                            score -= 15.0; // 残局轻罚
+                        } else {
+                            score -= 300.0; // 中盘适当惩罚
+                        }
+                    } else {
+                        score += 30.0; // 清空手牌 / 其他形态：照旧奖励
+                    }
+                }
                 CombinationKind::Ordinary(OrdinaryKind::Triple) => score += 20.0,
                 _ => {}
             }
@@ -2199,8 +2253,20 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
             match kind {
                 CombinationKind::Ordinary(OrdinaryKind::Straight)
                 | CombinationKind::Ordinary(OrdinaryKind::Plate)
-                | CombinationKind::Ordinary(OrdinaryKind::Tube)
-                | CombinationKind::Ordinary(OrdinaryKind::FullHouse) => score += 30.0,
+                | CombinationKind::Ordinary(OrdinaryKind::Tube) => score += 30.0,
+                CombinationKind::Ordinary(OrdinaryKind::FullHouse) => {
+                    // 房规（用户 2026-09-03）：三张=对子+百搭、对子天然 = 适当惩罚（替代 +30）。
+                    let (wild_triple_fh, _) = fh_wild_shape(play_cards, p);
+                    if wild_triple_fh && play_cards.len() < my_remaining {
+                        if my_remaining <= 6 {
+                            score -= 15.0; // 残局轻罚
+                        } else {
+                            score -= 300.0; // 中盘适当惩罚
+                        }
+                    } else {
+                        score += 30.0; // 清空手牌 / 其他形态：照旧奖励
+                    }
+                }
                 CombinationKind::Ordinary(OrdinaryKind::Triple) => score += 20.0,
                 _ => {}
             }
@@ -2864,6 +2930,97 @@ mod tests {
     }
 
     #[test]
+    fn fh_wild_pair_banned_and_wild_triple_penalized() {
+        // 房规（用户 2026-09-03）：
+        // ① 三张天然、对子=1天然+1百搭（百搭凑对）→ 禁止（清空/冲刺豁免）；
+        // ② 三张=对子+百搭（2天然+1百搭）、对子天然 → 适当惩罚（中盘-300/残局-15，非禁止）。
+        let fh_top = vec!["♠3", "♥3", "♦3", "♣5", "♥5"];
+        let e9 = ["♠9", "♥9", "♦9", "♣9", "♠8", "♥8", "♦8", "♣8", "♠7"];
+        let fill = |state: &mut TableGameState, n: &[&str], e: &[&str]| {
+            fill_seats(
+                state,
+                n.to_vec(),
+                vec!["♦4", "♣4", "♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J"],
+                vec!["♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♣8", "♥8", "♦8"],
+            );
+            if let Some(hand) = state.hand.as_mut() {
+                hand.hands.insert(Seat::E, e.iter().map(|s| s.to_string()).collect());
+            }
+        };
+
+        // ① 禁止：555天然+6+♥2(凑对6)+3+4 → 三带二被禁 → 555+♥2的4张炸被小三带二禁炸 → 过牌。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠5", "♥5", "♦5", "♠6", "♥2", "♠3", "♥4"],
+            Some((Seat::E, fh_top.clone())),
+        );
+        fill(&mut state, &["♠5", "♥5", "♦5", "♠6", "♥2", "♠3", "♥4"], &e9);
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        assert!(
+            matches!(act, PlayerAction::Pass),
+            "wild-pair FH must be banned → pass, got {act:?}"
+        );
+
+        // ② 清空豁免：5张手恰好=该三带二 → 放行。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠5", "♥5", "♦5", "♠6", "♥2"],
+            Some((Seat::E, fh_top.clone())),
+        );
+        fill(&mut state, &["♠5", "♥5", "♦5", "♠6", "♥2"], &e9);
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => assert_eq!(cards.len(), 5, "clearing exempts ban, got {cards:?}"),
+            other => panic!("clearing must allow wild-pair FH, got {other:?}"),
+        }
+
+        // ③ 冲刺豁免：E剩1张 → 放行拦截。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠5", "♥5", "♦5", "♠6", "♥2", "♠3", "♥4"],
+            Some((Seat::E, fh_top.clone())),
+        );
+        fill(&mut state, &["♠5", "♥5", "♦5", "♠6", "♥2", "♠3", "♥4"], &["♠9"]);
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => assert_eq!(cards.len(), 5, "sprint exempts ban, got {cards:?}"),
+            other => panic!("sprint must allow wild-pair FH, got {other:?}"),
+        }
+
+        // ④ 适当惩罚（非禁止）：55+♥2拼三张+66天然对 → 唯一能压 → 照常出。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠5", "♥5", "♥2", "♠6", "♥6", "♠3", "♠4"],
+            Some((Seat::E, fh_top.clone())),
+        );
+        fill(&mut state, &["♠5", "♥5", "♥2", "♠6", "♥6", "♠3", "♠4"], &e9);
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 5, "wild-triple FH still plays, got {cards:?}");
+                assert!(cards.contains(&"♥2".to_string()));
+            }
+            other => panic!("wild-triple FH must not be banned, got {other:?}"),
+        }
+
+        // ⑤ 惩罚生效判别：天然三带二(555+66) vs 百搭拼三张三带二 → 选天然。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠5", "♥5", "♦5", "♠6", "♥6", "♥2", "♠4"],
+            Some((Seat::E, fh_top.clone())),
+        );
+        fill(&mut state, &["♠5", "♥5", "♦5", "♠6", "♥6", "♥2", "♠4"], &e9);
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 5, "natural FH must win, got {cards:?}");
+                assert!(!cards.contains(&"♥2".to_string()), "must not burn wild, got {cards:?}");
+            }
+            other => panic!("natural FH must be preferred, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn fh_with_level_triple_and_wild_pair_is_banned_vs_opponent() {
         // 房规（用户 2026-09-03）：对方领三带二 → 禁"3张级牌+百搭+1张单张"级牌三带二
         // （烧三张最强级牌+百搭补对子=太浪费）。豁免=清空手牌或拦截对手冲刺。
@@ -2939,7 +3096,8 @@ mod tests {
             other => panic!("sprint must allow level FH intercept, got {other:?}"),
         }
 
-        // ④ 范围外：三张部分是A（非级牌）的含百搭三带二 → 不禁 → 照常出。
+        // ④ 房规更新（2026-09-03）：三张天然+百搭凑对子的三带二一律禁止（不分级牌与否）：
+        // 非级牌 A 三张同样被禁 → 555…炸被小三带二禁炸过滤 → 过牌。
         let mut state = mk_playing_state(
             Seat::N,
             vec!["♠A", "♥A", "♦A", "♥2", "♠5", "♥4", "♠6"],
@@ -2953,13 +3111,10 @@ mod tests {
         );
         fill_e(&mut state, &s9);
         let act = suggest_next_action(&state, Seat::N).unwrap();
-        match act {
-            PlayerAction::Play { cards, .. } => {
-                assert_eq!(cards.len(), 5, "non-level wild FH must not be banned, got {cards:?}");
-                assert!(cards.contains(&"♥2".to_string()));
-            }
-            other => panic!("non-level triple wild FH should play, got {other:?}"),
-        }
+        assert!(
+            matches!(act, PlayerAction::Pass),
+            "non-level natural-triple wild-pair FH also banned → pass, got {act:?}"
+        );
     }
 
     #[test]
@@ -4105,10 +4260,12 @@ mod tests {
         );
         fill_seats(
             &mut state,
-            vec!["♠3", "♥3", "♦3", "♣3", "♠4", "♥4", "♠6", "♥6", "♦6"],
+            vec!["♠3", "♥3", "♦3", "♣3", "♠4"],
             vec!["♣6", "♠7", "♥7", "♦7", "♣7", "♠10", "♥10", "♦10", "♣10"],
             vec!["♠J", "♥J", "♦J", "♣J", "♠Q", "♥Q", "♦Q", "♣Q", "♠A"],
         );
+        // 注：N 剩5张=对手冲刺 → 房规（2026-09-03）百搭凑对子三带二的禁止被冲刺豁免，
+        // 保留本测试原意（残局单张移除奖励 → 三带二胜过百搭炸弹）。E 的队友是 W，不是 N。
         let picked = suggest_next_action(&state, Seat::E).unwrap();
         match &picked {
             PlayerAction::Play { cards, wild_targets } => {
