@@ -458,7 +458,12 @@ fn split_penalty(
     has_level_card_or_joker: bool,
     play_kind: &CombinationKind,
     allow_endgame_split: bool,
+    unlock_pair_for_single: bool,
+    unlock_triple_for_pair: bool,
 ) -> u32 {
+    // 房规（用户 2026-08-30）：条件解锁——对手连续≥2轮领单张无人接 → 允许拆对出单张；
+    // 连续≥2轮领对子无人接 → 允许拆三张同出对子。优先级：先拆"孤"（非木板/钢板成员），
+    // 同优先级拆大的（10以上优先，依次9.8.7…），用分级小罚分表达（远小于禁令，能压过牌值偏好）。
     // playRankCounts via cardToRank: wilds/jokers contribute nothing (JS L1386-1392)
     let mut play_rank_counts: HashMap<u8, usize> = HashMap::new();
     for card in play_cards {
@@ -490,7 +495,7 @@ fn split_penalty(
                 .plate_pairs
                 .iter()
                 .any(|&(a, b)| rank == a || rank == b);
-            if is_plate_part {
+            if is_plate_part && !unlock_triple_for_pair {
                 return BANNED_SCORE_U32; // ABSOLUTE BAN: plate
             }
             if play_count < 3 {
@@ -504,6 +509,10 @@ fn split_penalty(
                 // 房规豁免（用户 2026-08-30）：残局+手牌无单张+队友本轮已过牌 → 允许拆三张同
                 if allow_endgame_split {
                     continue;
+                }
+                // 条件解锁（用户 2026-08-30）：对手连续≥2轮领对子无人接 → 拆三张同出对子
+                if unlock_triple_for_pair && matches!(play_kind, CombinationKind::Ordinary(OrdinaryKind::Pair)) {
+                    return u32::from(is_plate_part) * 10 + u32::from(14u8.saturating_sub(rank));
                 }
                 if rank <= 10 {
                     return BANNED_SCORE_U32; // ABSOLUTE BAN: rank ≤ 10
@@ -522,7 +531,7 @@ fn split_penalty(
                 .tube_triples
                 .iter()
                 .any(|&(a, b, c)| rank == a || rank == b || rank == c);
-            if is_tube_part {
+            if is_tube_part && !unlock_pair_for_single {
                 return BANNED_SCORE_U32; // ABSOLUTE BAN: tube
             }
             if play_count < 2 {
@@ -535,6 +544,10 @@ fn split_penalty(
                 // 房规豁免（用户 2026-08-30）：残局+手牌无单张+队友本轮已过牌 → 允许拆对子
                 if allow_endgame_split {
                     continue;
+                }
+                // 条件解锁（用户 2026-08-30）：对手连续≥2轮领单张无人接 → 拆对子出单张
+                if unlock_pair_for_single && matches!(play_kind, CombinationKind::Ordinary(OrdinaryKind::Single)) {
+                    return u32::from(is_tube_part) * 10 + u32::from(14u8.saturating_sub(rank));
                 }
                 if rank <= 10 {
                     return BANNED_SCORE_U32;
@@ -632,6 +645,11 @@ struct PlayContext {
     enemy_sprinting: bool,
     /// 活跃对手（剩 >0 张）的剩余张数（供带阈值参数的冲刺判定用）
     enemy_rem_active: Vec<usize>,
+    /// 房规（用户 2026-08-30）：对手连续领单张且无人接的轮数（当前顶牌算第 1 轮；
+    /// 向前跳过 Pass 累计对手同型领出，我方任何人出牌即断链）。≥2 才解锁拆对跟单张。
+    enemy_single_streak: usize,
+    /// 同上，对子版（≥2 解锁拆三张同跟对子）
+    enemy_pair_streak: usize,
     /// JS `isEndgame = myRemaining <= params.endgame_hand_count_threshold`
     is_endgame: bool,
     combos: HandCombos,
@@ -666,6 +684,47 @@ fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayCo
     // 房规（用户 2026-08-30，同步 CF）：冲刺判定只看"活跃"对手——剩 0 张（已走完）不计入。
     let enemy_rem_active: Vec<usize> = opp_counts.iter().copied().filter(|&c| c > 0).collect();
     let enemy_sprinting = enemy_rem_active.iter().any(|&c| c <= 6);
+
+    // 房规（用户 2026-08-30）：对手连续领单张/对子且无人接的轮数。
+    // 当前顶牌 = 第 1 轮；向前跳过 Pass 累计对手同型领出（我方出牌即断链）。
+    // history 不含当前顶牌（顶牌在 trick.top_play）。
+    let (enemy_single_streak, enemy_pair_streak) = {
+        let mut s_single = 0usize;
+        let mut s_pair = 0usize;
+        if let Some(tp) = hand.trick.top_play.as_ref() {
+            if tp.seat != actor && tp.seat != teammate_seat {
+                let want_single =
+                    matches!(tp.combination.kind, CombinationKind::Ordinary(OrdinaryKind::Single));
+                let want_pair =
+                    matches!(tp.combination.kind, CombinationKind::Ordinary(OrdinaryKind::Pair));
+                if want_single || want_pair {
+                    let mut streak = 1usize;
+                    for e in hand.history.iter().rev() {
+                        if e.action_type != HistoryActionKind::Play {
+                            continue; // Pass = 无人接，继续向前找上一轮领出
+                        }
+                        if e.seat == actor || e.seat == teammate_seat {
+                            break; // 我方接牌 → 断链
+                        }
+                        let kind = e.combination_type.as_deref().unwrap_or("");
+                        let is_single = kind == "single" || (kind.is_empty() && e.cards.len() == 1);
+                        let is_pair = kind == "pair" || (kind.is_empty() && e.cards.len() == 2);
+                        if (want_single && is_single) || (want_pair && is_pair) {
+                            streak += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if want_single {
+                        s_single = streak;
+                    } else {
+                        s_pair = streak;
+                    }
+                }
+            }
+        }
+        (s_single, s_pair)
+    };
 
     let params = get_params_for_seat(actor);
     let is_endgame = my_remaining <= params.endgame_hand_count_threshold as usize;
@@ -721,6 +780,8 @@ fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayCo
         min_opp_remaining,
         enemy_sprinting,
         enemy_rem_active,
+        enemy_single_streak,
+        enemy_pair_streak,
         is_endgame,
         combos,
         has_level_card_or_joker,
@@ -1371,8 +1432,22 @@ fn score_follow(
     // 房规（用户 2026-08-30）：拆对/拆三张豁免 = 残局(≤6) + 手牌无单张 + 队友本轮已过牌。
     let allow_endgame_split =
         p.is_endgame && p.combos.singles_count == 0 && p.teammate_passed_top;
-    let mut penalty =
-        split_penalty(play_cards, combos, p.level_nat, p.has_level_card_or_joker, kind, allow_endgame_split) as f32;
+    // 房规（用户 2026-08-30）：条件解锁——对手连续≥2轮领单张/对子且无人接 →
+    // 临时允许拆对跟单张 / 拆三张同跟对子（候选型 = 顶牌同型，故按顶牌型判定）
+    let unlock_pair_for_single = p.enemy_single_streak >= 2
+        && matches!(top.combination.kind, CombinationKind::Ordinary(OrdinaryKind::Single));
+    let unlock_triple_for_pair = p.enemy_pair_streak >= 2
+        && matches!(top.combination.kind, CombinationKind::Ordinary(OrdinaryKind::Pair));
+    let mut penalty = split_penalty(
+        play_cards,
+        combos,
+        p.level_nat,
+        p.has_level_card_or_joker,
+        kind,
+        allow_endgame_split,
+        unlock_pair_for_single,
+        unlock_triple_for_pair,
+    ) as f32;
     if !play_is_bomb {
         if bomb_split_verdict == BombSplitVerdict::Exempt && penalty >= BANNED_SCORE {
             penalty = 0.0; // 房规豁免：放行拆炸
@@ -1835,7 +1910,7 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
     let play_is_bomb = play_combo.class() == CombinationClass::Bomb;
     // 领出路径：拆对豁免不适用（房规豁免仅限跟牌场景，用户 2026-08-30）
     let mut penalty =
-        split_penalty(play_cards, combos, p.level_nat, p.has_level_card_or_joker, kind, false) as f32;
+        split_penalty(play_cards, combos, p.level_nat, p.has_level_card_or_joker, kind, false, false, false) as f32;
     if !play_is_bomb {
         if bomb_split_verdict == BombSplitVerdict::Exempt && penalty >= BANNED_SCORE {
             penalty = 0.0; // 房规豁免：放行拆炸
@@ -2432,12 +2507,12 @@ mod tests {
         let play = vec!["♠5".to_string()];
         let kind = CombinationKind::Ordinary(OrdinaryKind::Single);
         assert_eq!(
-            split_penalty(&play, &combos, 2, false, &kind, true),
+            split_penalty(&play, &combos, 2, false, &kind, true, false, false),
             0,
             "flag=true (残局+无单张+队友过牌) must allow pair split"
         );
         assert_eq!(
-            split_penalty(&play, &combos, 2, false, &kind, false),
+            split_penalty(&play, &combos, 2, false, &kind, false, false, false),
             BANNED_SCORE_U32,
             "flag=false must keep the absolute ban"
         );
@@ -2447,12 +2522,12 @@ mod tests {
         let combos3 = analyze_hand_combos(&hand3, ctx());
         let play3 = vec!["♠7".to_string()];
         assert_eq!(
-            split_penalty(&play3, &combos3, 2, false, &kind, true),
+            split_penalty(&play3, &combos3, 2, false, &kind, true, false, false),
             0,
             "flag=true must allow triple split"
         );
         assert_eq!(
-            split_penalty(&play3, &combos3, 2, false, &kind, false),
+            split_penalty(&play3, &combos3, 2, false, &kind, false, false, false),
             BANNED_SCORE_U32,
             "flag=false must keep the triple-split ban"
         );
@@ -2572,6 +2647,88 @@ mod tests {
             matches!(act, PlayerAction::Pass),
             "sole bomb must be conserved mid-game when no ACTIVE enemy sprints, got {act:?}"
         );
+    }
+
+    #[test]
+    fn split_unlock_on_repeated_enemy_leads() {
+        // 房规（用户 2026-08-30）：对手连续≥2轮领单张且无人接 → 临时允许拆对跟单张
+        // （优先孤对、同优先级拆大对子）；对子版 → 拆三张同跟对子（优先孤三张）。
+        // ① 第1轮：E 领单张3，history 空 → 不解锁 → 全对子手过牌。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠8", "♥8", "♠7", "♥7", "♠6", "♥6", "♠5", "♥5"],
+            Some((Seat::E, vec!["♠3"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠8", "♥8", "♠7", "♥7", "♠6", "♥6", "♠5", "♥5"],
+            vec!["♦4", "♣4", "♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J"],
+            vec!["♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♣8", "♥8", "♦8"],
+        );
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        assert!(
+            matches!(act, PlayerAction::Pass),
+            "round 1: no unlock yet, must pass, got {act:?}"
+        );
+
+        // ② 第2轮：E 再领单张4（history: E领3 → 全员pass）→ 解锁 → 拆孤对99跟牌
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠9", "♥9", "♠5", "♥5", "♠6", "♥6", "♠7", "♥7"],
+            Some((Seat::E, vec!["♠4"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠9", "♥9", "♠5", "♥5", "♠6", "♥6", "♠7", "♥7"],
+            vec!["♦4", "♣4", "♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J"],
+            vec!["♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♣8", "♥8", "♦8"],
+        );
+        state.hand.as_mut().unwrap().history = vec![
+            history_entry(Seat::E, vec!["♠3"]),
+            history_pass(Seat::S),
+            history_pass(Seat::W),
+            history_pass(Seat::N),
+        ];
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 1, "must split a pair for a single, got {cards:?}");
+                let r = cards
+                    .first()
+                    .and_then(|c| parse_card_symbol(c).ok())
+                    .map(|c| c.rank);
+                assert_eq!(r, Some(Rank::Nine), "孤对99优先拆大跟4, got {cards:?}");
+            }
+            other => panic!("unlock must allow pair-split follow, got {other:?}"),
+        }
+
+        // ③ 对子版：E 连续2轮领对子（33→44）→ 拆孤三张999跟对子
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠9", "♥9", "♦9", "♠5", "♥5", "♦5", "♠6", "♥6", "♦6", "♠K"],
+            Some((Seat::E, vec!["♠4", "♥4"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠9", "♥9", "♦9", "♠5", "♥5", "♦5", "♠6", "♥6", "♦6", "♠K"],
+            vec!["♦4", "♣4", "♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J", "♣J"],
+            vec!["♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♣8", "♥8", "♦8", "♠A"],
+        );
+        state.hand.as_mut().unwrap().history = vec![
+            history_entry(Seat::E, vec!["♠3", "♥3"]),
+            history_pass(Seat::S),
+            history_pass(Seat::W),
+            history_pass(Seat::N),
+        ];
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 2, "must split a triple for a pair, got {cards:?}");
+                let nines = cards.iter().filter(|c| c.ends_with('9')).count();
+                assert_eq!(nines, 2, "孤三张999优先 → 拆99跟44, got {cards:?}");
+            }
+            other => panic!("unlock must allow triple-split follow, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2739,6 +2896,19 @@ mod tests {
             timestamp: String::new(),
             action_type: HistoryActionKind::Play,
             cards: cards.into_iter().map(ToString::to_string).collect(),
+            combination_type: None,
+            wild_targets: None,
+        }
+    }
+
+    fn history_pass(seat: Seat) -> HandHistoryEntry {
+        HandHistoryEntry {
+            seq: 0,
+            action_id: "t".into(),
+            seat,
+            timestamp: String::new(),
+            action_type: HistoryActionKind::Pass,
+            cards: vec![],
             combination_type: None,
             wild_targets: None,
         }
