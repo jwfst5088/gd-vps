@@ -1170,19 +1170,22 @@ fn decide_follow(top: &PlayState, p: &PlayContext, actor: Seat) -> FollowDecisio
             _ => {}
         }
 
-        let trv = top_rank.map(rank_value_js).unwrap_or(0);
-        // 队友的对子大于12（K、A、2）不能压
+        // 队友的对子大于12（K、A、级牌）不能压。非级牌"2"按用户口径（2026-09-03 确认：
+        // 2 不是级牌时是最小的牌）不算大对——原 rank_value_js>12 误把 2 计入大对；
+        // primary 为 level_order_value 尺度（K=12 → "K及以上" ⇔ >=12），级牌对=14 仍受保护。
         if matches!(
             top.combination.kind,
             CombinationKind::Ordinary(OrdinaryKind::Pair)
-        ) && trv > 12
+        ) && top.combination.primary >= 12
         {
             return FollowDecision::Pass;
         }
-        // 队友的三带二大于等于10（10、J、Q、K、A、2）不能压——用户房规"10以上不压队友"。
+        // 队友的三带二大于等于10（10、J、Q、K、A）不能压——用户房规"10以上不压队友"。
+        // 非级牌"2"是最小的牌（2026-09-03 用户确认），不算"10以上"。
         // 三张 rank 取解析后的 combination.primary（修复 extract_top_rank 只看首张牌在
         // 乱序/百搭记录下判错致队友 JJJ 被压）。primary 为 level_order_value 刻度
-        // （10=9,J=10,Q=11,K=12,A=13,级牌=14），阈值 9 对齐 JS rankValue>=10（CF 同步）。
+        // （10=9,J=10,Q=11,K=12,A=13,级牌=14），阈值 9 ⇔ "≥10"；CF 端 2026-09-03 起
+        // 用 ruleOrderValue>=9 同口径（2 垫底）。
         if matches!(
             top.combination.kind,
             CombinationKind::Ordinary(OrdinaryKind::FullHouse)
@@ -1191,7 +1194,9 @@ fn decide_follow(top: &PlayState, p: &PlayContext, actor: Seat) -> FollowDecisio
             return FollowDecision::Pass;
         }
 
-        let top_is_big = trv >= 12; // Q or higher
+        // 队友领大牌（Q 及以上，level_order Q=11 → >=11）不压。非级牌"2"按用户口径
+        // （2026-09-03 确认：2 不是级牌时是最小的牌）不算大牌——原 rank_value_js>=12 误把 2 计入。
+        let top_is_big = top.combination.primary >= 11;
         if top_is_big {
             return FollowDecision::Pass; // Do not override teammate's big card
         }
@@ -3189,6 +3194,34 @@ mod tests {
     }
 
     #[test]
+    fn fh_222_banned_midgame_when_two_not_level() {
+        // 非级牌"2"尺度回归（用户 2026-09-03 确认：2 不是级牌时是最小的牌）：
+        // 级牌=8 的桌，对手领 222+55（最小的三带二，<Q）→ 中盘禁炸（房规A）。
+        // 旧 JS 尺度（2=15）会把它当大三带二放行出炸——两端必须一致禁炸。
+        let n8 = vec!["♠9", "♥9", "♦9", "♣9", "♠10", "♥10", "♦10", "♣10"];
+        let mut state = mk_playing_state_level(
+            Seat::N,
+            n8.clone(),
+            Some((Seat::E, vec!["♠2", "♦2", "♣2", "♠5", "♥5"])),
+            HandLevel::Eight,
+        );
+        fill_seats(
+            &mut state,
+            n8.clone(),
+            vec!["♦3", "♣3", "♠7", "♥7", "♦9", "♣9", "♠K", "♥K", "♠A"],
+            vec!["♠J", "♥J", "♦J", "♣J", "♠6", "♥6", "♦6", "♣6"],
+        );
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Pass => {}
+            PlayerAction::Play { cards, .. } => {
+                panic!("222+xx is the smallest FH (<Q) — midgame bomb must be banned, got {cards:?}")
+            }
+            other => panic!("expected pass or play, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn fh_wild_pair_banned_and_wild_triple_penalized() {
         // 房规（用户 2026-09-03）：
         // ① 三张天然、对子=1天然+1百搭（百搭凑对）→ 禁止（清空/冲刺豁免）；
@@ -3464,12 +3497,21 @@ mod tests {
         actor_hand: Vec<&str>,
         top_cards: Option<(Seat, Vec<&str>)>,
     ) -> TableGameState {
+        mk_playing_state_level(actor, actor_hand, top_cards, HandLevel::Two)
+    }
+
+    fn mk_playing_state_level(
+        actor: Seat,
+        actor_hand: Vec<&str>,
+        top_cards: Option<(Seat, Vec<&str>)>,
+        level: HandLevel,
+    ) -> TableGameState {
         let mut s = TableGameState::new("t_suggest".into());
         s.phase = GamePhase::Playing;
         s.turn_seat = actor;
         s.leader_seat = actor;
 
-        let mut hand = HandState::new(HandLevel::Two);
+        let mut hand = HandState::new(level);
         hand.hands.insert(
             actor,
             actor_hand.into_iter().map(ToString::to_string).collect(),
@@ -3480,7 +3522,8 @@ mod tests {
 
         if let Some((seat, cards)) = top_cards {
             let cards: Vec<String> = cards.into_iter().map(ToString::to_string).collect();
-            let combo = CombinationParser::parse(&cards, None, ctx()).unwrap();
+            let combo =
+                CombinationParser::parse(&cards, None, RuleContext { hand_level: level }).unwrap();
             hand.trick.top_play = Some(PlayState {
                 seat,
                 cards: cards.clone(),
