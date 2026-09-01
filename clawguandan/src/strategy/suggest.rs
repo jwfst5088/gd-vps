@@ -1635,7 +1635,7 @@ fn score_follow(
                             score -= 300.0; // 中盘适当惩罚
                         }
                     } else {
-                        score += 30.0; // 清空手牌 / 其他形态：照旧奖励
+                        score += 10.0; // 百搭使用优先级最低：炸弹/同花顺 > 钢板/木板/杂顺子 > 三带二
                     }
                 }
                 CombinationKind::Ordinary(OrdinaryKind::Triple) => score += 20.0,
@@ -2264,7 +2264,7 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
                             score -= 300.0; // 中盘适当惩罚
                         }
                     } else {
-                        score += 30.0; // 清空手牌 / 其他形态：照旧奖励
+                        score += 10.0; // 百搭使用优先级最低：炸弹/同花顺 > 钢板/木板/杂顺子 > 三带二
                     }
                 }
                 CombinationKind::Ordinary(OrdinaryKind::Triple) => score += 20.0,
@@ -2926,6 +2926,65 @@ mod tests {
                 assert_eq!(cards.len(), 5, "endgame dual-wild FH must still play, got {cards:?}");
             }
             other => panic!("endgame must keep dual-wild FH available, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wild_usage_priority_bomb_straight_over_fh() {
+        // 房规（用户 2026-09-03）：百搭使用优先级 炸弹/同花顺 > 钢板/木板/杂顺子 > 三带二。
+        // ① 领出：555+♥2 可拼炸/拼三带二 + 9999 保炸 → 出百搭炸弹；
+        // ② 领出：5678+♥2 可拼顺子/拼三带二 → 出百搭顺子。
+        let fill9 = |state: &mut TableGameState, n: &[&str]| {
+            fill_seats(
+                state,
+                n.to_vec(),
+                vec!["♦4", "♣4", "♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J"],
+                vec!["♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♣8", "♥8", "♦8"],
+            );
+            if let Some(hand) = state.hand.as_mut() {
+                hand.hands.insert(
+                    Seat::E,
+                    ["♠A", "♥A", "♦A", "♣A", "♠3", "♥3", "♦3", "♣3"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                );
+            }
+        };
+
+        // ① 跟牌 KKK+33（三张=级牌→允许炸；小fh跟不了）：唯一用法比较 → 百搭配炸弹 555+♥2。
+        // （领出场景下 555+88 可拼天然三带二，不属"百搭使用优先级"范畴，故用跟牌设计。）
+        let n_hand = ["♠5", "♥5", "♦5", "♥2", "♠9", "♥9", "♦9", "♣9", "♠3"];
+        let mut state = mk_playing_state(
+            Seat::N,
+            n_hand.to_vec(),
+            Some((Seat::E, vec!["♠K", "♥K", "♦K", "♠3", "♥3"])),
+        );
+        fill9(&mut state, &n_hand);
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 4, "wild bomb must be played, got {cards:?}");
+                assert!(cards.contains(&"♥2".to_string()), "bomb must use wild, got {cards:?}");
+            }
+            other => panic!("expected wild bomb, got {other:?}"),
+        }
+
+        // ② 百搭配顺子优先于百搭配三带二（手牌无天然顺子可用，5678+♥2 唯一顺子）。
+        let n_hand2 = ["♠5", "♥5", "♠6", "♥6", "♠7", "♠8", "♥2", "♠Q", "♠K"];
+        let mut state = mk_playing_state(
+            Seat::N,
+            n_hand2.to_vec(),
+            None,
+        );
+        fill9(&mut state, &n_hand2);
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 5, "wild straight must be led, got {cards:?}");
+                assert!(cards.contains(&"♥2".to_string()), "straight must use wild, got {cards:?}");
+            }
+            other => panic!("expected wild straight lead, got {other:?}"),
         }
     }
 
