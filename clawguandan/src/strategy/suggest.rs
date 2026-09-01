@@ -1034,6 +1034,20 @@ fn pick_playing(
                     continue;
                 }
             }
+            // 房规（用户 2026-09-03）：双百搭同出候选仅残局（手牌≤6张）才枚举——领出路径
+            // 硬门槛（2026-09-03 审计补，与跟牌过滤及 CF movegen 门槛一致）。
+            // 清空手牌的牌不受限。
+            if p.my_remaining > 6
+                && cand
+                    .cards
+                    .iter()
+                    .filter(|s| p.meta_for(s).map(|m| m.is_wild).unwrap_or(false))
+                    .count()
+                    >= 2
+                && cand.cards.len() < p.my_remaining
+            {
+                continue;
+            }
             let s = score_lead(cand.cards, &cand.combo, &p);
             if best.map_or(true, |(bs, _)| s > bs) {
                 best = Some((s, cand));
@@ -1417,7 +1431,13 @@ fn find_best_play_follow<'a>(
     // ① 炸弹保留：非残局、非对手冲刺、手里炸弹总数 = 1 个时，不出炸弹，直接过。
     //    （用户房规改自 JS 647-655：JS 为 bombCount<=2，现为 =1——
     //      2 个炸弹不再拦；"手里 ≥3 个炸可用"的豁免由条件 =1 自然排除）
-    if best_is_bomb && !is_endgame && !is_opp_sprinting && p.combos.bomb_count == 1 {
+    //    （2026-09-03 审计补：出炸直接清空手牌=赢牌，不受保留限制。）
+    if best_is_bomb
+        && !is_endgame
+        && !is_opp_sprinting
+        && p.combos.bomb_count == 1
+        && best_cards.len() < my_remaining
+    {
         return Ok(PlayerAction::Pass);
     }
 
@@ -1481,10 +1501,12 @@ fn find_best_play_follow<'a>(
     // ⑥ 绝对禁止：用炸弹压三张（太浪费，除非对手冲刺或残局）(JS 701-711)
     //    房规扩展（用户 2026-08-30）：12 以下（普通点数 <Q，即 J 及以下）的三带二同样不炸；
     //    Q/K/A/级牌 的三带二仍可炸。豁免照旧：残局（≤6）、对手冲刺（≤6）。
+    //    （2026-09-03 审计补：出炸直接清空手牌=赢牌不是浪费，本守卫不拦清空炸。）
     //    注：primary 为 level_order_value 尺度（Q=11, K=12, A=13, 级牌=14），故 <Q ⇔ primary<11。
     if best_is_bomb
         && !is_endgame
         && !is_opp_sprinting
+        && best_cards.len() < my_remaining
         && match top.combination.kind {
             CombinationKind::Ordinary(OrdinaryKind::Triple) => true,
             CombinationKind::Ordinary(OrdinaryKind::FullHouse) => top.combination.primary < 11,
@@ -3089,6 +3111,80 @@ mod tests {
                 assert!(cards.contains(&"♥2".to_string()), "wild bomb must play, got {cards:?}");
             }
             other => panic!("expected wild bomb intercept, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lead_shape_b_wild_pair_fh_banned_unless_clearing() {
+        // 房规（用户 2026-09-03）领出路径回归：三张天然+百搭凑对子的三带二禁领（清空豁免）。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠5", "♥5", "♦5", "♠6", "♥2", "♠3", "♠4"],
+            None,
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠5", "♥5", "♦5", "♠6", "♥2", "♠3", "♠4"],
+            vec!["♦4", "♣4", "♠10", "♥10", "♦10", "♣10", "♠J"],
+            vec!["♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♣8"],
+        );
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                // Shape B fh 特征：5张且同时用到天然三张的两张5（♠5♥5♦5 中任二）+ 百搭。
+                // 百搭顺子 23456(+30) 是合法领出，不受此限。
+                let shape_b_like = cards.len() == 5
+                    && cards.contains(&"♥2".to_string())
+                    && ((cards.contains(&"♥5".to_string()) && cards.contains(&"♦5".to_string()))
+                        || (cards.contains(&"♠5".to_string()) && cards.contains(&"♥5".to_string()))
+                        || (cards.contains(&"♠5".to_string()) && cards.contains(&"♦5".to_string())));
+                assert!(!shape_b_like, "Shape B FH must not be led midgame, got {cards:?}");
+            }
+            other => panic!("expected a lead, got {other:?}"),
+        }
+
+        // 清空豁免：5张手恰好=Shape B fh → 放行。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠5", "♥5", "♦5", "♠6", "♥2"],
+            None,
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠5", "♥5", "♦5", "♠6", "♥2"],
+            vec!["♦4", "♣4", "♠10", "♥10", "♦10"],
+            vec!["♣6", "♥6", "♦6", "♣7", "♥7"],
+        );
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 5, "clearing exempts Shape B lead ban, got {cards:?}");
+            }
+            other => panic!("clearing Shape B fh must lead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lead_dual_wild_candidates_gated_midgame() {
+        // 房规（用户 2026-09-03）领出路径回归（审计补）：手牌>6张时双百搭候选不枚举
+        // （与跟牌硬门槛、CF movegen 门槛一致）。双百搭对子不得在中盘领出。
+        let n8 = vec!["♥2", "♥2", "♠5", "♥5", "♦5", "♠6", "♠3", "♠4"];
+        let mut state = mk_playing_state(Seat::N, n8.clone(), None);
+        fill_seats(
+            &mut state,
+            n8.clone(),
+            vec!["♦4", "♣4", "♠10", "♥10", "♦10", "♣10", "♠J", "♥J"],
+            vec!["♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♣8", "♥8"],
+        );
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert!(
+                    !(cards.len() == 2 && cards.iter().all(|c| c == "♥2")),
+                    "dual-wild pair must not be led midgame, got {cards:?}"
+                );
+            }
+            other => panic!("expected a lead, got {other:?}"),
         }
     }
 
