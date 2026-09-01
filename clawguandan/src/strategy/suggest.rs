@@ -645,10 +645,12 @@ struct PlayContext {
     enemy_sprinting: bool,
     /// 活跃对手（剩 >0 张）的剩余张数（供带阈值参数的冲刺判定用）
     enemy_rem_active: Vec<usize>,
-    /// 房规（用户 2026-08-30）：对手连续领单张且无人接的轮数（当前顶牌算第 1 轮；
-    /// 向前跳过 Pass 累计对手同型领出，我方任何人出牌即断链）。≥2 才解锁拆对跟单张。
+    /// 房规（用户 2026-08-30，2026-09-03 放宽）：对手出牌我方无人接管的连续轮数
+    /// （当前顶牌算第 1 轮；对手任意牌型都算一轮，向前跳过 Pass 累计，
+    /// 我方任何人出牌即断链）。当前顶牌为单张时 ≥2 解锁拆对跟单张；
+    /// 为对子时 ≥2 解锁拆三张同跟对子。
     enemy_single_streak: usize,
-    /// 同上，对子版（≥2 解锁拆三张同跟对子）
+    /// 同上，对子版
     enemy_pair_streak: usize,
     /// JS `isEndgame = myRemaining <= params.endgame_hand_count_threshold`
     is_endgame: bool,
@@ -685,9 +687,9 @@ fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayCo
     let enemy_rem_active: Vec<usize> = opp_counts.iter().copied().filter(|&c| c > 0).collect();
     let enemy_sprinting = enemy_rem_active.iter().any(|&c| c <= 6);
 
-    // 房规（用户 2026-08-30）：对手连续领单张/对子且无人接的轮数。
-    // 当前顶牌 = 第 1 轮；向前跳过 Pass 累计对手同型领出（我方出牌即断链）。
-    // history 不含当前顶牌（顶牌在 trick.top_play）。
+    // 房规（用户 2026-08-30，2026-09-03 放宽）：对手出牌我方无人接管的连续轮数。
+    // 当前顶牌 = 第 1 轮；对手任意牌型都算一轮（不要求同型），向前跳过 Pass 累计，
+    // 我方出牌即断链。history 不含当前顶牌（顶牌在 trick.top_play）。
     let (enemy_single_streak, enemy_pair_streak) = {
         let mut s_single = 0usize;
         let mut s_pair = 0usize;
@@ -701,19 +703,12 @@ fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayCo
                     let mut streak = 1usize;
                     for e in hand.history.iter().rev() {
                         if e.action_type != HistoryActionKind::Play {
-                            continue; // Pass = 无人接，继续向前找上一轮领出
+                            continue; // Pass = 无人接管，继续向前
                         }
                         if e.seat == actor || e.seat == teammate_seat {
-                            break; // 我方接牌 → 断链
+                            break; // 我方接管 → 断链
                         }
-                        let kind = e.combination_type.as_deref().unwrap_or("");
-                        let is_single = kind == "single" || (kind.is_empty() && e.cards.len() == 1);
-                        let is_pair = kind == "pair" || (kind.is_empty() && e.cards.len() == 2);
-                        if (want_single && is_single) || (want_pair && is_pair) {
-                            streak += 1;
-                        } else {
-                            break;
-                        }
+                        streak += 1; // 对手任意牌型都算一轮
                     }
                     if want_single {
                         s_single = streak;
@@ -2729,6 +2724,57 @@ mod tests {
             }
             other => panic!("unlock must allow triple-split follow, got {other:?}"),
         }
+        // ④ 跨牌型（2026-09-03 放宽）：E 领三张555（全过）→ E 领单张6 → 链=2 →
+        // 解锁拆孤对88跟牌（旧逻辑要求同型会不过）。手牌 7 张=中盘，避开残局拆对豁免。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠8", "♥8", "♠7", "♥7", "♠5", "♥5", "♠4"],
+            Some((Seat::E, vec!["♠6"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠8", "♥8", "♠7", "♥7", "♠5", "♥5", "♠4"],
+            vec!["♦4", "♣4", "♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J"],
+            vec!["♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♣8", "♥8", "♦8"],
+        );
+        state.hand.as_mut().unwrap().history = vec![
+            history_entry(Seat::E, vec!["♠5", "♥5", "♦5"]),
+            history_pass(Seat::S),
+            history_pass(Seat::W),
+            history_pass(Seat::N),
+        ];
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 1, "cross-type chain must unlock, got {cards:?}");
+                assert!(cards[0].ends_with('8'), "孤对88优先拆大跟6, got {cards:?}");
+            }
+            other => panic!("cross-type chain must unlock pair-split, got {other:?}"),
+        }
+
+        // ⑤ 我方接管断链：E 领单张3 → 我队友接了 → E 再领单张4 → 链=1 → 不解锁 → 过牌。
+        let mut state = mk_playing_state(
+            Seat::N,
+            vec!["♠8", "♥8", "♠7", "♥7", "♠6", "♥6", "♠5", "♥5"],
+            Some((Seat::E, vec!["♠5"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♠8", "♥8", "♠7", "♥7", "♠6", "♥6", "♠5", "♥5"],
+            vec!["♦4", "♣4", "♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J"],
+            vec!["♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♣8", "♥8", "♦8"],
+        );
+        state.hand.as_mut().unwrap().history = vec![
+            history_entry(Seat::E, vec!["♠3"]),
+            history_entry(Seat::S, vec!["♦4"]), // 我方队友接管
+            history_pass(Seat::W),
+            history_pass(Seat::N),
+        ];
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        assert!(
+            matches!(act, PlayerAction::Pass),
+            "our side took over → chain broken → must pass, got {act:?}"
+        );
     }
 
     #[test]
