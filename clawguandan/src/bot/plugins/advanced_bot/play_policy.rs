@@ -152,7 +152,12 @@ impl PlayPolicy for AdvancedPlayPolicy {
                 return Ok(BotDecision::Action(PlayerAction::Pass));
             }
 
-            let top_is_big = top_rank.map(|r| rank_value(r) >= 12).unwrap_or(false);
+            // 非级牌"2"尺度（用户 2026-09-03 确认：2 不是级牌时是最小的牌）：
+            // "队友大牌不压"按 level_order 判定（Q=11 → >=11），非级牌 2=1 不再被当大牌硬拦
+            // （与 suggest.rs 队友规则及 CF bot ruleOrderValue 同口径）。
+            let top_is_big = top_rank
+                .map(|r| level_order_value(r, level_rank.unwrap_or(Rank::Two)) >= 11)
+                .unwrap_or(false);
             if top_is_big {
                 pass_score += 5.0 * self.params.team_win_weight;
                 reasons.push("pass: do not override teammate's big card".to_string());
@@ -309,5 +314,35 @@ fn rank_value(r: Rank) -> u8 {
         Rank::Two => 15,
         Rank::BlackJoker => 16,
         Rank::RedJoker => 17,
+    }
+}
+
+/// 牌序尺度（与 card.rs level_order_value 同源）：R=16 > B=15 > 级牌=14 > A=13 > … > 3=2 > 2=1。
+/// 非级牌"2"是最小的牌（用户房规口径，2026-09-03 确认）。
+fn level_order_value(r: Rank, level_rank: Rank) -> u8 {
+    if r == Rank::RedJoker {
+        return 16;
+    }
+    if r == Rank::BlackJoker {
+        return 15;
+    }
+    if r == level_rank {
+        return 14;
+    }
+    match r {
+        Rank::A => 13,
+        Rank::K => 12,
+        Rank::Q => 11,
+        Rank::J => 10,
+        Rank::Ten => 9,
+        Rank::Nine => 8,
+        Rank::Eight => 7,
+        Rank::Seven => 6,
+        Rank::Six => 5,
+        Rank::Five => 4,
+        Rank::Four => 3,
+        Rank::Three => 2,
+        Rank::Two => 1,
+        _ => 0,
     }
 }
