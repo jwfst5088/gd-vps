@@ -1296,6 +1296,31 @@ fn find_best_play_follow<'a>(
         .iter()
         .any(|c| c.combo.class() == CombinationClass::Bomb && !cand_has_wild(c));
 
+    // 房规（用户 2026-09-03）：能跟就不烧——存在同型非炸、不含百搭、且不拆手牌天然炸弹的
+    // 天然候选能压顶牌时，非清空候选中"炸弹"与"含百搭"的一律排除（残局/冲刺场景同样生效；
+    // 烧百搭的"跟"与拆炸的"跟"都不算能跟，否则百搭配对三带二会顶着冲刺豁免+10分顶掉天然平跟）。
+    // 出炸直接清空手牌不受限（那是赢牌不是浪费）。顶牌是炸弹时同型非炸不存在，规则自然不生效
+    // （反炸省百搭由 B1 管）。候选本就全部合法能压顶，"能压"无需再验。
+    let follow_breaks_bomb = |c: &Candidate| {
+        let mut use_count: HashMap<u8, usize> = HashMap::new();
+        for s in c.cards.iter() {
+            if let Some(&r) = p.combos.card_to_rank.get(s) {
+                *use_count.entry(r).or_default() += 1;
+            }
+        }
+        use_count.iter().any(|(&r, &n)| {
+            let hand_n = p.combos.rank_to_count.get(&r).copied().unwrap_or(0);
+            hand_n >= 4 && n < hand_n
+        })
+    };
+    let has_same_type_follow = !top_is_bomb
+        && candidates.iter().any(|c| {
+            c.combo.class() == CombinationClass::Ordinary
+                && !cand_has_wild(c)
+                && !follow_breaks_bomb(c)
+                && c.combo.kind == top.combination.kind
+        });
+
     // Score each possible play and pick the best one (ties → first in order, JS stable sort)
     let mut best: Option<(f32, &Candidate)> = None;
     for cand in candidates {
@@ -1307,6 +1332,14 @@ fn find_best_play_follow<'a>(
             && cand.combo.class() == CombinationClass::Bomb
             && cand_has_wild(cand)
             && cand.cards.len() < my_remaining
+        {
+            continue;
+        }
+        // 房规（用户 2026-09-03）：能跟就不烧——有天然同型平跟时，非清空候选里的
+        // 炸弹与含百搭候选全部排除（唯一豁免 = 直接清空手牌）。
+        if has_same_type_follow
+            && cand.cards.len() < my_remaining
+            && (cand.combo.class() == CombinationClass::Bomb || cand_has_wild(cand))
         {
             continue;
         }
@@ -2985,6 +3018,77 @@ mod tests {
                 assert!(cards.contains(&"♥2".to_string()), "straight must use wild, got {cards:?}");
             }
             other => panic!("expected wild straight lead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn follow_instead_of_bomb_when_same_type_follow_exists() {
+        // 房规（用户 2026-09-03）：能跟就不炸——存在同型非炸（且不含百搭）平跟候选时
+        // 禁用炸弹；冲刺/残局豁免不再为"有平跟还烧炸"开绿灯；无平跟时冲刺拦截照旧可用。
+        let fh_top = vec!["♠3", "♥3", "♦3", "♣5", "♥5"];
+        let n10 = ["♠8", "♥8", "♦8", "♠4", "♥4", "♠9", "♥9", "♦9", "♥2", "♠3"];
+        let fill = |state: &mut TableGameState, n: &[&str], e: &[&str]| {
+            fill_seats(
+                state,
+                n.to_vec(),
+                vec!["♦4", "♣4", "♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J", "♣10"],
+                vec!["♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♣8", "♥8", "♦8", "♣J"],
+            );
+            if let Some(hand) = state.hand.as_mut() {
+                hand.hands.insert(Seat::E, e.iter().map(|s| s.to_string()).collect());
+            }
+        };
+
+        // ① 对方领小三带二 + 我有天然8/9三带二 + 百搭炸(999+♥2) + E冲刺(剩5张)：
+        //    旧逻辑=烧炸抢节奏；新规=用同型三带二平跟（同样赢下这轮+出牌权，零浪费）。
+        let mut state = mk_playing_state(
+            Seat::N,
+            n10.to_vec(),
+            Some((Seat::E, fh_top.clone())),
+        );
+        fill(&mut state, &n10, &["♠9", "♥9", "♦9", "♣9", "♠7"]);
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 5, "must follow with natural FH, got {cards:?}");
+                assert!(!cards.contains(&"♥2".to_string()), "no wild bomb when follow exists, got {cards:?}");
+            }
+            other => panic!("expected natural FH follow, got {other:?}"),
+        }
+
+        // ② 无冲刺对照：同样平跟（不因房规A走向过牌——平跟在候选层接管）。
+        let mut state = mk_playing_state(
+            Seat::N,
+            n10.to_vec(),
+            Some((Seat::E, fh_top.clone())),
+        );
+        fill(&mut state, &n10, &["♠9", "♥9", "♦9", "♣9", "♠7", "♥8", "♦8", "♣8", "♠6"]);
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 5, "must follow with natural FH, got {cards:?}");
+                assert!(!cards.contains(&"♥2".to_string()), "no wild bomb when follow exists, got {cards:?}");
+            }
+            other => panic!("expected natural FH follow, got {other:?}"),
+        }
+
+        // ③ 无平跟 + 冲刺 → 炸弹拦截照旧可用（不误伤冲刺设计）。
+        //   顶牌用天然级牌三带二 KKK+33（9的三带二/百搭配对fh都压不了）→ 唯一合法候选=百搭炸。
+        let kf_top = vec!["♠K", "♥K", "♦K", "♠3", "♥3"];
+        let n6 = ["♠9", "♥9", "♦9", "♥2", "♠3", "♠4"];
+        let mut state = mk_playing_state(
+            Seat::N,
+            n6.to_vec(),
+            Some((Seat::E, kf_top)),
+        );
+        fill(&mut state, &n6, &["♠9", "♥9", "♦9", "♣9", "♠7"]);
+        let act = suggest_next_action(&state, Seat::N).unwrap();
+        match act {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 4, "sprint intercept bomb still allowed, got {cards:?}");
+                assert!(cards.contains(&"♥2".to_string()), "wild bomb must play, got {cards:?}");
+            }
+            other => panic!("expected wild bomb intercept, got {other:?}"),
         }
     }
 
