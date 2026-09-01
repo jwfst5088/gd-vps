@@ -188,7 +188,12 @@ impl GameEngine {
         state.hand_index += 1;
         state.phase = GamePhase::Dealing;
         let mut hand = HandState::new(hand_level);
-        let deck = Deck::new_shuffled_double_deck(self.cfg.rng_seed + state.hand_index as u64);
+        let deal_seed = if self.cfg.randomize_deals {
+            rand::random::<u64>()
+        } else {
+            self.cfg.rng_seed + state.hand_index as u64
+        };
+        let deck = Deck::new_shuffled_double_deck(deal_seed);
         let dealt = deck.deal_27_each_ccw_from(first_drawer);
         for s in Seat::ALL {
             let cards = dealt
@@ -215,7 +220,12 @@ impl GameEngine {
     ) -> Result<(), String> {
         let new_hand_index = state.hand_index + 1;
         let mut hand = HandState::new(hand_level);
-        let deck = Deck::new_shuffled_double_deck(self.cfg.rng_seed + new_hand_index as u64);
+        let deal_seed = if self.cfg.randomize_deals {
+            rand::random::<u64>()
+        } else {
+            self.cfg.rng_seed + new_hand_index as u64
+        };
+        let deck = Deck::new_shuffled_double_deck(deal_seed);
         let first_drawer = *last_finishing_order
             .last()
             .ok_or_else(|| "missing finishing order".to_string())?;
@@ -268,7 +278,12 @@ impl GameEngine {
         state.hand_index += 1;
         state.phase = GamePhase::Dealing;
         let mut hand = HandState::new(HandLevel::Two);
-        let deck = Deck::new_shuffled_double_deck(self.cfg.rng_seed + state.hand_index as u64);
+        let deal_seed = if self.cfg.randomize_deals {
+            rand::random::<u64>()
+        } else {
+            self.cfg.rng_seed + state.hand_index as u64
+        };
+        let deck = Deck::new_shuffled_double_deck(deal_seed);
         let dealt = deck.deal_27_each_ccw_from(Seat::E);
         for s in Seat::ALL {
             let cards = dealt
@@ -852,6 +867,23 @@ mod tests {
             .apply_player_action(&mut s, Seat::E, PlayerAction::Pass, None)
             .unwrap_err();
         assert!(err.contains("cannot pass"));
+    }
+
+    #[test]
+    fn randomize_deals_true_yields_different_deals_false_stays_deterministic() {
+        // 房规（用户 2026-09-03）：真实牌桌每局真随机（randomize_deals=true）；
+        // 测试/训练确定性回退（false → rng_seed+hand_index 可复现）。
+        let deal = |randomize: bool| {
+            let eng = GameEngine::new(GameConfig { rng_seed: 42, randomize_deals: randomize });
+            let mut s = TableGameState::new("t".into());
+            eng.start_first_hand(&mut s, Seat::E, HandLevel::Two).unwrap();
+            let hand = s.hand.as_ref().unwrap();
+            hand.hands.get(&Seat::E).cloned().unwrap()
+        };
+        // false：确定性——同种子同牌
+        assert_eq!(deal(false), deal(false), "deterministic mode must reproduce the same deal");
+        // true：真随机——两次开局牌不同（108张全同概率≈0）
+        assert_ne!(deal(true), deal(true), "randomized mode must not repeat the same deal");
     }
 
     #[test]

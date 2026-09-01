@@ -279,7 +279,7 @@ fn evaluate_params_from_logs(params: &AdvancedBotParams, logs: &[GameLogEntry]) 
 
     let matches_to_run = std::cmp::min(logs.len() as u32, 50);
     for _ in 0..matches_to_run {
-        let engine = GameEngine::new(GameConfig { rng_seed: rand::random() });
+        let engine = GameEngine::new(GameConfig { rng_seed: rand::random(), randomize_deals: false });
         match run_single_match_from_log(&engine, params) {
             Ok(Some((winner, first_out_team, ns_residual))) => {
                 played += 1;

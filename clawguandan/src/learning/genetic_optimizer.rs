@@ -143,7 +143,7 @@ fn evaluate_individual(params: &AdvancedBotParams, matches: u32) -> EvalResult {
         if !crate::learning::is_running_generation(my_gen) {
             break;
         }
-        let engine = GameEngine::new(GameConfig { rng_seed: rand::random() });
+        let engine = GameEngine::new(GameConfig { rng_seed: rand::random(), randomize_deals: false });
         match run_single_match(&engine) {
             Ok(Some((winner, first_out_team, ns_residual))) => {
                 played += 1;

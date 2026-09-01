@@ -430,6 +430,7 @@ pub async fn list_table_runtimes(&self) -> Vec<TableRuntimeState> {
             inner.state.status = TableStatus::InGame;
             inner.state.game_config = GameConfig {
                 rng_seed: TableRuntimeState::hash_table_id_seed(&inner.state.table_id),
+                randomize_deals: true, // 房规（用户 2026-09-03）：真实牌桌每局真随机
             };
             let first_hand_level = match inner.state.current_declarer {
                 TeamId::Ew => inner.state.team_progress_ew.level,

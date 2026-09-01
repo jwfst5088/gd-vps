@@ -31,11 +31,14 @@ impl TeamId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GameConfig {
     pub rng_seed: u64,
+    /// 房规（用户 2026-09-03）：每局真随机——为 true 时每副发牌用 rand::random() 种子，
+    /// rng_seed+hand_index 仅作测试/训练的确定性回退（false = 原可复现行为）。
+    pub randomize_deals: bool,
 }
 
 impl Default for GameConfig {
     fn default() -> Self {
-        Self { rng_seed: 0 }
+        Self { rng_seed: 0, randomize_deals: false }
     }
 }
 

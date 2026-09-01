@@ -97,7 +97,7 @@ pub fn evaluate_params_with_progress<F: Fn(u32, u32)>(
         if !crate::learning::is_running_generation(my_gen) {
             break;
         }
-        let engine = GameEngine::new(GameConfig { rng_seed: rand::random() });
+        let engine = GameEngine::new(GameConfig { rng_seed: rand::random(), randomize_deals: false });
         match run_single_match(&engine, config.max_plies) {
             Ok(Some((winner, first_out_team, ns_residual))) => {
                 played += 1;
