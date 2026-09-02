@@ -1783,12 +1783,20 @@ fn score_follow(
             score -= p.params.bomb_keep_many; // 3+炸弹，留至少1个到残局
         }
 
-        // 房规（用户 2026-09-03）：2 炸时用炸不扣分（1 炸仍保留罚）；
-        // 仅 1 个炸弹时，非残局非对手冲刺不能用炸弹
-        if !is_endgame && !is_last_play && min_opp_remaining > 6 {
-            if combos.bomb_count < 2 {
-                score -= p.params.bomb_keep_single; // 仅1个炸弹，绝对保留
-            }
+        // 房规（用户 2026-09-03 追问澄清）："至少留 1 炸到残局"——中盘（手牌>6）打出
+        // 手里最后一炸（打完 0 炸）= 硬禁令：否则到残局时 0 炸，"留 1 炸控牌"落空。
+        // 2026-09-02 实战复盘（t_15bfb589 局 [22]/[59]）：原 −200 软罚（bomb_keep_single）
+        // 被炸弹收益淹没，且 is_last_play（位置最后出手）使 bot 总能"赢墩式"烧光两炸
+        // （W/N 均在 12 张时烧光）。本禁令不设 is_last_play 豁免——"留到残局"是存在性保证。
+        // 豁免：①对手冲刺（任一对手剩≤6，拦截优先）②打完后剩≤2张（下一手即可清空）。
+        // 清空本身（len>=remaining）不进本分支；2 炸用第 1 炸不受影响（bomb_count==2）。
+        let rest_cards_after_bomb_mid = my_remaining.saturating_sub(play_cards.len());
+        if !is_endgame
+            && min_opp_remaining > 6
+            && combos.bomb_count < 2
+            && rest_cards_after_bomb_mid > 2
+        {
+            score -= BANNED_SCORE; // 中盘烧最后一炸 = 硬禁令（至少留 1 炸到残局）
         }
 
         // 房规禁令（用户 2026-09-03 重申并升级）：残局手里只剩 1 炸必须留作控牌
@@ -2812,6 +2820,17 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
         let rest_after = my_remaining - play_cards.len();
         if combos.bomb_count == 1 && p.min_opp_remaining > 6 && rest_after > 2 {
             score -= BANNED_SCORE; // 残局留炸禁令（领出侧）
+        }
+    }
+
+    // ── 房规（用户 2026-09-03 追问澄清）：中盘领出侧同款"留 1 炸到残局"硬禁令 ──
+    // 中盘（手牌>6）领出手里最后一炸（打完 0 炸）→ 到残局必 0 炸 → 禁止。
+    // 与跟牌侧同规：不设 is_last_play 豁免（存在性保证）。
+    // 豁免：①对手冲刺（≤6）②打完后剩≤2张；清空（len>=remaining）不进本分支。
+    if is_bomb && !is_endgame && play_cards.len() < my_remaining {
+        let rest_after_mid = my_remaining - play_cards.len();
+        if combos.bomb_count < 2 && p.min_opp_remaining > 6 && rest_after_mid > 2 {
+            score -= BANNED_SCORE; // 中盘留炸禁令（领出侧）
         }
     }
 
