@@ -66,11 +66,43 @@ pub fn set_learn_params_for_teams(ns: Option<AdvancedBotParams>, ew: Option<Adva
     }
 }
 
+thread_local! {
+    /// 训练评估线程标记（2026-09-03 排查修复）：仅训练线程为 true。
+    static IN_TRAINING_EVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII：训练评估入口置位，Drop 复位。作用域内的 `get_params_for_seat` 才会读
+/// `LEARN_PARAMS*`（训练候选 vs 基线的自对弈语义）。
+///
+/// 房规隔离修复（2026-09-03）：此前 `LEARN_PARAMS*` 是全局量，训练评估（24h 自动续跑）
+/// 期间**线上对局桌面的机器人也会读到变异中的候选参数**。参数面扩到 52 维后单次变异
+/// 扰动巨大（如 keep_bomb_bonus 500→8、dual_wild_penalty_mid 600→3），玩家桌上
+/// 留炸/百搭罚/接风等打分型房规全部失真。修复后线上桌面永远使用 `js_trained_params`
+/// 房规基线，训练扰动只存在于训练线程自己的自对弈里。
+pub(crate) struct TrainingGuard;
+
+impl TrainingGuard {
+    pub(crate) fn new() -> Self {
+        IN_TRAINING_EVAL.with(|c| c.set(true));
+        TrainingGuard
+    }
+}
+
+impl Drop for TrainingGuard {
+    fn drop(&mut self) {
+        IN_TRAINING_EVAL.with(|c| c.set(false));
+    }
+}
+
 fn get_learn_params() -> Option<AdvancedBotParams> {
     LEARN_PARAMS.lock().ok().and_then(|lock| lock.clone())
 }
 
 fn get_params_for_seat(seat: Seat) -> AdvancedBotParams {
+    // 房规隔离（2026-09-03）：非训练线程一律使用房规基线 js_trained_params。
+    if !IN_TRAINING_EVAL.with(std::cell::Cell::get) {
+        return js_trained_params();
+    }
     let team_lock = match seat {
         Seat::S | Seat::N => LEARN_PARAMS_NS.lock(),
         _ => LEARN_PARAMS_EW.lock(),
@@ -654,6 +686,11 @@ struct PlayContext {
     pool: PoolStats,
     /// 残局求解器 memo（路线图③）：手牌多重集 → 最少出牌墩数（仅手牌 ≤6 张时使用）
     endgame_memo: std::cell::RefCell<HashMap<String, usize>>,
+    /// 求解器单次决策时间闸（2026-09-03 排查修复）：求解器在带百搭的残局上可能秒级耗时，
+    /// 触发 store.rs `BOT_TURN_TIMEOUT=30s` 的 bot_turn_timeout 强制过牌——线上机器人在
+    /// 残局被系统自动 Pass，留炸/接风/清牌等房规全部"失效"。每次决策建 context 时定为
+    /// now+500ms；超时后其余候选退回传统打分（远低于 30s 强制过牌线）。
+    solver_deadline: std::time::Instant,
 }
 
 fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayContext {
@@ -759,6 +796,7 @@ fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayCo
         enemy_seats,
         pool,
         endgame_memo: std::cell::RefCell::new(HashMap::new()),
+        solver_deadline: std::time::Instant::now() + std::time::Duration::from_millis(500),
     }
 }
 
@@ -770,6 +808,7 @@ fn min_tricks_partition(
     cards: &[String],
     level: HandLevel,
     memo: &mut HashMap<String, usize>,
+    deadline: std::time::Instant,
 ) -> usize {
     if cards.is_empty() {
         return 0;
@@ -786,6 +825,13 @@ fn min_tricks_partition(
     // 锚定首张：每一墩必含某张牌，枚举"含 sorted[0]"的全部子集（其余 n-1 位按位掩码）。
     // 掩码选的是下标，天然处理重复符号（多重集）。
     for mask in 0..(1u16 << (n - 1)) {
+        // 时间闸（2026-09-03）：带百搭的残局子集解析可能远超预期，超时返回当前最优的
+        // 上界（cards.len()=全拆单张，恒为合法上界）。防线上 30s bot_turn_timeout 强制过牌。
+        if std::time::Instant::now() > deadline {
+            let bound = if best == usize::MAX { n } else { best.min(n) };
+            memo.insert(key, bound); // 上界可安全缓存（只会高估墩数，不会低估）
+            return bound;
+        }
         let mut subset: Vec<String> = Vec::with_capacity(n);
         let mut rest: Vec<String> = Vec::with_capacity(n);
         subset.push(sorted[0].clone());
@@ -799,7 +845,7 @@ fn min_tricks_partition(
         if subset.len() > 1 && CombinationParser::parse(&subset, None, ctx).is_err() {
             continue;
         }
-        let sub = min_tricks_partition(&rest, level, memo);
+        let sub = min_tricks_partition(&rest, level, memo, deadline);
         if sub + 1 < best {
             best = sub + 1;
             if best == 1 {
@@ -807,8 +853,9 @@ fn min_tricks_partition(
             }
         }
     }
-    memo.insert(key, best);
-    best
+    let result = if best == usize::MAX { n } else { best };
+    memo.insert(key, result);
+    result
 }
 
 impl PlayContext {
@@ -831,7 +878,7 @@ impl PlayContext {
             }
         }
         let mut memo = self.endgame_memo.borrow_mut();
-        min_tricks_partition(&rest, self.ctx.hand_level, &mut memo)
+        min_tricks_partition(&rest, self.ctx.hand_level, &mut memo, self.solver_deadline)
     }
 
     // ── 牌踪器概率接口（JS HandTracker / ProbabilisticReasoner 1:1）─────────
@@ -2690,7 +2737,9 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
     // 剩余墩数越少越好（每墩 −500）；同墩平手时小幅倾向甩掉手中的天然废单
     // （+15/张——与 endgame_lead_single_removal_reward 的设计行为一致：先甩垃圾单张、
     //   保留组合牌作回手/逃生，专家打法）。清空候选不进本段（+10000 已覆盖）。
-    if solver_active {
+    // 运维杀开关：CLAW_DISABLE_SOLVER=1 完全关闭残局求解器（2026-09-03 排查用）
+    let solver_enabled = std::env::var("CLAW_DISABLE_SOLVER").is_err();
+    if solver_enabled && solver_active && std::time::Instant::now() < p.solver_deadline {
         let residual_tricks = p.min_tricks_after(play_cards);
         score -= residual_tricks as f32 * p.params.solver_trick_penalty;
         let mut junk_removed = 0usize;

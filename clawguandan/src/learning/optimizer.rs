@@ -86,6 +86,8 @@ pub fn evaluate_params_with_progress<F: Fn(u32, u32)>(
     // 这样 NS 胜率能真实反映候选参数相对基准的优劣，避免自对弈对称导致的~50%胜率随机游走。
     // （房规：基线从 default_balanced 改为 js_trained_params，与线上实际回退一致）
     let baseline = crate::strategy::suggest::js_trained_params();
+    // 房规隔离（2026-09-03）：LEARN_PARAMS 只对本训练线程生效，线上桌面永远房规基线
+    let _training_scope = crate::strategy::suggest::TrainingGuard::new();
     set_learn_params_for_teams(Some(params.clone()), Some(baseline));
 
     // 记录当前训练 generation,用于检测是否有新训练启动
@@ -227,8 +229,7 @@ fn run_single_match(
 
 /// Hill-climbing optimization: start with initial params, mutate and evaluate.
 /// Keeps the better params and continues for the configured number of iterations.
-pub fn optimize(start: &AdvancedBotParams, config: &HillClimbConfig) -> AdvancedBotParams {
-    let mut best = start.clone();
+pub fn optimize(start: &AdvancedBotParams, config: &HillClimbConfig) -> AdvancedBotParams {    let mut best = start.clone();
     let mut best_eval = evaluate_params(&best, &config.eval_config);
     println!(
         "[learn] iter 0: level_ev={:.3} win_rate={:.3} first_out={:.3} residual={:.1} score={:.4}",
@@ -257,4 +258,36 @@ pub fn optimize(start: &AdvancedBotParams, config: &HillClimbConfig) -> Advanced
     }
 
     best
+}
+
+#[cfg(test)]
+mod trainer_repro_tests {
+    use super::*;
+
+    /// 排查训练器全部对局 0 分问题：单局自对弈能否正常完成并产生胜负。
+    #[test]
+    fn single_selfplay_match_completes() {
+        let mut completed = 0;
+        let mut none_count = 0;
+        let mut err_count = 0;
+        for seed in 1..=10u64 {
+            let engine = GameEngine::new(GameConfig { rng_seed: seed, randomize_deals: false });
+            match run_single_match(&engine, 2000) {
+                Ok(Some((w, f, d, res))) => {
+                    completed += 1;
+                    println!("seed {seed}: OK winner={w:?} first_out={f:?} delta={d} residual={res}");
+                }
+                Ok(None) => {
+                    none_count += 1;
+                    println!("seed {seed}: Ok(None) —— 相位Scoring但无winner，或非Scoring相位");
+                }
+                Err(e) => {
+                    err_count += 1;
+                    println!("seed {seed}: Err: {e}");
+                }
+            }
+        }
+        println!("completed={completed} none={none_count} err={err_count}");
+        assert!(completed > 0, "没有任何一局正常完成: none={none_count} err={err_count}");
+    }
 }

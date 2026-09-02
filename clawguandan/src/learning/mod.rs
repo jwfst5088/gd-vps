@@ -288,6 +288,8 @@ fn evaluate_params_from_logs(params: &AdvancedBotParams, logs: &[GameLogEntry]) 
     // 打破对称性：NS 用候选参数，EW 用固定基线参数(default_balanced)。
     // 与 optimizer.rs / genetic_optimizer.rs 保持一致。
     let baseline = AdvancedBotParams::default_balanced();
+    // 房规隔离（2026-09-03）：LEARN_PARAMS 只对本训练线程生效，线上桌面永远房规基线
+    let _training_scope = crate::strategy::suggest::TrainingGuard::new();
     set_learn_params_for_teams(Some(params.clone()), Some(baseline));
 
     let mut ns_wins = 0u32;

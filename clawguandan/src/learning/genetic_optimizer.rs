@@ -140,6 +140,8 @@ fn evaluate_individual(params: &AdvancedBotParams, matches: u32) -> EvalResult {
     // 这样 NS 胜率能真实反映候选参数相对基准的优劣，避免自对弈对称导致的~50%胜率随机游走。
     // 与 optimizer.rs 保持一致。（房规：基线从 default_balanced 改为 js_trained_params）
     let baseline = crate::strategy::suggest::js_trained_params();
+    // 房规隔离（2026-09-03）：LEARN_PARAMS 只对本训练线程生效，线上桌面永远房规基线
+    let _training_scope = crate::strategy::suggest::TrainingGuard::new();
     set_learn_params_for_teams(Some(params.clone()), Some(baseline));
 
     // 记录当前训练 generation,用于检测是否有新训练启动
