@@ -116,25 +116,29 @@ fn get_params_for_seat(seat: Seat) -> AdvancedBotParams {
 
 /// JS `TRAINED_PARAMS` (bot-advanced.js L49-69) — the rule-standard defaults.
 /// 房规基线：训练器(learning)起点/评估基线也以此为准（含冲刺=6 等用户房规）。
+/// 2026-09-02 基线分裂修复：f32 权重升级为 2026-08-31 训练冠军值（= advanced_params.json
+/// = CF TRAINED_PARAMS 逐键一致）。此前 Rust 线上用旧基线(first_out 0.7658)、CF 用
+/// 训练值(0.8317)，两端行为分裂。u8 房规阈值仍冻结不变。
 pub(crate) fn js_trained_params() -> AdvancedBotParams {
     AdvancedBotParams {
-        team_win_weight: 1.0,
-        first_out_weight: 0.7657717,
+        team_win_weight: 1.0285988,
+        first_out_weight: 0.8316725,
         second_out_weight: 0.9,
         yield_to_partner_bias: 1.4,
         partner_sprint_threshold: 2,
-        bomb_conserve_bias: 0.8,
-        bomb_aggression_when_enemy_low: 2.2148905,
+        bomb_conserve_bias: 0.83482033,
+        bomb_aggression_when_enemy_low: 2.2,
         enemy_low_cards_threshold: 6, // 用户房规：冲刺 = 任一对手剩 ≤6 张（JS 原值 3）
         endgame_hand_count_threshold: 6,
-        endgame_clear_hand_bias: 1.2,
+        endgame_clear_hand_bias: 1.2082484,
         proactive_play_bias: 1.1,
         low_card_dump_bias: 1.4,
-        pass_stall_penalty: 0.9,
+        pass_stall_penalty: 0.90296406,
         hand_tracker_enabled: true,
-        prob_threshold_for_bomb: 0.6,
+        prob_threshold_for_bomb: 0.56296045,
         prob_threshold_for_intercept: 0.4,
-        enable_reason_trace: true,
+        enable_reason_trace: false, // 与 CF/参数文件一致（true 仅多一条调试打印）
+        keep_bomb_bonus: 499.99548, // 2026-09-02 16:06 训练首个采纳变异（57键新冠军，bestScore 0.6665）
         ..crate::bot::plugins::advanced_bot::params::AdvancedBotParams::scoring_defaults()
     }
 }
