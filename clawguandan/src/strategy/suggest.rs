@@ -108,31 +108,13 @@ pub(crate) fn js_trained_params() -> AdvancedBotParams {
 }
 
 // ── JS 房规常量 (bot-advanced.js L14-42), 按值移植 ──────────────────────
-
+// （罚值量级已参数化 → params.dual_wild_penalty_* 等；禁令/豁免结构保持常量）
 /// JS `DUAL_WILD_HAND_ENDGAME`: 手牌 ≤ 此值视为残局（百搭/拆炸房规专用，硬编码 6）
 const DUAL_WILD_HAND_ENDGAME: usize = 6;
-/// JS `DUAL_WILD_PENALTY_MIDGAME`: 中盘双百搭同出重罚（近乎禁绝）
-const DUAL_WILD_PENALTY_MIDGAME: f32 = 600.0;
-/// JS `DUAL_WILD_PENALTY_ENDGAME`: 残局双百搭同出罚
-const DUAL_WILD_PENALTY_ENDGAME: f32 = 60.0;
 /// JS `DUAL_WILD_CANDIDATE_HAND_MAX`: 仅 movegen（JS generatePlaysOfType）使用；
 /// 本文件不枚举候选（由 `enumerate_legal_actions` 负责），保留仅为 1:1 对应。
 #[allow(dead_code)]
 const DUAL_WILD_CANDIDATE_HAND_MAX: usize = 6;
-/// JS `UPGRADED_BOMB_WILD_PENALTY_MIDGAME`: 天然炸弹贴百搭升档中盘重罚
-const UPGRADED_BOMB_WILD_PENALTY_MIDGAME: f32 = 150.0;
-/// JS `UPGRADED_BOMB_WILD_PENALTY_ENDGAME`: 升档残局轻罚
-const UPGRADED_BOMB_WILD_PENALTY_ENDGAME: f32 = 10.0;
-/// JS `WILD_ON_LEVEL_PENALTY_MIDGAME`: 百搭落级牌中盘重罚
-const WILD_ON_LEVEL_PENALTY_MIDGAME: f32 = 250.0;
-/// JS `WILD_ON_LEVEL_PENALTY_ENDGAME`: 百搭落级牌残局轻罚
-const WILD_ON_LEVEL_PENALTY_ENDGAME: f32 = 20.0;
-/// JS `WILD_PLAIN_PAIR_PENALTY_MIDGAME`: 百搭配普通单张成普通对中盘重罚
-const WILD_PLAIN_PAIR_PENALTY_MIDGAME: f32 = 300.0;
-/// JS `WILD_PAIR_PENALTY_ENDGAME`: 百搭配对子残局轻罚
-const WILD_PAIR_PENALTY_ENDGAME: f32 = 15.0;
-/// JS `BARE_DUAL_WILD_EXTRA_PENALTY`: 裸出双百搭额外加重
-const BARE_DUAL_WILD_EXTRA_PENALTY: f32 = 200.0;
 
 // JS 内联分值常量（scorePlay base 100 / scoreLeadPlay base 50 / 清空+10000）
 // penalty×20 缩放已参数化 → params.split_penalty_scale（路线图②）
@@ -1660,19 +1642,18 @@ fn score_follow(
 
         let min_opp_remaining = p.min_opp_remaining;
         if is_last_play {
-            score += 20.0; // Bonus: clearing hand with bomb
+            score += p.params.last_play_clear_bonus; // Bonus: clearing hand with bomb
         } else if min_opp_remaining <= 6 {
-            score += 15.0; // 对手≤6张，炸弹拦截是好选择
+            score += p.params.intercept_sprint_bonus; // 对手≤6张，炸弹拦截是好选择
         } else if combos.bomb_count >= 3 && !is_endgame {
-            score -= 10.0; // 3+炸弹，留至少1个到残局
+            score -= p.params.bomb_keep_many; // 3+炸弹，留至少1个到残局
         }
 
-        // 只有1-2个炸弹时，非残局非对手冲刺不能用炸弹
+        // 房规（用户 2026-09-03）：2 炸时用炸不扣分（1 炸仍保留罚）；
+        // 仅 1 个炸弹时，非残局非对手冲刺不能用炸弹
         if !is_endgame && !is_last_play && min_opp_remaining > 6 {
             if combos.bomb_count < 2 {
                 score -= p.params.bomb_keep_single; // 仅1个炸弹，绝对保留
-            } else if combos.bomb_count < 3 {
-                score -= p.params.bomb_keep_double; // 2个炸弹，至少留1个
             }
         }
 
@@ -1720,9 +1701,10 @@ fn score_follow(
                 match top.combination.kind {
                     CombinationKind::Ordinary(OrdinaryKind::Single) => score -= p.params.bomb_over_single,
                     CombinationKind::Ordinary(OrdinaryKind::Pair) => score -= p.params.bomb_over_pair,
+                    // 房规（用户 2026-09-03）：炸弹压顺子/钢板/木板不扣分
                     CombinationKind::Ordinary(OrdinaryKind::Straight)
                     | CombinationKind::Ordinary(OrdinaryKind::Tube)
-                    | CombinationKind::Ordinary(OrdinaryKind::Plate) => score -= p.params.bomb_over_run,
+                    | CombinationKind::Ordinary(OrdinaryKind::Plate) => {}
                     // 炸弹可以压三张/三带二，不扣分
                     _ => {}
                 }
@@ -1754,8 +1736,9 @@ fn score_follow(
                 | CombinationKind::Ordinary(OrdinaryKind::Tube) => score += p.params.wild_run_bonus,
                 CombinationKind::Ordinary(OrdinaryKind::FullHouse) => {
                     // 房规（用户 2026-09-03）：三张=对子+百搭（2天然+1百搭）、对子天然
-                    // = 适当惩罚（替代原 +30）；清空手牌豁免照旧 +30；残局轻罚。
+                    // = 适当惩罚（替代原 +30）；清空手牌豁免照旧；残局轻罚。
                     // 百搭凑对子（三张天然）的三带二已被禁止过滤，仅豁免场景到此处。
+                    // 用户 2026-09-03：百搭成三带二不奖励（原 +10 移除）。
                     let (wild_triple_fh, _) = fh_wild_shape(play_cards, p);
                     if wild_triple_fh && play_cards.len() < my_remaining {
                         if is_endgame {
@@ -1763,11 +1746,10 @@ fn score_follow(
                         } else {
                             score -= 300.0; // 中盘适当惩罚
                         }
-                    } else {
-                        score += p.params.wild_fh_bonus; // 百搭使用优先级最低：炸弹/同花顺 > 钢板/木板/杂顺子 > 三带二
                     }
                 }
-                CombinationKind::Ordinary(OrdinaryKind::Triple) => score += p.params.wild_triple_bonus,
+                // 用户 2026-09-03：百搭成三张不奖励（原 +20 移除）
+                CombinationKind::Ordinary(OrdinaryKind::Triple) => {}
                 _ => {}
             }
         }
@@ -1791,9 +1773,9 @@ fn score_follow(
         if naturals_already_bomb && naturals[0].rank != p.level_rank {
             if p.min_opp_remaining > DUAL_WILD_HAND_ENDGAME {
                 if my_remaining <= DUAL_WILD_HAND_ENDGAME {
-                    score -= UPGRADED_BOMB_WILD_PENALTY_ENDGAME; // 残局升档：轻罚
+                    score -= p.params.upgraded_bomb_wild_end; // 残局升档：轻罚
                 } else {
-                    score -= UPGRADED_BOMB_WILD_PENALTY_MIDGAME; // 中盘无场景升档：浪费重罚
+                    score -= p.params.upgraded_bomb_wild_mid; // 中盘无场景升档：浪费重罚
                 }
             }
         }
@@ -1835,7 +1817,7 @@ fn score_follow(
     // ── Team awareness: 联邦接风重奖 (JS 947-957) ──
     let top_is_teammate = top.seat == p.teammate_seat;
     if top_is_teammate && !is_bomb {
-        score += 300.0; // 给联邦接风，重奖！
+        score += p.params.partner_feng_bonus; // 给联邦接风，重奖！
     }
     if p.teammate_remaining == 1 && !is_bomb {
         score += 10.0;
@@ -1875,7 +1857,7 @@ fn score_follow(
             CombinationKind::Ordinary(OrdinaryKind::Single)
             | CombinationKind::Ordinary(OrdinaryKind::Pair) => {
                 if play_combo.primary > 10 {
-                    score += 15.0; // 出大牌阻止对手送牌
+                    score += p.params.block_enemy_bonus; // 出大牌阻止对手送牌
                 }
             }
             _ => {
@@ -1904,9 +1886,9 @@ fn score_follow(
         });
         if !finishing_play && same_rank_type && touches_level_natural {
             score -= if endgame_hand {
-                WILD_ON_LEVEL_PENALTY_ENDGAME
+                p.params.wild_on_level_end
             } else {
-                WILD_ON_LEVEL_PENALTY_MIDGAME
+                p.params.wild_on_level_mid
             };
         }
 
@@ -1919,9 +1901,9 @@ fn score_follow(
             });
         if !finishing_play && lvl_face_bomb {
             score -= if endgame_hand {
-                DUAL_WILD_PENALTY_ENDGAME
+                p.params.dual_wild_penalty_end
             } else {
-                DUAL_WILD_PENALTY_MIDGAME
+                p.params.dual_wild_penalty_mid
             };
         }
 
@@ -1949,9 +1931,9 @@ fn score_follow(
                 let pair_rank = pair_naturals.first().map(|m| m.rank).unwrap_or(p.level_rank);
                 if pair_rank != p.level_rank {
                     score -= if endgame_hand {
-                        WILD_PAIR_PENALTY_ENDGAME
+                        p.params.wild_pair_penalty_end
                     } else {
-                        WILD_PLAIN_PAIR_PENALTY_MIDGAME
+                        p.params.wild_plain_pair_mid
                     };
                 }
             }
@@ -1996,12 +1978,12 @@ fn score_follow(
             score -= 10.0; // 残局唯一合法用法：轻微不鼓励
         } else {
             score -= if dw_endgame {
-                DUAL_WILD_PENALTY_ENDGAME
+                p.params.dual_wild_penalty_end
             } else {
-                DUAL_WILD_PENALTY_MIDGAME
+                p.params.dual_wild_penalty_mid
             };
             if bare_dual {
-                score -= BARE_DUAL_WILD_EXTRA_PENALTY; // 裸双百搭：额外重罚
+                score -= p.params.bare_dual_wild_extra; // 裸双百搭：额外重罚
             }
         }
     }
@@ -2051,7 +2033,7 @@ fn score_follow(
 
     // ── 房规：接风重奖——队友已全部出完 (JS 1120-1125) ──
     if !is_last_play && p.teammate_remaining == 0 {
-        score += 180.0; // 为队友接风：压制敌人拿回出牌权，重奖
+        score += p.params.partner_feng_lead_bonus; // 为队友接风：压制敌人拿回出牌权，重奖
     }
 
     // ── 房规：避免把自己打到「只剩小单张」(JS 1128-1148) ──
@@ -2082,7 +2064,7 @@ fn score_follow(
         }
         let sm_vals: Vec<usize> = rest.values().copied().collect();
         if !sm_has_bad && sm_vals.len() >= 3 && sm_vals.iter().all(|&n| n == 1) {
-            score -= sm_vals.len() as f32 * 22.0;
+            score -= sm_vals.len() as f32 * p.params.avoid_small_singles_each;
         }
     }
 
@@ -2206,7 +2188,7 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
                 | CombinationKind::Ordinary(OrdinaryKind::Plate)
                 | CombinationKind::Ordinary(OrdinaryKind::FullHouse)
         ) {
-            score += 15.0; // Prefer combos to help teammate
+            score += p.params.teammate_combo_bonus; // Prefer combos to help teammate
         }
     }
 
@@ -2228,14 +2210,14 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
             if play_combo.primary <= 10 {
                 score -= 30.0; // 不出小单张，对手可能吃单张
             } else {
-                score += 15.0; // 出大单张阻止对手
+                score += p.params.block_enemy_bonus; // 出大单张阻止对手
             }
         }
         if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Pair)) {
             if play_combo.primary <= 10 {
                 score -= 15.0; // 不出小对子
             } else {
-                score += 15.0; // 出大对子阻止对手
+                score += p.params.block_enemy_bonus; // 出大对子阻止对手
             }
         }
         if matches!(
@@ -2246,17 +2228,17 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
                 | CombinationKind::Ordinary(OrdinaryKind::FullHouse)
         ) && !is_bomb
         {
-            score += 20.0; // 出组合牌型让对手拆牌，更难接
+            score += p.params.combo_shape_bonus; // 出组合牌型让对手拆牌，更难接
         }
     }
 
     // ── Endgame: play small cards first, keep big cards (JS 1623-1634) ──
     if is_endgame && !is_bomb {
-        score += play_cards.len() as f32 * 5.0;
-        score -= play_combo.primary as f32 * 1.5;
+        score += play_cards.len() as f32 * p.params.lead_len_step_endgame;
+        score -= play_combo.primary as f32 * p.params.lead_primary_step_endgame;
     } else {
-        score += play_cards.len() as f32 * 8.0;
-        score -= play_combo.primary as f32 * 0.5;
+        score += play_cards.len() as f32 * p.params.lead_len_step;
+        score -= play_combo.primary as f32 * p.params.lead_primary_step;
     }
 
     // ── 残局散牌处理：重奖移除单张的出牌 (JS 1638-1686) ──
@@ -2333,7 +2315,7 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
             }
         }
         if max_consecutive >= 3 {
-            score += 30.0; // 单牌能组成顺子，奖励
+            score += p.params.straight_build_bonus; // 单牌能组成顺子，奖励
         }
     }
 
@@ -2352,7 +2334,7 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
         if ratio_after > 0.6 {
             score -= 150.0; // Heavy penalty: scattered singles
         } else if ratio_after > 0.4 {
-            score -= 80.0; // Medium penalty
+            score -= p.params.many_singles_penalty; // Medium penalty
         } else if ratio_after > 0.2 {
             score -= 20.0; // Light penalty
         }
@@ -2362,15 +2344,15 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
     if !is_bomb {
         let primary = play_combo.primary;
         if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Single)) {
-            score += 20.0; // 单张优先出
+            score += p.params.single_lead_bonus; // 单张优先出
             if primary <= 10 {
-                score += 15.0; // 小单张更优先
+                score += p.params.small_single_lead_bonus; // 小单张更优先
             }
         }
         if primary > 10 {
             score -= 30.0; // 大牌绝不能先出
         } else {
-            score += 10.0; // 小牌奖励
+            score += p.params.small_card_lead_bonus; // 小牌奖励
         }
     }
 
@@ -2388,6 +2370,7 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
                 | CombinationKind::Ordinary(OrdinaryKind::Tube) => score += p.params.wild_run_bonus,
                 CombinationKind::Ordinary(OrdinaryKind::FullHouse) => {
                     // 房规（用户 2026-09-03）：三张=对子+百搭、对子天然 = 适当惩罚（替代 +30）。
+                    // 用户 2026-09-03：百搭成三带二不奖励（原 +10 移除）。
                     let (wild_triple_fh, _) = fh_wild_shape(play_cards, p);
                     if wild_triple_fh && play_cards.len() < my_remaining {
                         if my_remaining <= 6 {
@@ -2395,11 +2378,10 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
                         } else {
                             score -= 300.0; // 中盘适当惩罚
                         }
-                    } else {
-                        score += p.params.wild_fh_bonus; // 百搭使用优先级最低：炸弹/同花顺 > 钢板/木板/杂顺子 > 三带二
                     }
                 }
-                CombinationKind::Ordinary(OrdinaryKind::Triple) => score += p.params.wild_triple_bonus,
+                // 用户 2026-09-03：百搭成三张不奖励（原 +20 移除）
+                CombinationKind::Ordinary(OrdinaryKind::Triple) => {}
                 _ => {}
             }
         }
@@ -2423,9 +2405,9 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
         if naturals_already_bomb && naturals[0].rank != p.level_rank {
             if p.min_opp_remaining > DUAL_WILD_HAND_ENDGAME {
                 if my_remaining <= DUAL_WILD_HAND_ENDGAME {
-                    score -= UPGRADED_BOMB_WILD_PENALTY_ENDGAME;
+                    score -= p.params.upgraded_bomb_wild_end;
                 } else {
-                    score -= UPGRADED_BOMB_WILD_PENALTY_MIDGAME;
+                    score -= p.params.upgraded_bomb_wild_mid;
                 }
             }
         }
@@ -2448,9 +2430,9 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
         });
         if !finishing_play && same_rank_type && touches_level_natural {
             score -= if endgame_hand {
-                WILD_ON_LEVEL_PENALTY_ENDGAME
+                p.params.wild_on_level_end
             } else {
-                WILD_ON_LEVEL_PENALTY_MIDGAME
+                p.params.wild_on_level_mid
             };
         }
 
@@ -2462,9 +2444,9 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
             });
         if !finishing_play && lvl_face_bomb {
             score -= if endgame_hand {
-                DUAL_WILD_PENALTY_ENDGAME
+                p.params.dual_wild_penalty_end
             } else {
-                DUAL_WILD_PENALTY_MIDGAME
+                p.params.dual_wild_penalty_mid
             };
         }
 
@@ -2491,9 +2473,9 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
                 let pair_rank = pair_naturals.first().map(|m| m.rank).unwrap_or(p.level_rank);
                 if pair_rank != p.level_rank {
                     score -= if endgame_hand {
-                        WILD_PAIR_PENALTY_ENDGAME
+                        p.params.wild_pair_penalty_end
                     } else {
-                        WILD_PLAIN_PAIR_PENALTY_MIDGAME
+                        p.params.wild_plain_pair_mid
                     };
                 }
             }
@@ -2537,12 +2519,12 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
             score -= 10.0; // 残局唯一合法用法：轻微不鼓励
         } else {
             score -= if dw_endgame {
-                DUAL_WILD_PENALTY_ENDGAME
+                p.params.dual_wild_penalty_end
             } else {
-                DUAL_WILD_PENALTY_MIDGAME
+                p.params.dual_wild_penalty_mid
             };
             if bare_dual {
-                score -= BARE_DUAL_WILD_EXTRA_PENALTY; // 裸双百搭：额外重罚
+                score -= p.params.bare_dual_wild_extra; // 裸双百搭：额外重罚
             }
         }
     }
@@ -2624,7 +2606,7 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
 
     // ── 房规：接风重奖——队友已全部出完，本圈由我接风先出 (JS 1933-1937) ──
     if p.teammate_remaining == 0 {
-        score += 120.0; // 接风首出权重奖
+        score += p.params.partner_feng_first_bonus; // 接风首出权重奖
     }
 
     // ── 房规：空出炸弹重罚 (JS 1940-1960) ──
@@ -2686,7 +2668,7 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
         }
         let sm_vals: Vec<usize> = rest.values().copied().collect();
         if !sm_has_bad && sm_vals.len() >= 3 && sm_vals.iter().all(|&n| n == 1) {
-            score -= sm_vals.len() as f32 * 22.0; // 剩3张-66 … 剩5张-110
+            score -= sm_vals.len() as f32 * p.params.avoid_small_singles_each; // 剩3张-66 … 剩5张-110
         }
     }
 
@@ -2708,7 +2690,7 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
                 junk_removed += 1;
             }
         }
-        score += junk_removed as f32 * 15.0;
+        score += junk_removed as f32 * p.params.solver_junk_bonus;
     }
 
     // ── 清空手牌重奖 (JS 1987-1989) ──

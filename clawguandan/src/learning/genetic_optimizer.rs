@@ -237,22 +237,49 @@ fn crossover(parent1: &AdvancedBotParams, parent2: &AdvancedBotParams) -> Advanc
     if rng.random_bool(0.5) { child.endgame_hand_count_threshold = parent2.endgame_hand_count_threshold; }
 
     // 打分常数（路线图②扩大参数面）：与 optimizer.rs 变异表对齐
+    // （用户 2026-09-03：bomb_keep_double/bomb_over_run/wild_triple_bonus/wild_fh_bonus
+    //   已按房规调整移除——不奖不罚，不再入参）
     if rng.random_bool(0.5) { child.bomb_keep_single = parent2.bomb_keep_single; }
-    if rng.random_bool(0.5) { child.bomb_keep_double = parent2.bomb_keep_double; }
     if rng.random_bool(0.5) { child.last_bomb_penalty = parent2.last_bomb_penalty; }
     if rng.random_bool(0.5) { child.bomb_over_single = parent2.bomb_over_single; }
     if rng.random_bool(0.5) { child.bomb_over_pair = parent2.bomb_over_pair; }
-    if rng.random_bool(0.5) { child.bomb_over_run = parent2.bomb_over_run; }
     if rng.random_bool(0.5) { child.wild_bomb_bonus = parent2.wild_bomb_bonus; }
     if rng.random_bool(0.5) { child.wild_run_bonus = parent2.wild_run_bonus; }
-    if rng.random_bool(0.5) { child.wild_triple_bonus = parent2.wild_triple_bonus; }
-    if rng.random_bool(0.5) { child.wild_fh_bonus = parent2.wild_fh_bonus; }
     if rng.random_bool(0.5) { child.endgame_single_removal = parent2.endgame_single_removal; }
     if rng.random_bool(0.5) { child.endgame_small_single_removal = parent2.endgame_small_single_removal; }
     if rng.random_bool(0.5) { child.empty_lead_bomb_penalty = parent2.empty_lead_bomb_penalty; }
     if rng.random_bool(0.5) { child.split_penalty_scale = parent2.split_penalty_scale; }
     if rng.random_bool(0.5) { child.keep_bomb_bonus = parent2.keep_bomb_bonus; }
     if rng.random_bool(0.5) { child.solver_trick_penalty = parent2.solver_trick_penalty; }
+    if rng.random_bool(0.5) { child.bomb_keep_many = parent2.bomb_keep_many; }
+    if rng.random_bool(0.5) { child.intercept_sprint_bonus = parent2.intercept_sprint_bonus; }
+    if rng.random_bool(0.5) { child.last_play_clear_bonus = parent2.last_play_clear_bonus; }
+    if rng.random_bool(0.5) { child.combo_shape_bonus = parent2.combo_shape_bonus; }
+    if rng.random_bool(0.5) { child.partner_feng_bonus = parent2.partner_feng_bonus; }
+    if rng.random_bool(0.5) { child.partner_feng_lead_bonus = parent2.partner_feng_lead_bonus; }
+    if rng.random_bool(0.5) { child.partner_feng_first_bonus = parent2.partner_feng_first_bonus; }
+    if rng.random_bool(0.5) { child.teammate_combo_bonus = parent2.teammate_combo_bonus; }
+    if rng.random_bool(0.5) { child.block_enemy_bonus = parent2.block_enemy_bonus; }
+    if rng.random_bool(0.5) { child.straight_build_bonus = parent2.straight_build_bonus; }
+    if rng.random_bool(0.5) { child.many_singles_penalty = parent2.many_singles_penalty; }
+    if rng.random_bool(0.5) { child.single_lead_bonus = parent2.single_lead_bonus; }
+    if rng.random_bool(0.5) { child.small_single_lead_bonus = parent2.small_single_lead_bonus; }
+    if rng.random_bool(0.5) { child.small_card_lead_bonus = parent2.small_card_lead_bonus; }
+    if rng.random_bool(0.5) { child.avoid_small_singles_each = parent2.avoid_small_singles_each; }
+    if rng.random_bool(0.5) { child.lead_len_step = parent2.lead_len_step; }
+    if rng.random_bool(0.5) { child.lead_len_step_endgame = parent2.lead_len_step_endgame; }
+    if rng.random_bool(0.5) { child.lead_primary_step = parent2.lead_primary_step; }
+    if rng.random_bool(0.5) { child.lead_primary_step_endgame = parent2.lead_primary_step_endgame; }
+    if rng.random_bool(0.5) { child.solver_junk_bonus = parent2.solver_junk_bonus; }
+    if rng.random_bool(0.5) { child.dual_wild_penalty_mid = parent2.dual_wild_penalty_mid; }
+    if rng.random_bool(0.5) { child.dual_wild_penalty_end = parent2.dual_wild_penalty_end; }
+    if rng.random_bool(0.5) { child.upgraded_bomb_wild_mid = parent2.upgraded_bomb_wild_mid; }
+    if rng.random_bool(0.5) { child.upgraded_bomb_wild_end = parent2.upgraded_bomb_wild_end; }
+    if rng.random_bool(0.5) { child.wild_on_level_mid = parent2.wild_on_level_mid; }
+    if rng.random_bool(0.5) { child.wild_on_level_end = parent2.wild_on_level_end; }
+    if rng.random_bool(0.5) { child.wild_plain_pair_mid = parent2.wild_plain_pair_mid; }
+    if rng.random_bool(0.5) { child.wild_pair_penalty_end = parent2.wild_pair_penalty_end; }
+    if rng.random_bool(0.5) { child.bare_dual_wild_extra = parent2.bare_dual_wild_extra; }
 
     child
 }
@@ -311,10 +338,6 @@ fn mutate(params: &AdvancedBotParams, rate: f32, step_size: f32) -> AdvancedBotP
     }
     if rng.random_bool(r) {
         let delta = rng.random_range(-step_size..step_size);
-        mutated.bomb_keep_double = (mutated.bomb_keep_double + delta).clamp(1.0, 2000.0);
-    }
-    if rng.random_bool(r) {
-        let delta = rng.random_range(-step_size..step_size);
         mutated.last_bomb_penalty = (mutated.last_bomb_penalty + delta).clamp(1.0, 2000.0);
     }
     if rng.random_bool(r) {
@@ -327,23 +350,11 @@ fn mutate(params: &AdvancedBotParams, rate: f32, step_size: f32) -> AdvancedBotP
     }
     if rng.random_bool(r) {
         let delta = rng.random_range(-step_size..step_size);
-        mutated.bomb_over_run = (mutated.bomb_over_run + delta).clamp(1.0, 2000.0);
-    }
-    if rng.random_bool(r) {
-        let delta = rng.random_range(-step_size..step_size);
         mutated.wild_bomb_bonus = (mutated.wild_bomb_bonus + delta).clamp(1.0, 2000.0);
     }
     if rng.random_bool(r) {
         let delta = rng.random_range(-step_size..step_size);
         mutated.wild_run_bonus = (mutated.wild_run_bonus + delta).clamp(1.0, 2000.0);
-    }
-    if rng.random_bool(r) {
-        let delta = rng.random_range(-step_size..step_size);
-        mutated.wild_triple_bonus = (mutated.wild_triple_bonus + delta).clamp(1.0, 2000.0);
-    }
-    if rng.random_bool(r) {
-        let delta = rng.random_range(-step_size..step_size);
-        mutated.wild_fh_bonus = (mutated.wild_fh_bonus + delta).clamp(1.0, 2000.0);
     }
     if rng.random_bool(r) {
         let delta = rng.random_range(-step_size..step_size);
@@ -360,6 +371,122 @@ fn mutate(params: &AdvancedBotParams, rate: f32, step_size: f32) -> AdvancedBotP
     if rng.random_bool(r) {
         let delta = rng.random_range(-step_size..step_size);
         mutated.split_penalty_scale = (mutated.split_penalty_scale + delta).clamp(5.0, 100.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.bomb_keep_many = (mutated.bomb_keep_many + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.intercept_sprint_bonus = (mutated.intercept_sprint_bonus + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.last_play_clear_bonus = (mutated.last_play_clear_bonus + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.combo_shape_bonus = (mutated.combo_shape_bonus + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.partner_feng_bonus = (mutated.partner_feng_bonus + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.partner_feng_lead_bonus = (mutated.partner_feng_lead_bonus + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.partner_feng_first_bonus = (mutated.partner_feng_first_bonus + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.teammate_combo_bonus = (mutated.teammate_combo_bonus + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.block_enemy_bonus = (mutated.block_enemy_bonus + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.straight_build_bonus = (mutated.straight_build_bonus + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.many_singles_penalty = (mutated.many_singles_penalty + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.single_lead_bonus = (mutated.single_lead_bonus + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.small_single_lead_bonus = (mutated.small_single_lead_bonus + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.small_card_lead_bonus = (mutated.small_card_lead_bonus + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.avoid_small_singles_each = (mutated.avoid_small_singles_each + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.lead_len_step = (mutated.lead_len_step + delta).clamp(0.0, 100.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.lead_len_step_endgame = (mutated.lead_len_step_endgame + delta).clamp(0.0, 100.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.lead_primary_step = (mutated.lead_primary_step + delta).clamp(0.0, 50.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.lead_primary_step_endgame = (mutated.lead_primary_step_endgame + delta).clamp(0.0, 50.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.solver_junk_bonus = (mutated.solver_junk_bonus + delta).clamp(0.0, 500.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.dual_wild_penalty_mid = (mutated.dual_wild_penalty_mid + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.dual_wild_penalty_end = (mutated.dual_wild_penalty_end + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.upgraded_bomb_wild_mid = (mutated.upgraded_bomb_wild_mid + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.upgraded_bomb_wild_end = (mutated.upgraded_bomb_wild_end + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.wild_on_level_mid = (mutated.wild_on_level_mid + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.wild_on_level_end = (mutated.wild_on_level_end + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.wild_plain_pair_mid = (mutated.wild_plain_pair_mid + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.wild_pair_penalty_end = (mutated.wild_pair_penalty_end + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.bare_dual_wild_extra = (mutated.bare_dual_wild_extra + delta).clamp(1.0, 2000.0);
     }
     if rng.random_bool(r) {
         let delta = rng.random_range(-step_size..step_size);
