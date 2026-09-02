@@ -158,6 +158,21 @@ const BANNED_SCORE: f32 = 99999.0;
 /// 炸弹/同花顺时，把百搭用进更低级组合的冻结惩罚（房规禁令不入训练面）。
 const WILD_CONSERVATION_PENALTY: f32 = 150.0;
 
+// ── 房规（用户 2026-09-03）：残局报牌防走/送队友（领出侧，冻结不入训练面）──
+// 原弱化版（+40/−50/−20）被其他分项淹没导致"房规失效"，本次按用户口径原位加强。
+/// 对手剩 1 张：领出单张强阻尼（防对手最后一张直接走人）；不得不发时从大往小
+const OPP_LAST_CARD_SINGLE_PENALTY: f32 = 400.0;
+/// 对手剩 2 张：领出对子强阻尼（防对手对子直接走人）→ 改拆对发单张或领其他牌型
+const OPP_LAST_TWO_PAIR_PENALTY: f32 = 400.0;
+/// 队友剩 1/2 张：送单张/对子强奖励
+const TEAMMATE_FEED_BONUS: f32 = 400.0;
+/// 从小送/从大发的 primary 倾斜系数（primary: 3=3…A=14, 2=15, 王=16/17）
+const FEED_RANK_TILT: f32 = 8.0;
+/// 对手剩 2 张：领出单张净鼓励（拆对发单张/散单——对手剩两张接不走单张）
+const OPP_TWO_SINGLE_NUDGE: f32 = 60.0;
+/// 对手剩 1 张：领出对子净鼓励（对手单张接不走对子，最安全的压制）
+const OPP_ONE_PAIR_NUDGE: f32 = 120.0;
+
 // ── Card helpers (cards.js getRank / rankValue / NATURAL_RANK 等价物) ───
 
 /// Pre-parsed card metadata for hot loops.
@@ -538,6 +553,7 @@ fn split_penalty(
     allow_endgame_split: bool,
     unlock_pair_for_single: bool,
     unlock_triple_for_pair: bool,
+    feed_exempt: bool,
 ) -> u32 {
     // 房规（用户 2026-08-30）：条件解锁——对手连续≥2轮领单张无人接 → 允许拆对出单张；
     // 连续≥2轮领对子无人接 → 允许拆三张同出对子。优先级：先拆"孤"（非木板/钢板成员），
@@ -622,6 +638,14 @@ fn split_penalty(
                 // 房规豁免（用户 2026-08-30）：残局+手牌无单张+队友本轮已过牌 → 允许拆对子
                 if allow_endgame_split {
                     continue;
+                }
+                // 房规（用户 2026-09-03）：报牌豁免——对手剩≤2 或队友剩 1 时，领出拆对
+                // 发单张放行（小罚分分级：连三对成员 +10；拆小对罚更小 → 天然优先拆小对）。
+                // 仅领出路径传入；跟牌路径的既有拆对房规不受影响。
+                if feed_exempt
+                    && matches!(play_kind, CombinationKind::Ordinary(OrdinaryKind::Single))
+                {
+                    return u32::from(is_tube_part) * 10 + u32::from(14u8.saturating_sub(rank));
                 }
                 // 条件解锁（用户 2026-08-30）：对手连续≥2轮领单张无人接 → 拆对子出单张
                 if unlock_pair_for_single && matches!(play_kind, CombinationKind::Ordinary(OrdinaryKind::Single)) {
@@ -1724,6 +1748,7 @@ fn score_follow(
         allow_endgame_split,
         unlock_pair_for_single,
         unlock_triple_for_pair,
+        false, // 报牌拆对豁免仅限领出路径（跟牌侧旧房规不变）
     ) as f32;
     if !play_is_bomb {
         if bomb_split_verdict == BombSplitVerdict::Exempt && penalty >= BANNED_SCORE {
@@ -2218,17 +2243,24 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
     let my_remaining = p.my_remaining;
     let is_endgame = p.is_endgame;
     let combos = &p.combos;
+    // 房规（用户 2026-09-03）：报牌场景（任一活跃对手剩≤2 或队友剩 1/2）——
+    // 此时打法由报牌房规主导，残局求解器的"最少墩数"规划让位（它只规划自己清牌，
+    // 不理解"防对手走/送队友"）。非报牌场景求解器照常。
+    let feed_scenario =
+        p.min_opp_remaining <= 2 || (p.teammate_remaining > 0 && p.teammate_remaining <= 2);
     // 残局求解器激活条件（路线图③）：手牌 ≤6 张、非清空领出——此时由求解器的
     // "打完后剩几墩"规划接管，旧的残局单张奖励/整形项让位（见下方 solver_active 守卫）。
-    let solver_active = my_remaining <= 6 && play_cards.len() < my_remaining;
+    let solver_active = my_remaining <= 6 && play_cards.len() < my_remaining && !feed_scenario;
 
     // ── Hand combo analysis & split penalty (JS 1473-1489) ──
     let bomb_split_verdict =
         classify_bomb_split(play_cards, &p.my_hand, kind, my_remaining);
     let play_is_bomb = play_combo.class() == CombinationClass::Bomb;
-    // 领出路径：拆对豁免不适用（房规豁免仅限跟牌场景，用户 2026-08-30）
+    // 领出路径：拆对豁免不适用（房规豁免仅限跟牌场景，用户 2026-08-30）；
+    // 例外（用户 2026-09-03 报牌房规）：对手剩≤2 或队友剩 1 → 允许拆对发单张。
+    let feed_exempt = feed_scenario;
     let mut penalty =
-        split_penalty(play_cards, combos, p.level_nat, p.has_level_card_or_joker, kind, false, false, false) as f32;
+        split_penalty(play_cards, combos, p.level_nat, p.has_level_card_or_joker, kind, false, false, false, feed_exempt) as f32;
     if !play_is_bomb {
         if bomb_split_verdict == BombSplitVerdict::Exempt && penalty >= BANNED_SCORE {
             penalty = 0.0; // 房规豁免：放行拆炸
@@ -2297,16 +2329,19 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
     }
 
     // ── Team awareness: teammate sprinting (JS 1550-1571) ──
+    // 房规（用户 2026-09-03，原位加强）：队友剩 1 → 发小单张送；剩 2 → 发小对子送。
     let teammate_remaining = p.teammate_remaining;
     if teammate_remaining == 1 {
         if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Single)) {
-            score += 40.0; // Strongly prefer singles to feed teammate
+            // 强奖励 + 从小单张开始（primary 越小加分越多；+400 远超 +40 旧值）
+            score += TEAMMATE_FEED_BONUS - play_combo.primary as f32 * FEED_RANK_TILT;
         } else if !is_bomb {
             score -= 20.0; // Discourage non-single plays when teammate has 1 card
         }
     } else if teammate_remaining == 2 {
         if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Pair)) {
-            score += 40.0; // Strongly prefer pairs to feed teammate
+            // 强奖励 + 从小对子开始送
+            score += TEAMMATE_FEED_BONUS - play_combo.primary as f32 * FEED_RANK_TILT;
         }
     } else if teammate_remaining == 3 {
         if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Triple)) {
@@ -2326,17 +2361,27 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
     }
 
     // ── Opponent interception: opponent sprinting (JS 1575-1619) ──
+    // 房规（用户 2026-09-03，原位加强）：对手剩 1 → 不发单张（不得不发从大往小）；
+    // 对手剩 2 → 不发对子（改拆对发单张或领其他牌型）。
     let min_opp_remaining = p.min_opp_remaining;
     if min_opp_remaining == 1 {
         if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Single)) {
-            score -= 50.0; // NEVER lead singles when opponent has 1 card
+            // 强阻尼 + 不得不发时从大往小（primary 越大罚越轻）
+            score -= OPP_LAST_CARD_SINGLE_PENALTY;
+            score += play_combo.primary as f32 * FEED_RANK_TILT;
+        }
+        if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Pair)) {
+            score += OPP_ONE_PAIR_NUDGE; // 对手单张接不走对子——最安全的压制
         }
         if !is_bomb {
             score += 10.0; // Prefer non-bomb plays to intercept
         }
     } else if min_opp_remaining == 2 {
         if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Pair)) {
-            score -= 20.0; // Avoid leading pairs when opponent has 2 cards
+            score -= OPP_LAST_TWO_PAIR_PENALTY; // 防对手对子直接走人
+        }
+        if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Single)) {
+            score += OPP_TWO_SINGLE_NUDGE; // 拆对发单张/散单——对手两张接不走单张
         }
     } else if min_opp_remaining <= 6 {
         if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Single)) {
@@ -2885,12 +2930,12 @@ mod tests {
         let play = vec!["♠5".to_string()];
         let kind = CombinationKind::Ordinary(OrdinaryKind::Single);
         assert_eq!(
-            split_penalty(&play, &combos, 2, false, &kind, true, false, false),
+            split_penalty(&play, &combos, 2, false, &kind, true, false, false, false),
             0,
             "flag=true (残局+无单张+队友过牌) must allow pair split"
         );
         assert_eq!(
-            split_penalty(&play, &combos, 2, false, &kind, false, false, false),
+            split_penalty(&play, &combos, 2, false, &kind, false, false, false, false),
             BANNED_SCORE_U32,
             "flag=false must keep the absolute ban"
         );
@@ -2900,12 +2945,12 @@ mod tests {
         let combos3 = analyze_hand_combos(&hand3, ctx());
         let play3 = vec!["♠7".to_string()];
         assert_eq!(
-            split_penalty(&play3, &combos3, 2, false, &kind, true, false, false),
+            split_penalty(&play3, &combos3, 2, false, &kind, true, false, false, false),
             0,
             "flag=true must allow triple split"
         );
         assert_eq!(
-            split_penalty(&play3, &combos3, 2, false, &kind, false, false, false),
+            split_penalty(&play3, &combos3, 2, false, &kind, false, false, false, false),
             BANNED_SCORE_U32,
             "flag=false must keep the triple-split ban"
         );
@@ -4317,6 +4362,46 @@ mod tests {
         );
         let p2 = pctx_of(&st2, Seat::E);
         assert!(wilds_could_form_bomb_or_sf(&p2, &["♦K".to_string()]));
+    }
+
+    #[test]
+    fn opp_one_card_avoid_single_lead() {
+        // 房规（2026-09-03）：对手 N 剩 1 张 → 不得领单张（发对子压制）
+        let mut st = mk_playing_state(Seat::E, vec!["♠5", "♥5", "♠K", "♥K"], None);
+        fill_seats(
+            &mut st,
+            vec!["♠3"], // N 对手剩 1 张
+            vec!["♦4", "♣4", "♦6", "♣6", "♦7", "♣7", "♦8", "♣8", "♦9"],
+            vec!["♣10", "♠J", "♥J", "♦J", "♣J", "♠Q", "♥Q", "♦Q", "♣Q"],
+        );
+        let picked = suggest_next_action(&st, Seat::E).unwrap();
+        match picked {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 2, "对手剩1张时不得领单张, picked={cards:?}");
+            }
+            other => panic!("应领出, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn teammate_one_card_feed_small_single() {
+        // 房规（2026-09-03）：队友 W 剩 1 张 → 领小单张送队友（3 优先于 K/KKK）
+        // 注：小单 3 为天然散牌；K 们构成三张（拆三张出单 K 被既有房规禁止）
+        let mut st = mk_playing_state(Seat::E, vec!["♠3", "♠K", "♥K", "♦K"], None);
+        fill_seats(
+            &mut st,
+            vec!["♠4", "♥4", "♦4", "♣4", "♠5", "♥5", "♦5", "♣5", "♠6"],
+            vec!["♥6", "♦6", "♣6", "♠7", "♥7", "♦7", "♣7", "♠8", "♥8"],
+            vec!["♣9"], // W 队友剩 1 张
+        );
+        let picked = suggest_next_action(&st, Seat::E).unwrap();
+        match picked {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 1, "队友剩1张应送单张, picked={cards:?}");
+                assert!(cards[0].ends_with('3'), "应送小单张 3, picked={cards:?}");
+            }
+            other => panic!("应领出, got {other:?}"),
+        }
     }
 
     // ══ JS 行为测试 ⑥：双百搭矩阵（残局 −10 轻罚 / 其余 −60、−600、裸出 −200）══
