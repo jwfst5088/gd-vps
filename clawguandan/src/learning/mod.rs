@@ -39,6 +39,21 @@ pub fn run_learning(
     run_learning_with_progress(matches_per_eval, iterations, output_path)
 }
 
+/// 训练保存参数后，尽力同步到 public_html/auto_params.json 镜像
+/// （CF mergeRemoteParams 每3天拉取该镜像；此前无自动同步导致镜像停留在旧值）。
+/// 仅当 `../public_html/` 目录存在时同步（服务器部署布局），本地开发静默跳过。
+fn try_sync_params_mirror(path: &str) {
+    let Ok(payload) = std::fs::read_to_string(path) else { return };
+    if !std::path::Path::new("../public_html").is_dir() {
+        return;
+    }
+    let mirror = std::path::Path::new("../public_html/auto_params.json");
+    let tmp = std::path::Path::new("../public_html/.auto_params.json.tmp");
+    if std::fs::write(tmp, payload).is_ok() {
+        let _ = std::fs::rename(tmp, mirror);
+    }
+}
+
 /// Run learning with progress updates for web UI.
 pub fn run_learning_with_progress(
     matches_per_eval: u32,
@@ -189,6 +204,7 @@ pub fn run_learning_with_progress(
                 );
                 if best.save(output_path).is_ok() {
                     println!("[learn]   -> checkpoint saved");
+                    try_sync_params_mirror(output_path);
                 }
             }
         }
@@ -204,6 +220,7 @@ pub fn run_learning_with_progress(
 
     println!("\n[learn] Self-play optimization complete. Saving to {output_path}");
     best.save(output_path)?;
+    try_sync_params_mirror(output_path);
 
     println!("[learn] Best params: {:?}", best);
     println!("[learn] Done.");
@@ -232,6 +249,7 @@ pub fn run_learning_from_logs(
 
     println!("\n[learn] Log-based optimization complete. Saving to {output_path}");
     best.save(output_path)?;
+    try_sync_params_mirror(output_path);
 
     println!("[learn] Best params: {:?}", best);
     println!("[learn] Done.");
@@ -419,7 +437,8 @@ pub fn run_genetic_learning_with_progress(
     
     println!("\n[GA] Genetic optimization complete. Saving to {output_path}");
     best.save(output_path)?;
-    
+    try_sync_params_mirror(output_path);
+
     println!("[GA] Best params: {:?}", best);
     println!("[GA] Done.");
     
@@ -490,7 +509,8 @@ pub fn run_record_learning_with_progress(
     
     println!("\n[record_learner] Record-based learning complete. Saving to {output_path}");
     best.save(output_path)?;
-    
+    try_sync_params_mirror(output_path);
+
     println!("[record_learner] Best params: {:?}", best);
     println!("[record_learner] Done.");
     
