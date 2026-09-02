@@ -65,6 +65,9 @@ impl Eq for Individual {}
 #[derive(Clone, Debug)]
 pub struct EvalResult {
     pub win_rate: f32,
+    /// 平均升级行（0..1）：赢双上+3/赢单上+2/输单上−2/被双上−3，归一化 (delta+3)/6。
+    /// 与 optimizer.rs 保持一致（路线图①，用户 2026-09-03）。
+    pub level_ev: f32,
     pub first_out_rate: f32,
     /// NS队结束时平均剩余手牌总数(S+N剩余之和)。越少越好。
     /// 直接衡量"残局剩牌"表现，缓解"最后剩小牌和单张"问题。
@@ -75,10 +78,10 @@ pub struct EvalResult {
 pub fn eval_to_score(result: &EvalResult) -> f32 {
     // 残局剩牌越少越好：clear_rate = 1 - avg_residual/27
     // (27 ≈ NS两人初始手牌总数上界，用作归一化)
-    // 权重：胜率0.5 + 头游0.2 + 残局清牌0.3
+    // 权重：升级期望0.5 + 头游0.2 + 残局清牌0.3
     // 与 optimizer.rs 保持一致，避免遗传算法训练目标与爬山算法不一致。
     let clear_rate = (1.0 - (result.avg_endgame_residual / 27.0).clamp(0.0, 1.0)).max(0.0);
-    result.win_rate * 0.5 + result.first_out_rate * 0.2 + clear_rate * 0.3
+    result.level_ev * 0.5 + result.first_out_rate * 0.2 + clear_rate * 0.3
 }
 
 fn seat_team(seat: Seat) -> TeamId {
@@ -88,7 +91,7 @@ fn seat_team(seat: Seat) -> TeamId {
     }
 }
 
-fn run_single_match(engine: &GameEngine) -> Result<Option<(TeamId, TeamId, usize)>, String> {
+fn run_single_match(engine: &GameEngine) -> Result<Option<(TeamId, TeamId, i32, usize)>, String> {
     let mut state = engine.init_table(format!("ga_{}", uuid::Uuid::new_v4()));
     let first_drawer = Seat::S;
     engine
@@ -100,11 +103,20 @@ fn run_single_match(engine: &GameEngine) -> Result<Option<(TeamId, TeamId, usize
 
     if outcome.final_phase == GamePhase::Scoring {
         if let Some(winner) = state.winner_team {
-            let first_out_team = state.hand
+            let finishing = state
+                .hand
                 .as_ref()
-                .and_then(|h| h.finishing_order.first().copied())
-                .map(seat_team)
-                .unwrap_or(winner);
+                .map(|h| h.finishing_order.clone())
+                .unwrap_or_default();
+            let first_out_team = finishing.first().copied().map(seat_team).unwrap_or(winner);
+            // 升级行：头游队为胜方；胜方二游也是本队 → 双上+3，否则单上+2；负方取负。
+            let ns_level_delta = match (finishing.first(), finishing.get(1)) {
+                (Some(f1), Some(f2)) => {
+                    let gain = if seat_team(*f2) == seat_team(*f1) { 3i32 } else { 2 };
+                    if seat_team(*f1) == TeamId::Sn { gain } else { -gain }
+                }
+                _ => 0,
+            };
             // NS队结束时剩余手牌总数(S+N)：衡量残局剩牌表现
             let ns_residual = state
                 .hand
@@ -114,7 +126,7 @@ fn run_single_match(engine: &GameEngine) -> Result<Option<(TeamId, TeamId, usize
                         + h.hands.get(&Seat::N).map(|v| v.len()).unwrap_or(0)
                 })
                 .unwrap_or(0);
-            Ok(Some((winner, first_out_team, ns_residual)))
+            Ok(Some((winner, first_out_team, ns_level_delta, ns_residual)))
         } else {
             Ok(None)
         }
@@ -136,6 +148,7 @@ fn evaluate_individual(params: &AdvancedBotParams, matches: u32) -> EvalResult {
     let mut ns_wins = 0u32;
     let mut ns_first_out = 0u32;
     let mut ns_residual_sum: usize = 0;
+    let mut ns_level_delta_sum: i32 = 0;
     let mut played = 0u32;
 
     for _ in 0..matches {
@@ -145,7 +158,7 @@ fn evaluate_individual(params: &AdvancedBotParams, matches: u32) -> EvalResult {
         }
         let engine = GameEngine::new(GameConfig { rng_seed: rand::random(), randomize_deals: false });
         match run_single_match(&engine) {
-            Ok(Some((winner, first_out_team, ns_residual))) => {
+            Ok(Some((winner, first_out_team, ns_level_delta, ns_residual))) => {
                 played += 1;
                 if winner == TeamId::Sn {
                     ns_wins += 1;
@@ -153,13 +166,15 @@ fn evaluate_individual(params: &AdvancedBotParams, matches: u32) -> EvalResult {
                 if first_out_team == TeamId::Sn {
                     ns_first_out += 1;
                 }
+                ns_level_delta_sum += ns_level_delta;
                 ns_residual_sum += ns_residual;
             }
             _ => {
                 played += 1;
-                // 失败比赛按最差情况计：NS两人满手牌未清(27)
+                // 失败比赛按最差情况计：NS两人满手牌未清(27)、升级行按被双上(−3)计
                 // 避免失败比赛被当作0张残牌而人为抬高clear_rate评分
                 ns_residual_sum += 27;
+                ns_level_delta_sum -= 3;
             }
         }
         if crate::learning::is_running_generation(my_gen) {
@@ -191,6 +206,11 @@ fn evaluate_individual(params: &AdvancedBotParams, matches: u32) -> EvalResult {
 
     EvalResult {
         win_rate,
+        level_ev: if played > 0 {
+            ((ns_level_delta_sum as f32 / played as f32) + 3.0) / 6.0
+        } else {
+            0.5
+        },
         first_out_rate,
         avg_endgame_residual,
         matches_played: played,
@@ -215,6 +235,24 @@ fn crossover(parent1: &AdvancedBotParams, parent2: &AdvancedBotParams) -> Advanc
     if rng.random_bool(0.5) { child.partner_sprint_threshold = parent2.partner_sprint_threshold; }
     if rng.random_bool(0.5) { child.enemy_low_cards_threshold = parent2.enemy_low_cards_threshold; }
     if rng.random_bool(0.5) { child.endgame_hand_count_threshold = parent2.endgame_hand_count_threshold; }
+
+    // 打分常数（路线图②扩大参数面）：与 optimizer.rs 变异表对齐
+    if rng.random_bool(0.5) { child.bomb_keep_single = parent2.bomb_keep_single; }
+    if rng.random_bool(0.5) { child.bomb_keep_double = parent2.bomb_keep_double; }
+    if rng.random_bool(0.5) { child.last_bomb_penalty = parent2.last_bomb_penalty; }
+    if rng.random_bool(0.5) { child.bomb_over_single = parent2.bomb_over_single; }
+    if rng.random_bool(0.5) { child.bomb_over_pair = parent2.bomb_over_pair; }
+    if rng.random_bool(0.5) { child.bomb_over_run = parent2.bomb_over_run; }
+    if rng.random_bool(0.5) { child.wild_bomb_bonus = parent2.wild_bomb_bonus; }
+    if rng.random_bool(0.5) { child.wild_run_bonus = parent2.wild_run_bonus; }
+    if rng.random_bool(0.5) { child.wild_triple_bonus = parent2.wild_triple_bonus; }
+    if rng.random_bool(0.5) { child.wild_fh_bonus = parent2.wild_fh_bonus; }
+    if rng.random_bool(0.5) { child.endgame_single_removal = parent2.endgame_single_removal; }
+    if rng.random_bool(0.5) { child.endgame_small_single_removal = parent2.endgame_small_single_removal; }
+    if rng.random_bool(0.5) { child.empty_lead_bomb_penalty = parent2.empty_lead_bomb_penalty; }
+    if rng.random_bool(0.5) { child.split_penalty_scale = parent2.split_penalty_scale; }
+    if rng.random_bool(0.5) { child.keep_bomb_bonus = parent2.keep_bomb_bonus; }
+    if rng.random_bool(0.5) { child.solver_trick_penalty = parent2.solver_trick_penalty; }
 
     child
 }
@@ -264,6 +302,72 @@ fn mutate(params: &AdvancedBotParams, rate: f32, step_size: f32) -> AdvancedBotP
     if rng.random_bool(r) {
         let delta = rng.random_range(-step_size..step_size);
         mutated.pass_stall_penalty = (mutated.pass_stall_penalty + delta).clamp(0.1, 10.0);
+    }
+
+    // 打分常数（路线图②扩大参数面）：clamp [1, 2000]
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.bomb_keep_single = (mutated.bomb_keep_single + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.bomb_keep_double = (mutated.bomb_keep_double + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.last_bomb_penalty = (mutated.last_bomb_penalty + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.bomb_over_single = (mutated.bomb_over_single + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.bomb_over_pair = (mutated.bomb_over_pair + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.bomb_over_run = (mutated.bomb_over_run + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.wild_bomb_bonus = (mutated.wild_bomb_bonus + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.wild_run_bonus = (mutated.wild_run_bonus + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.wild_triple_bonus = (mutated.wild_triple_bonus + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.wild_fh_bonus = (mutated.wild_fh_bonus + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.endgame_single_removal = (mutated.endgame_single_removal + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.endgame_small_single_removal = (mutated.endgame_small_single_removal + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.empty_lead_bomb_penalty = (mutated.empty_lead_bomb_penalty + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.split_penalty_scale = (mutated.split_penalty_scale + delta).clamp(5.0, 100.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.keep_bomb_bonus = (mutated.keep_bomb_bonus + delta).clamp(1.0, 2000.0);
+    }
+    if rng.random_bool(r) {
+        let delta = rng.random_range(-step_size..step_size);
+        mutated.solver_trick_penalty = (mutated.solver_trick_penalty + delta).clamp(1.0, 2000.0);
     }
 
     if rng.random_bool(r) {

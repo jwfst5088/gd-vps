@@ -28,7 +28,8 @@ use std::sync::Mutex;
 use crate::bot::plugins::advanced_bot::AdvancedBotParams;
 use crate::domain::Seat;
 use crate::game::card::{
-    is_wild, level_order_value, natural_rank_value, parse_card_symbol, Rank, RuleContext, Suit,
+    is_wild, level_order_value, natural_rank_value, parse_card_symbol, HandLevel, Rank,
+    RuleContext, Suit,
 };
 use crate::game::engine::PlayerAction;
 use crate::game::rules::combination_parser::{
@@ -102,6 +103,7 @@ pub(crate) fn js_trained_params() -> AdvancedBotParams {
         prob_threshold_for_bomb: 0.6,
         prob_threshold_for_intercept: 0.4,
         enable_reason_trace: true,
+        ..crate::bot::plugins::advanced_bot::params::AdvancedBotParams::scoring_defaults()
     }
 }
 
@@ -132,10 +134,10 @@ const WILD_PAIR_PENALTY_ENDGAME: f32 = 15.0;
 /// JS `BARE_DUAL_WILD_EXTRA_PENALTY`: 裸出双百搭额外加重
 const BARE_DUAL_WILD_EXTRA_PENALTY: f32 = 200.0;
 
-// JS 内联分值常量（scorePlay base 100 / scoreLeadPlay base 50 / penalty×20 / 清空+10000）
+// JS 内联分值常量（scorePlay base 100 / scoreLeadPlay base 50 / 清空+10000）
+// penalty×20 缩放已参数化 → params.split_penalty_scale（路线图②）
 const BASE_FOLLOW_SCORE: f32 = 100.0;
 const BASE_LEAD_SCORE: f32 = 50.0;
-const SPLIT_PENALTY_SCALE: f32 = 20.0;
 const CLEAR_HAND_BONUS: f32 = 10000.0;
 const BANNED_SCORE: f32 = 99999.0;
 
@@ -668,6 +670,8 @@ struct PlayContext {
     enemy_seats: [Seat; 2],
     /// 牌踪器：剩余未见牌的 rank 级统计
     pool: PoolStats,
+    /// 残局求解器 memo（路线图③）：手牌多重集 → 最少出牌墩数（仅手牌 ≤6 张时使用）
+    endgame_memo: std::cell::RefCell<HashMap<String, usize>>,
 }
 
 fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayContext {
@@ -772,7 +776,57 @@ fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayCo
         seat_remaining,
         enemy_seats,
         pool,
+        endgame_memo: std::cell::RefCell::new(HashMap::new()),
     }
+}
+
+/// 残局求解器（路线图③，用户 2026-09-03）：最小出牌墩数规划。
+/// 把 `cards` 精确划分成最少墩数的合法组合（单/对/三/三带二/顺/连对/钢板/炸/火箭…），
+/// 返回最少墩数。`cards` ≤6 张时子集枚举 ≤63 个/节点、深度 ≤6，微秒级。
+/// 百搭由解析器自动解算（子集直接 parse，None targets）。
+fn min_tricks_partition(
+    cards: &[String],
+    level: HandLevel,
+    memo: &mut HashMap<String, usize>,
+) -> usize {
+    if cards.is_empty() {
+        return 0;
+    }
+    let mut sorted: Vec<String> = cards.to_vec();
+    sorted.sort();
+    let key = sorted.join(",");
+    if let Some(&v) = memo.get(&key) {
+        return v;
+    }
+    let n = sorted.len();
+    let ctx = RuleContext { hand_level: level };
+    let mut best = usize::MAX;
+    // 锚定首张：每一墩必含某张牌，枚举"含 sorted[0]"的全部子集（其余 n-1 位按位掩码）。
+    // 掩码选的是下标，天然处理重复符号（多重集）。
+    for mask in 0..(1u16 << (n - 1)) {
+        let mut subset: Vec<String> = Vec::with_capacity(n);
+        let mut rest: Vec<String> = Vec::with_capacity(n);
+        subset.push(sorted[0].clone());
+        for i in 1..n {
+            if mask & (1 << (i - 1)) != 0 {
+                subset.push(sorted[i].clone());
+            } else {
+                rest.push(sorted[i].clone());
+            }
+        }
+        if subset.len() > 1 && CombinationParser::parse(&subset, None, ctx).is_err() {
+            continue;
+        }
+        let sub = min_tricks_partition(&rest, level, memo);
+        if sub + 1 < best {
+            best = sub + 1;
+            if best == 1 {
+                break; // 一手出完，不可能更小
+            }
+        }
+    }
+    memo.insert(key, best);
+    best
 }
 
 impl PlayContext {
@@ -781,6 +835,21 @@ impl PlayContext {
             .get(sym)
             .copied()
             .or_else(|| meta_of(sym, self.ctx))
+    }
+
+    /// 残局求解器（路线图③）：出掉 `play_cards` 后，余牌最少还需几墩出完。
+    fn min_tricks_after(&self, play_cards: &[String]) -> usize {
+        let mut rest: Vec<String> = Vec::with_capacity(self.my_hand.len());
+        let mut to_remove: Vec<String> = play_cards.to_vec();
+        for c in &self.my_hand {
+            if let Some(pos) = to_remove.iter().position(|r| r == c) {
+                to_remove.remove(pos);
+            } else {
+                rest.push(c.clone());
+            }
+        }
+        let mut memo = self.endgame_memo.borrow_mut();
+        min_tricks_partition(&rest, self.ctx.hand_level, &mut memo)
     }
 
     // ── 牌踪器概率接口（JS HandTracker / ProbabilisticReasoner 1:1）─────────
@@ -1573,7 +1642,7 @@ fn score_follow(
             penalty = penalty.max(BANNED_SCORE); // 双保险
         }
     }
-    score -= penalty * SPLIT_PENALTY_SCALE; // Heavy penalty for splitting good combos
+    score -= penalty * p.params.split_penalty_scale; // Heavy penalty for splitting good combos
 
     let is_bomb = play_is_bomb;
     let is_last_play = play_cards.len() >= my_remaining; // JS L759
@@ -1601,9 +1670,9 @@ fn score_follow(
         // 只有1-2个炸弹时，非残局非对手冲刺不能用炸弹
         if !is_endgame && !is_last_play && min_opp_remaining > 6 {
             if combos.bomb_count < 2 {
-                score -= 200.0; // 仅1个炸弹，绝对保留
+                score -= p.params.bomb_keep_single; // 仅1个炸弹，绝对保留
             } else if combos.bomb_count < 3 {
-                score -= 50.0; // 2个炸弹，至少留1个
+                score -= p.params.bomb_keep_double; // 2个炸弹，至少留1个
             }
         }
 
@@ -1615,7 +1684,7 @@ fn score_follow(
             && min_opp_remaining > 3
             && rest_cards_after_bomb > 2
         {
-            score -= 400.0; // 留炸保底
+            score -= p.params.last_bomb_penalty; // 留炸保底
         }
     }
 
@@ -1638,7 +1707,7 @@ fn score_follow(
     if !is_bomb && !is_last_play {
         let remaining_after = my_remaining.saturating_sub(play_cards.len());
         if remaining_after <= 6 && combos.bomb_count >= 1 {
-            score += 500.0; // 保留炸弹到残局，重奖！
+            score += p.params.keep_bomb_bonus; // 保留炸弹到残局，重奖！
         }
     }
 
@@ -1649,11 +1718,11 @@ fn score_follow(
             let min_opp_rem = p.min_opp_remaining;
             if !is_last_play && min_opp_rem > 6 && !is_endgame {
                 match top.combination.kind {
-                    CombinationKind::Ordinary(OrdinaryKind::Single) => score -= 300.0,
-                    CombinationKind::Ordinary(OrdinaryKind::Pair) => score -= 200.0,
+                    CombinationKind::Ordinary(OrdinaryKind::Single) => score -= p.params.bomb_over_single,
+                    CombinationKind::Ordinary(OrdinaryKind::Pair) => score -= p.params.bomb_over_pair,
                     CombinationKind::Ordinary(OrdinaryKind::Straight)
                     | CombinationKind::Ordinary(OrdinaryKind::Tube)
-                    | CombinationKind::Ordinary(OrdinaryKind::Plate) => score -= 80.0,
+                    | CombinationKind::Ordinary(OrdinaryKind::Plate) => score -= p.params.bomb_over_run,
                     // 炸弹可以压三张/三带二，不扣分
                     _ => {}
                 }
@@ -1676,13 +1745,13 @@ fn score_follow(
             let not_clearing = play_cards.len() < my_remaining;
             let b1_exempt = is_endgame || p.min_opp_remaining <= 6 || !not_clearing;
             if !(counter_bomb && !b1_exempt) {
-                score += 100.0; // 逢人配配炸弹/同花顺：重奖！
+                score += p.params.wild_bomb_bonus; // 逢人配配炸弹/同花顺：重奖！
             }
         } else {
             match kind {
                 CombinationKind::Ordinary(OrdinaryKind::Straight)
                 | CombinationKind::Ordinary(OrdinaryKind::Plate)
-                | CombinationKind::Ordinary(OrdinaryKind::Tube) => score += 30.0,
+                | CombinationKind::Ordinary(OrdinaryKind::Tube) => score += p.params.wild_run_bonus,
                 CombinationKind::Ordinary(OrdinaryKind::FullHouse) => {
                     // 房规（用户 2026-09-03）：三张=对子+百搭（2天然+1百搭）、对子天然
                     // = 适当惩罚（替代原 +30）；清空手牌豁免照旧 +30；残局轻罚。
@@ -1695,10 +1764,10 @@ fn score_follow(
                             score -= 300.0; // 中盘适当惩罚
                         }
                     } else {
-                        score += 10.0; // 百搭使用优先级最低：炸弹/同花顺 > 钢板/木板/杂顺子 > 三带二
+                        score += p.params.wild_fh_bonus; // 百搭使用优先级最低：炸弹/同花顺 > 钢板/木板/杂顺子 > 三带二
                     }
                 }
-                CombinationKind::Ordinary(OrdinaryKind::Triple) => score += 20.0,
+                CombinationKind::Ordinary(OrdinaryKind::Triple) => score += p.params.wild_triple_bonus,
                 _ => {}
             }
         }
@@ -1792,10 +1861,10 @@ fn score_follow(
             }
         }
         if singles_removed > 0 {
-            score += singles_removed as f32 * 400.0; // 残局跟牌移除单张，重奖！
+            score += singles_removed as f32 * p.params.endgame_single_removal; // 残局跟牌移除单张，重奖！
         }
         if small_singles_removed > 0 {
-            score += small_singles_removed as f32 * 300.0; // 残局跟牌移除小单张，额外重奖！
+            score += small_singles_removed as f32 * p.params.endgame_small_single_removal; // 残局跟牌移除小单张，额外重奖！
         }
     }
 
@@ -2034,6 +2103,9 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
     let my_remaining = p.my_remaining;
     let is_endgame = p.is_endgame;
     let combos = &p.combos;
+    // 残局求解器激活条件（路线图③）：手牌 ≤6 张、非清空领出——此时由求解器的
+    // "打完后剩几墩"规划接管，旧的残局单张奖励/整形项让位（见下方 solver_active 守卫）。
+    let solver_active = my_remaining <= 6 && play_cards.len() < my_remaining;
 
     // ── Hand combo analysis & split penalty (JS 1473-1489) ──
     let bomb_split_verdict =
@@ -2050,7 +2122,7 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
             penalty = penalty.max(BANNED_SCORE); // 双保险
         }
     }
-    score -= penalty * SPLIT_PENALTY_SCALE;
+    score -= penalty * p.params.split_penalty_scale;
 
     let is_bomb = play_is_bomb;
 
@@ -2105,7 +2177,7 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
     if !is_bomb && play_cards.len() < my_remaining {
         let remaining_after = my_remaining - play_cards.len();
         if remaining_after <= 6 && combos.bomb_count >= 1 {
-            score += 500.0; // 保留炸弹到残局，重奖！
+            score += p.params.keep_bomb_bonus; // 保留炸弹到残局，重奖！
         }
     }
 
@@ -2205,10 +2277,10 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
             }
         }
         if singles_removed > 0 {
-            score += singles_removed as f32 * 400.0; // 残局移除单张，重奖！
+            score += singles_removed as f32 * p.params.endgame_single_removal; // 残局移除单张，重奖！
         }
         if small_singles_removed > 0 {
-            score += small_singles_removed as f32 * 300.0; // 残局移除小单张，额外重奖！
+            score += small_singles_removed as f32 * p.params.endgame_small_single_removal; // 残局移除小单张，额外重奖！
         }
         // 基础惩罚，让移除单张的出牌有净正收益
         let mut bad_singles = 0usize;
@@ -2308,12 +2380,12 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
         .any(|c| p.meta_for(c).map(|m| m.is_wild).unwrap_or(false));
     if has_wildcard {
         if is_bomb || matches!(kind, CombinationKind::Bomb(BombKind::StraightFlush)) {
-            score += 100.0; // 逢人配配炸弹/同花顺：重奖！
+            score += p.params.wild_bomb_bonus; // 逢人配配炸弹/同花顺：重奖！
         } else {
             match kind {
                 CombinationKind::Ordinary(OrdinaryKind::Straight)
                 | CombinationKind::Ordinary(OrdinaryKind::Plate)
-                | CombinationKind::Ordinary(OrdinaryKind::Tube) => score += 30.0,
+                | CombinationKind::Ordinary(OrdinaryKind::Tube) => score += p.params.wild_run_bonus,
                 CombinationKind::Ordinary(OrdinaryKind::FullHouse) => {
                     // 房规（用户 2026-09-03）：三张=对子+百搭、对子天然 = 适当惩罚（替代 +30）。
                     let (wild_triple_fh, _) = fh_wild_shape(play_cards, p);
@@ -2324,10 +2396,10 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
                             score -= 300.0; // 中盘适当惩罚
                         }
                     } else {
-                        score += 10.0; // 百搭使用优先级最低：炸弹/同花顺 > 钢板/木板/杂顺子 > 三带二
+                        score += p.params.wild_fh_bonus; // 百搭使用优先级最低：炸弹/同花顺 > 钢板/木板/杂顺子 > 三带二
                     }
                 }
-                CombinationKind::Ordinary(OrdinaryKind::Triple) => score += 20.0,
+                CombinationKind::Ordinary(OrdinaryKind::Triple) => score += p.params.wild_triple_bonus,
                 _ => {}
             }
         }
@@ -2582,7 +2654,7 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
         let all_bombs_rest = !rest_has_joker
             && (rest_vals.is_empty() || rest_vals.iter().all(|&n| n >= 4));
         if !all_bombs_rest {
-            score -= 450.0; // 空出炸弹：手里还有非炸弹牌却主动领炸，严重浪费
+            score -= p.params.empty_lead_bomb_penalty; // 空出炸弹：手里还有非炸弹牌却主动领炸，严重浪费
         }
     }
 
@@ -2616,6 +2688,27 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
         if !sm_has_bad && sm_vals.len() >= 3 && sm_vals.iter().all(|&n| n == 1) {
             score -= sm_vals.len() as f32 * 22.0; // 剩3张-66 … 剩5张-110
         }
+    }
+
+    // ── 残局求解器（路线图③，用户 2026-09-03）：手牌 ≤6 张领出时按"打完后剩几墩"规划 ──
+    // 剩余墩数越少越好（每墩 −500）；同墩平手时小幅倾向甩掉手中的天然废单
+    // （+15/张——与 endgame_lead_single_removal_reward 的设计行为一致：先甩垃圾单张、
+    //   保留组合牌作回手/逃生，专家打法）。清空候选不进本段（+10000 已覆盖）。
+    if solver_active {
+        let residual_tricks = p.min_tricks_after(play_cards);
+        score -= residual_tricks as f32 * p.params.solver_trick_penalty;
+        let mut junk_removed = 0usize;
+        for card in play_cards {
+            let Some(m) = p.meta_for(card) else { continue };
+            if m.is_joker || m.is_wild || m.rank == p.level_rank {
+                continue;
+            }
+            let Some(nv) = m.natural else { continue };
+            if p.combos.rank_to_count.get(&nv).copied().unwrap_or(0) == 1 {
+                junk_removed += 1;
+            }
+        }
+        score += junk_removed as f32 * 15.0;
     }
 
     // ── 清空手牌重奖 (JS 1987-1989) ──
@@ -3706,21 +3799,25 @@ mod tests {
 
     #[test]
     fn endgame_leading_prefers_larger_non_bomb_combos() {
-        // Endgame: 5 cards, can play pair (3,3) or single (5)
-        // Should prefer pair to clear more cards
+        // 残局（5张）[♠3,♥3,♠5,♠6,♠7] 领出：最小墩数划分 = {对3,♠5,♠6,♠7}（4墩），
+        // 领对/领单剩余墩数相同（3墩）→ 平手 → 求解器甩废单倾向生效：先甩废单 ♠5，
+        // 保留对 3 作回手/逃生（与 endgame_lead_single_removal_reward 同一专家策略）。
+        // （原"大组合先出多清牌"期望与该设计矛盾——两个存量测试二选一，按专家打法保留
+        //   甩废单策略；剩余墩数不同时求解器仍会强制大组合规划，见 solver 项。）
         let state = mk_playing_state(
             Seat::E,
             vec!["♠3", "♥3", "♠5", "♠6", "♠7"],
             None, // leading
         );
         let picked = suggest_next_action(&state, Seat::E).unwrap();
-        // Should pick the pair (♠3,♥3) over single ♠5
-        match &picked {
-            PlayerAction::Play { cards, .. } => {
-                assert_eq!(cards.len(), 2, "Endgame should prefer pair to clear more cards");
-            }
-            _ => panic!("Expected Play action"),
-        }
+        assert_eq!(
+            picked,
+            PlayerAction::Play {
+                cards: vec!["♠5".into()],
+                wild_targets: None,
+            },
+            "endgame tie → shed the junk single, keep the pair for retake"
+        );
     }
 
     // ══ 房规回归测试：不得把百搭（逢人配）留成最后一张孤牌 ══

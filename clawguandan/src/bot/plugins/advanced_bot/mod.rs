@@ -6,7 +6,7 @@ pub use self::params::AdvancedBotParams;
 use self::play_policy::AdvancedPlayPolicy;
 
 mod hand_tracker;
-mod params;
+pub(crate) mod params;
 mod play_policy;
 mod prob_reasoner;
 

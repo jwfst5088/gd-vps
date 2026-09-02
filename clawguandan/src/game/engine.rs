@@ -1225,6 +1225,9 @@ mod tests {
         hand.hands.insert(Seat::N, vec!["♠7".into()]);
         hand.hands.insert(Seat::W, vec!["♠8".into()]);
         hand.hands.insert(Seat::S, vec![]);
+        // E 空手 = 已完牌：真实对局中空手必然已登记 finishing_order（领出后才完牌），
+        // 测试造景必须补登记，否则接风查找 finishing_order.last() 落空 → 领出误回 E（空手座）。
+        hand.finishing_order.push(Seat::E);
         set_top_play(&mut hand, Seat::E, vec!["♠6"]);
         s.hand = Some(hand);
 
@@ -1281,8 +1284,11 @@ mod tests {
             None,
         )
         .unwrap();
-        // S's last card empties both S and N -> SN team wins -> scoring (no further passes).
+        // S's last card empties both S and N -> SN is the first fully-empty team -> scoring.
+        // 胜负判定（标准掼蛋，与 CF game-room.js "first finisher sets winner_team" 一致）：
+        // 头游所在队获胜——E 先出完（头游，EW 队），N/S 拿二游三游只是让 SN 队先"双全"
+        // 触发终局，不改胜负归属。故 winner = EW（旧期望 SN 是把"终局条件"误当"胜负条件"）。
         assert_eq!(s.phase, GamePhase::Scoring);
-        assert_eq!(s.winner_team, Some(TeamId::Sn));
+        assert_eq!(s.winner_team, Some(TeamId::Ew));
     }
 }

@@ -35,6 +35,10 @@ pub struct SelfPlayConfig {
 pub struct EvalResult {
     pub params: AdvancedBotParams,
     pub win_rate: f32,
+    /// 平均升级行（0..1）：每局按掼蛋记级结算——赢双上+3 / 赢单上+2 / 输单上−2 / 被双上−3，
+    /// 归一化 (delta+3)/6。直接优化"每局升级期望"而非裸胜率：
+    /// 同胜率下，被双上多的参数组会显式变差（路线图①，用户 2026-09-03）。
+    pub level_ev: f32,
     pub first_out_rate: f32,
     /// NS队结束时平均剩余手牌总数(S+N剩余之和)。越少越好。
     /// 直接衡量"残局剩牌"表现，缓解"最后剩小牌和单张"问题。
@@ -45,11 +49,12 @@ pub struct EvalResult {
 pub fn eval_to_score(eval: &EvalResult) -> f32 {
     // 残局剩牌越少越好：clear_rate = 1 - avg_residual/27
     // (27 ≈ NS两人初始手牌总数上界，用作归一化)
-    // 权重：胜率0.5 + 头游0.2 + 残局清牌0.3
-    // 原来只看胜率+头游，导致AI为抢头游早出大牌、残局剩散牌。
-    // 加入残局清牌项，让训练直接惩罚"残局剩牌多"的参数。
+    // 权重：升级期望0.5 + 头游0.2 + 残局清牌0.3
+    // ① 升级期望替代裸胜率：双上+3/单上+2/输单上−2/被双上−3——同胜率下，
+    //    输局常被打双上的参数组被显式惩罚（"输了也要少输"，掼蛋核心）。
+    // ② 头游/清牌项保留：鼓励抢头游与残局少剩牌。
     let clear_rate = (1.0 - (eval.avg_endgame_residual / 27.0).clamp(0.0, 1.0)).max(0.0);
-    eval.win_rate * 0.5 + eval.first_out_rate * 0.2 + clear_rate * 0.3
+    eval.level_ev * 0.5 + eval.first_out_rate * 0.2 + clear_rate * 0.3
 }
 
 /// Configuration for hill-climbing optimization.
@@ -89,6 +94,7 @@ pub fn evaluate_params_with_progress<F: Fn(u32, u32)>(
     let mut ns_wins = 0u32;
     let mut ns_first_out = 0u32;
     let mut ns_residual_sum: usize = 0;
+    let mut ns_level_delta_sum: i32 = 0;
     let mut played = 0u32;
 
     let total = config.matches_per_eval;
@@ -99,7 +105,7 @@ pub fn evaluate_params_with_progress<F: Fn(u32, u32)>(
         }
         let engine = GameEngine::new(GameConfig { rng_seed: rand::random(), randomize_deals: false });
         match run_single_match(&engine, config.max_plies) {
-            Ok(Some((winner, first_out_team, ns_residual))) => {
+            Ok(Some((winner, first_out_team, ns_level_delta, ns_residual))) => {
                 played += 1;
                 if winner == TeamId::Sn {
                     ns_wins += 1;
@@ -107,18 +113,21 @@ pub fn evaluate_params_with_progress<F: Fn(u32, u32)>(
                 if first_out_team == TeamId::Sn {
                     ns_first_out += 1;
                 }
+                ns_level_delta_sum += ns_level_delta;
                 ns_residual_sum += ns_residual;
             }
             Ok(None) => {
                 played += 1;
-                // 失败比赛按最差情况计：NS两人满手牌未清(27)
+                // 失败比赛按最差情况计：NS两人满手牌未清(27)、升级行按被双上(−3)计
                 // 避免失败比赛被当作0张残牌而人为抬高clear_rate评分
                 ns_residual_sum += 27;
+                ns_level_delta_sum -= 3;
             }
             Err(e) => {
                 eprintln!("[learn] match error: {e}");
                 played += 1;
                 ns_residual_sum += 27; // 同上：失败按最差情况计
+                ns_level_delta_sum -= 3;
             }
         }
         if let Some(ref cb) = progress_cb {
@@ -154,6 +163,11 @@ pub fn evaluate_params_with_progress<F: Fn(u32, u32)>(
     EvalResult {
         params: params.clone(),
         win_rate,
+        level_ev: if played > 0 {
+            ((ns_level_delta_sum as f32 / played as f32) + 3.0) / 6.0
+        } else {
+            0.0
+        },
         first_out_rate,
         avg_endgame_residual,
         matches_played: played,
@@ -161,12 +175,13 @@ pub fn evaluate_params_with_progress<F: Fn(u32, u32)>(
 }
 
 /// Run a single match: create a new game state, deal cards, and play until completion.
-/// Returns (winner_team, first_out_team, ns_residual) where ns_residual is the total
-/// remaining cards of NS team (S+N) at match end — used to penalize endgame leftovers.
+/// Returns (winner_team, first_out_team, ns_level_delta, ns_residual):
+/// - ns_level_delta: NS 队本局升级行（掼蛋记级：赢双上+3/赢单上+2/输单上−2/被双上−3）
+/// - ns_residual: NS (S+N) 剩余手牌总数 — 用于惩罚残局剩牌。
 fn run_single_match(
     engine: &GameEngine,
     max_plies: usize,
-) -> Result<Option<(TeamId, TeamId, usize)>, String> {
+) -> Result<Option<(TeamId, TeamId, i32, usize)>, String> {
     let mut state = engine.init_table(format!("learn_{}", uuid::Uuid::new_v4()));
     let first_drawer = Seat::S;
     engine
@@ -178,11 +193,20 @@ fn run_single_match(
 
     if outcome.final_phase == GamePhase::Scoring {
         if let Some(winner) = state.winner_team {
-            let first_out_team = state.hand
+            let finishing = state
+                .hand
                 .as_ref()
-                .and_then(|h| h.finishing_order.first().copied())
-                .map(seat_team)
-                .unwrap_or(winner);
+                .map(|h| h.finishing_order.clone())
+                .unwrap_or_default();
+            let first_out_team = finishing.first().copied().map(seat_team).unwrap_or(winner);
+            // 升级行：头游队为胜方；胜方二游也是本队 → 双上+3，否则单上+2；负方取负。
+            let ns_level_delta = match (finishing.first(), finishing.get(1)) {
+                (Some(f1), Some(f2)) => {
+                    let gain = if seat_team(*f2) == seat_team(*f1) { 3i32 } else { 2 };
+                    if seat_team(*f1) == TeamId::Sn { gain } else { -gain }
+                }
+                _ => 0,
+            };
             // NS队结束时剩余手牌总数(S+N)：衡量残局剩牌表现
             let ns_residual = state
                 .hand
@@ -192,7 +216,7 @@ fn run_single_match(
                         + h.hands.get(&Seat::N).map(|v| v.len()).unwrap_or(0)
                 })
                 .unwrap_or(0);
-            Ok(Some((winner, first_out_team, ns_residual)))
+            Ok(Some((winner, first_out_team, ns_level_delta, ns_residual)))
         } else {
             Ok(None)
         }
@@ -207,8 +231,8 @@ pub fn optimize(start: &AdvancedBotParams, config: &HillClimbConfig) -> Advanced
     let mut best = start.clone();
     let mut best_eval = evaluate_params(&best, &config.eval_config);
     println!(
-        "[learn] iter 0: win_rate={:.3} first_out={:.3} residual={:.1} score={:.4}",
-        best_eval.win_rate, best_eval.first_out_rate, best_eval.avg_endgame_residual,
+        "[learn] iter 0: level_ev={:.3} win_rate={:.3} first_out={:.3} residual={:.1} score={:.4}",
+        best_eval.level_ev, best_eval.win_rate, best_eval.first_out_rate, best_eval.avg_endgame_residual,
         eval_to_score(&best_eval)
     );
 
@@ -217,19 +241,17 @@ pub fn optimize(start: &AdvancedBotParams, config: &HillClimbConfig) -> Advanced
         let eval = evaluate_params(&candidate, &config.eval_config);
 
         println!(
-            "[learn] iter {i}: win_rate={:.3} first_out={:.3} residual={:.1} (best_score={:.4})",
-            eval.win_rate, eval.first_out_rate, eval.avg_endgame_residual, eval_to_score(&best_eval)
+            "[learn] iter {i}: level_ev={:.3} win_rate={:.3} first_out={:.3} residual={:.1} (best_score={:.4})",
+            eval.level_ev, eval.win_rate, eval.first_out_rate, eval.avg_endgame_residual, eval_to_score(&best_eval)
         );
 
-        // 修改5：用综合评分(eval_to_score)比较，而非裸 win_rate。
-        // 原来只用 win_rate 比较，导致 first_out_rate/残局指标完全被忽略，
-        // 训练目标与 eval_to_score 定义不一致。
+        // 用综合评分(eval_to_score)比较：升级期望0.5 + 头游0.2 + 清牌0.3。
         if eval_to_score(&eval) > eval_to_score(&best_eval) {
             best = candidate;
             best_eval = eval;
             println!(
-                "[learn]   -> improved! new best score={:.4} (win={:.3} residual={:.1})",
-                eval_to_score(&best_eval), best_eval.win_rate, best_eval.avg_endgame_residual
+                "[learn]   -> improved! new best score={:.4} (level_ev={:.3} win={:.3} residual={:.1})",
+                eval_to_score(&best_eval), best_eval.level_ev, best_eval.win_rate, best_eval.avg_endgame_residual
             );
         }
     }
