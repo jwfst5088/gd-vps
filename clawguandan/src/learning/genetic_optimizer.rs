@@ -240,7 +240,6 @@ fn crossover(parent1: &AdvancedBotParams, parent2: &AdvancedBotParams) -> Advanc
     // （用户 2026-09-03：bomb_keep_double/bomb_over_run/wild_triple_bonus/wild_fh_bonus
     //   已按房规调整移除——不奖不罚，不再入参）
     if rng.random_bool(0.5) { child.bomb_keep_single = parent2.bomb_keep_single; }
-    if rng.random_bool(0.5) { child.last_bomb_penalty = parent2.last_bomb_penalty; }
     if rng.random_bool(0.5) { child.bomb_over_single = parent2.bomb_over_single; }
     if rng.random_bool(0.5) { child.bomb_over_pair = parent2.bomb_over_pair; }
     if rng.random_bool(0.5) { child.wild_bomb_bonus = parent2.wild_bomb_bonus; }
@@ -335,10 +334,6 @@ fn mutate(params: &AdvancedBotParams, rate: f32, step_size: f32) -> AdvancedBotP
     if rng.random_bool(r) {
         let delta = rng.random_range(-step_size..step_size);
         mutated.bomb_keep_single = (mutated.bomb_keep_single + delta).clamp(1.0, 2000.0);
-    }
-    if rng.random_bool(r) {
-        let delta = rng.random_range(-step_size..step_size);
-        mutated.last_bomb_penalty = (mutated.last_bomb_penalty + delta).clamp(1.0, 2000.0);
     }
     if rng.random_bool(r) {
         let delta = rng.random_range(-step_size..step_size);

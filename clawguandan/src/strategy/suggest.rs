@@ -1657,15 +1657,18 @@ fn score_follow(
             }
         }
 
-        // 房规：残局保留最后一个炸弹——非清空不轻出 (JS 800-806)
+        // 房规禁令（用户 2026-09-03 重申并升级）：残局手里只剩 1 炸必须留作控牌
+        // ——非清空不得轻出。禁令级（BANNED_SCORE），任何奖励/求解器项都不可抵消。
+        // 豁免（用户 2026-09-03 修订口径=全项目冲刺阈值）：①对手冲刺（任一对手剩≤6张，
+        // 炸了拦人）②出完手牌 ③打完后剩≤2张（下一手即可清空）。
         let rest_cards_after_bomb = my_remaining.saturating_sub(play_cards.len());
         if is_endgame
             && !is_last_play
             && combos.bomb_count == 1
-            && min_opp_remaining > 3
+            && min_opp_remaining > 6
             && rest_cards_after_bomb > 2
         {
-            score -= p.params.last_bomb_penalty; // 留炸保底
+            score -= BANNED_SCORE; // 残局留炸禁令
         }
     }
 
@@ -2607,6 +2610,17 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
     // ── 房规：接风重奖——队友已全部出完，本圈由我接风先出 (JS 1933-1937) ──
     if p.teammate_remaining == 0 {
         score += p.params.partner_feng_first_bonus; // 接风首出权重奖
+    }
+
+    // ── 房规禁令（用户 2026-09-03 重申并升级）：残局领出侧同款留炸禁令 ──
+    // 残局（手牌≤6）且手里只剩 1 炸：非清空不得主动领出，留作控场底线。
+    // 豁免：①对手冲刺（任一对手剩≤6张）②出完手牌 ③打完后剩≤2张。
+    // 禁令级（BANNED_SCORE），残局求解器不可抵消。
+    if is_bomb && is_endgame && play_cards.len() < my_remaining {
+        let rest_after = my_remaining - play_cards.len();
+        if combos.bomb_count == 1 && p.min_opp_remaining > 6 && rest_after > 2 {
+            score -= BANNED_SCORE; // 残局留炸禁令（领出侧）
+        }
     }
 
     // ── 房规：空出炸弹重罚 (JS 1940-1960) ──

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 //   · 炸弹压顺子/钢板/木板：不扣分（原 −80 移除）
 //   · 手里有 2 炸时用炸：不扣分（原 −50 移除；1 炸的保留罚不变）
 pub const D_BOMB_KEEP_SINGLE: f32 = 200.0; // 炸弹保留：手里只剩1炸 打分减
-pub const D_LAST_BOMB_PENALTY: f32 = 400.0; // 残局末炸过早出
+// （last_bomb_penalty 已于 2026-09-03 升级为禁令级房规，不再参数化）
 pub const D_BOMB_OVER_SINGLE: f32 = 300.0; // 炸压单张
 pub const D_BOMB_OVER_PAIR: f32 = 200.0; // 炸压对子
 pub const D_WILD_BOMB_BONUS: f32 = 100.0; // 百搭成炸/同花顺
@@ -74,8 +74,6 @@ pub struct AdvancedBotParams {
     // ── 打分常数（默认=引擎现值，见上方 D_* 常量）──
     #[serde(default = "default_bomb_keep_single")]
     pub bomb_keep_single: f32,
-    #[serde(default = "default_last_bomb_penalty")]
-    pub last_bomb_penalty: f32,
     #[serde(default = "default_bomb_over_single")]
     pub bomb_over_single: f32,
     #[serde(default = "default_bomb_over_pair")]
@@ -165,7 +163,6 @@ macro_rules! serde_default_fn {
 }
 
 serde_default_fn!(default_bomb_keep_single, D_BOMB_KEEP_SINGLE);
-serde_default_fn!(default_last_bomb_penalty, D_LAST_BOMB_PENALTY);
 serde_default_fn!(default_bomb_over_single, D_BOMB_OVER_SINGLE);
 serde_default_fn!(default_bomb_over_pair, D_BOMB_OVER_PAIR);
 serde_default_fn!(default_wild_bomb_bonus, D_WILD_BOMB_BONUS);
@@ -211,7 +208,6 @@ impl AdvancedBotParams {
     pub(crate) fn scoring_defaults() -> Self {
         Self {
             bomb_keep_single: D_BOMB_KEEP_SINGLE,
-            last_bomb_penalty: D_LAST_BOMB_PENALTY,
             bomb_over_single: D_BOMB_OVER_SINGLE,
             bomb_over_pair: D_BOMB_OVER_PAIR,
             wild_bomb_bonus: D_WILD_BOMB_BONUS,
@@ -358,10 +354,10 @@ impl AdvancedBotParams {
         let mut rng = rand::rng();
         let mut cloned = self.clone();
         // 房规锁：可变异参数为 10 个 f32 权重（0-9）+ 2 个概率阈值（10-11）+
-        // 41 个打分常数（12-52，路线图②扩大参数面；默认=引擎现值）。
+        // 40 个打分常数（12-51，路线图②扩大参数面；默认=引擎现值）。
         // 3 个 u8 阈值（冲刺/残局/队友冲刺）不参与变异——训练不可漂移房规。
         // 禁令/豁免/阈值全部冻结，可训练的只有打分量级。
-        let idx = rng.random_range(0..53);
+        let idx = rng.random_range(0..52);
         macro_rules! m {
             ($field:ident, $lo:expr, $hi:expr) => {
                 cloned.$field = (cloned.$field + rng.random_range(-step_size..step_size)).clamp($lo, $hi)
@@ -384,48 +380,47 @@ impl AdvancedBotParams {
             11 => m!(prob_threshold_for_intercept, 0.1, 1.0),
             // 打分常数（量级，正数）：clamp 到 [1, 2000]
             12 => m!(bomb_keep_single, 1.0, 2000.0),
-            13 => m!(last_bomb_penalty, 1.0, 2000.0),
-            14 => m!(bomb_over_single, 1.0, 2000.0),
-            15 => m!(bomb_over_pair, 1.0, 2000.0),
-            16 => m!(wild_bomb_bonus, 1.0, 2000.0),
-            17 => m!(wild_run_bonus, 1.0, 2000.0),
-            18 => m!(endgame_single_removal, 1.0, 2000.0),
-            19 => m!(endgame_small_single_removal, 1.0, 2000.0),
-            20 => m!(empty_lead_bomb_penalty, 1.0, 2000.0),
-            21 => m!(split_penalty_scale, 5.0, 100.0),
-            22 => m!(keep_bomb_bonus, 1.0, 2000.0),
-            23 => m!(solver_trick_penalty, 1.0, 2000.0),
-            24 => m!(bomb_keep_many, 1.0, 2000.0),
-            25 => m!(intercept_sprint_bonus, 1.0, 2000.0),
-            26 => m!(last_play_clear_bonus, 1.0, 2000.0),
-            27 => m!(combo_shape_bonus, 1.0, 2000.0),
-            28 => m!(partner_feng_bonus, 1.0, 2000.0),
-            29 => m!(partner_feng_lead_bonus, 1.0, 2000.0),
-            30 => m!(partner_feng_first_bonus, 1.0, 2000.0),
-            31 => m!(teammate_combo_bonus, 1.0, 2000.0),
-            32 => m!(block_enemy_bonus, 1.0, 2000.0),
-            33 => m!(straight_build_bonus, 1.0, 2000.0),
-            34 => m!(many_singles_penalty, 1.0, 2000.0),
-            35 => m!(single_lead_bonus, 1.0, 2000.0),
-            36 => m!(small_single_lead_bonus, 1.0, 2000.0),
-            37 => m!(small_card_lead_bonus, 1.0, 2000.0),
-            38 => m!(avoid_small_singles_each, 1.0, 2000.0),
+            13 => m!(bomb_over_single, 1.0, 2000.0),
+            14 => m!(bomb_over_pair, 1.0, 2000.0),
+            15 => m!(wild_bomb_bonus, 1.0, 2000.0),
+            16 => m!(wild_run_bonus, 1.0, 2000.0),
+            17 => m!(endgame_single_removal, 1.0, 2000.0),
+            18 => m!(endgame_small_single_removal, 1.0, 2000.0),
+            19 => m!(empty_lead_bomb_penalty, 1.0, 2000.0),
+            20 => m!(split_penalty_scale, 5.0, 100.0),
+            21 => m!(keep_bomb_bonus, 1.0, 2000.0),
+            22 => m!(solver_trick_penalty, 1.0, 2000.0),
+            23 => m!(bomb_keep_many, 1.0, 2000.0),
+            24 => m!(intercept_sprint_bonus, 1.0, 2000.0),
+            25 => m!(last_play_clear_bonus, 1.0, 2000.0),
+            26 => m!(combo_shape_bonus, 1.0, 2000.0),
+            27 => m!(partner_feng_bonus, 1.0, 2000.0),
+            28 => m!(partner_feng_lead_bonus, 1.0, 2000.0),
+            29 => m!(partner_feng_first_bonus, 1.0, 2000.0),
+            30 => m!(teammate_combo_bonus, 1.0, 2000.0),
+            31 => m!(block_enemy_bonus, 1.0, 2000.0),
+            32 => m!(straight_build_bonus, 1.0, 2000.0),
+            33 => m!(many_singles_penalty, 1.0, 2000.0),
+            34 => m!(single_lead_bonus, 1.0, 2000.0),
+            35 => m!(small_single_lead_bonus, 1.0, 2000.0),
+            36 => m!(small_card_lead_bonus, 1.0, 2000.0),
+            37 => m!(avoid_small_singles_each, 1.0, 2000.0),
             // 领出整形/求解器倾向：允许训练到 0（关闭该项）
-            39 => m!(lead_len_step, 0.0, 100.0),
-            40 => m!(lead_len_step_endgame, 0.0, 100.0),
-            41 => m!(lead_primary_step, 0.0, 50.0),
-            42 => m!(lead_primary_step_endgame, 0.0, 50.0),
-            43 => m!(solver_junk_bonus, 0.0, 500.0),
+            38 => m!(lead_len_step, 0.0, 100.0),
+            39 => m!(lead_len_step_endgame, 0.0, 100.0),
+            40 => m!(lead_primary_step, 0.0, 50.0),
+            41 => m!(lead_primary_step_endgame, 0.0, 50.0),
+            42 => m!(solver_junk_bonus, 0.0, 500.0),
             // 双百搭/升档/落级牌罚家族（JS 房规口径，量级可训练）
-            44 => m!(dual_wild_penalty_mid, 1.0, 2000.0),
-            45 => m!(dual_wild_penalty_end, 1.0, 2000.0),
-            46 => m!(upgraded_bomb_wild_mid, 1.0, 2000.0),
-            47 => m!(upgraded_bomb_wild_end, 1.0, 2000.0),
-            48 => m!(wild_on_level_mid, 1.0, 2000.0),
-            49 => m!(wild_on_level_end, 1.0, 2000.0),
-            50 => m!(wild_plain_pair_mid, 1.0, 2000.0),
-            51 => m!(wild_pair_penalty_end, 1.0, 2000.0),
-            52 => m!(bare_dual_wild_extra, 1.0, 2000.0),
+            43 => m!(dual_wild_penalty_mid, 1.0, 2000.0),
+            44 => m!(dual_wild_penalty_end, 1.0, 2000.0),
+            45 => m!(upgraded_bomb_wild_mid, 1.0, 2000.0),
+            46 => m!(upgraded_bomb_wild_end, 1.0, 2000.0),
+            47 => m!(wild_on_level_mid, 1.0, 2000.0),
+            48 => m!(wild_on_level_end, 1.0, 2000.0),
+            49 => m!(wild_plain_pair_mid, 1.0, 2000.0),
+            50 => m!(wild_pair_penalty_end, 1.0, 2000.0),
+            51 => m!(bare_dual_wild_extra, 1.0, 2000.0),
             _ => unreachable!(),
         }
         cloned
