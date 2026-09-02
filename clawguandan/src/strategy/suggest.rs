@@ -154,6 +154,9 @@ const BASE_FOLLOW_SCORE: f32 = 100.0;
 const BASE_LEAD_SCORE: f32 = 50.0;
 const CLEAR_HAND_BONUS: f32 = 10000.0;
 const BANNED_SCORE: f32 = 99999.0;
+/// 房规（用户 2026-09-03）：百搭优先用于炸弹/同花顺——手中余牌与剩余百搭仍可组成
+/// 炸弹/同花顺时，把百搭用进更低级组合的冻结惩罚（房规禁令不入训练面）。
+const WILD_CONSERVATION_PENALTY: f32 = 150.0;
 
 // ── Card helpers (cards.js getRank / rankValue / NATURAL_RANK 等价物) ───
 
@@ -203,6 +206,65 @@ fn rank_value_js(rank: Rank) -> u8 {
 
 fn is_joker_sym(sym: &str) -> bool {
     sym.starts_with('🃏')
+}
+
+/// 房规（用户 2026-09-03）：手里余牌与剩余百搭能否组成炸弹或同花顺。
+/// 炸弹补足：某点数天然牌 ≥2 且 天然数+剩余百搭 ≥4（级牌点数除外——级牌炸弹被房规禁止）。
+/// 同花顺：同花色 5 连窗（natural 2..=14，2 作低——JS 23456 合法），缺张数 ∈ [1, 剩余百搭数]。
+/// 百搭/王不计入天然牌；jokers 无花色不参与同花顺。
+fn wilds_could_form_bomb_or_sf(p: &PlayContext, play_cards: &[String]) -> bool {
+    let mut to_remove: Vec<String> = play_cards.to_vec();
+    let mut remaining: Vec<&String> = Vec::with_capacity(p.my_hand.len());
+    for c in &p.my_hand {
+        if let Some(pos) = to_remove.iter().position(|r| r == c) {
+            to_remove.remove(pos);
+        } else {
+            remaining.push(c);
+        }
+    }
+    let wild_left = remaining
+        .iter()
+        .filter(|c| p.meta_for(c).map(|m| m.is_wild).unwrap_or(false))
+        .count();
+    if wild_left == 0 {
+        return false;
+    }
+    let mut rank_counts: HashMap<Rank, usize> = HashMap::new();
+    let mut suit_ranks: HashMap<Suit, HashSet<u8>> = HashMap::new();
+    for c in remaining {
+        if is_joker_sym(c) {
+            continue;
+        }
+        let Some(m) = p.meta_for(c) else { continue };
+        if m.is_wild {
+            continue;
+        }
+        if m.rank != p.level_rank {
+            *rank_counts.entry(m.rank).or_default() += 1;
+        }
+        if let Some(nv) = m.natural {
+            if let Ok(card) = parse_card_symbol(c) {
+                suit_ranks.entry(card.suit).or_default().insert(nv);
+            }
+        }
+    }
+    // 炸弹补足：某点数天然牌 ≥2，剩余百搭能补到 4
+    if rank_counts
+        .values()
+        .any(|&n| n >= 2 && n + wild_left >= 4)
+    {
+        return true;
+    }
+    // 同花顺：同花色 5 连窗缺张可由百搭补足
+    for ranks in suit_ranks.values() {
+        for lo in 2..=10u8 {
+            let missing = (lo..lo + 5).filter(|r| !ranks.contains(r)).count();
+            if missing >= 1 && missing <= wild_left {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ── Hand combo analysis (JS analyzeHandCombos L1215-1320) ──────────────
@@ -2006,6 +2068,14 @@ fn score_follow(
         .filter(|c| p.meta_for(c).map(|m| m.is_wild).unwrap_or(false))
         .count();
     if !dw_finishing && wild_count_in_play >= 2 {
+        // 房规（用户 2026-09-03）：一对百搭（两张百搭凑对子）压对子 = 禁止。
+        // 此前仅软罚（中盘 −600/残局 −60），残局 −60 形同虚设，机器人照样双百搭压对子。
+        // 豁免：清空手牌（外层 dw_finishing 已排除）、对手冲刺（≤6）。
+        if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Pair))
+            && p.min_opp_remaining > 6
+        {
+            score -= BANNED_SCORE;
+        }
         let dw_naturals: Vec<CardMeta> = play_cards
             .iter()
             .filter_map(|c| p.meta_for(c))
@@ -2036,6 +2106,19 @@ fn score_follow(
                 score -= p.params.bare_dual_wild_extra; // 裸双百搭：额外重罚
             }
         }
+    }
+
+    // ── 房规（用户 2026-09-03）：百搭优先用于炸弹/同花顺（跟牌侧） ──
+    // 手中余牌与剩余百搭仍可组成炸弹/同花顺时，把百搭用进更低级组合 → 冻结惩罚（不入训练面）。
+    // 豁免：清空手牌、炸弹/同花顺本身、对手冲刺（≤6）。
+    if wild_count_in_play >= 1
+        && !is_bomb
+        && !matches!(kind, CombinationKind::Bomb(BombKind::StraightFlush))
+        && play_cards.len() < my_remaining
+        && p.min_opp_remaining > 6
+        && wilds_could_form_bomb_or_sf(p, play_cards)
+    {
+        score -= WILD_CONSERVATION_PENALTY;
     }
 
     // ── 三带二不能带两张级牌 (JS 1089-1096) ──
@@ -2577,6 +2660,20 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
                 score -= p.params.bare_dual_wild_extra; // 裸双百搭：额外重罚
             }
         }
+    }
+
+    // ── 房规（用户 2026-09-03）：百搭优先用于炸弹/同花顺（领出侧） ──
+    // 领出无"压对子"，双百搭对子禁令仅跟牌侧（中盘双百搭领出已被 movegen 门槛挡住）；
+    // 百搭保留原则两侧同规：余牌+剩余百搭可组成炸弹/同花顺时，浪费百搭 → 冻结惩罚。
+    // 豁免：清空手牌、炸弹/同花顺本身、对手冲刺（≤6）。
+    if wild_count_in_play >= 1
+        && !is_bomb
+        && !matches!(kind, CombinationKind::Bomb(BombKind::StraightFlush))
+        && play_cards.len() < my_remaining
+        && p.min_opp_remaining > 6
+        && wilds_could_form_bomb_or_sf(p, play_cards)
+    {
+        score -= WILD_CONSERVATION_PENALTY;
     }
 
     // ── 三带二不能带两张级牌 (JS 1875-1884) ──
@@ -4160,6 +4257,66 @@ mod tests {
         );
         let picked = suggest_next_action(&state, Seat::E).unwrap();
         assert_eq!(picked, PlayerAction::Pass, "no legal alternative → must Pass");
+    }
+
+    // ══ 房规（2026-09-03）：双百搭压对子禁止 + 百搭保留优先 ══
+
+    #[test]
+    fn dual_wild_pair_follow_banned() {
+        // 跟对 4：双百搭凑对子 = 禁止（BANNED_SCORE），不得压过天然对 9
+        let top = mk_top(Seat::N, vec!["♦4", "♣4"]);
+        let mut st = mk_playing_state(
+            Seat::E,
+            vec!["♥2", "♥2", "♠9", "♥9", "♠K", "♠A"],
+            Some((Seat::N, vec!["♦4", "♣4"])),
+        );
+        fill_seats(
+            &mut st,
+            vec!["♦9", "♣9", "♦J", "♣J", "♦Q", "♣Q", "♦K", "♣K", "♦A"],
+            vec!["♠3", "♥3", "♠5", "♥5", "♠6", "♥6", "♠7", "♥7", "♠8"],
+            vec!["♥8", "♦8", "♣8", "♠10", "♥10", "♦10", "♣10", "♠J", "♥J"],
+        );
+        let p = pctx_of(&st, Seat::E);
+        let wpair_cards = vec!["♥2".to_string(), "♥2".to_string()];
+        let wpair = combo_of(vec!["♥2", "♥2"], vec!["♠9", "♥9"]); // 双百搭充当对 9
+        let s = score_follow(&wpair_cards, &wpair, &top, &p);
+        assert!(s <= -50000.0, "双百搭压对子必须被禁止, got {s}");
+    }
+
+    #[test]
+    fn wild_conservation_detector() {
+        // 余牌与百搭可成炸弹（333+百搭）→ 判真；可成同花顺（♠45678 缺 4）→ 判真
+        let mut st = mk_playing_state(
+            Seat::E,
+            vec!["♠3", "♥3", "♦3", "♥2", "♦K"],
+            None,
+        );
+        fill_seats(
+            &mut st,
+            vec!["♠4", "♥4", "♦4", "♣4", "♠5"],
+            vec!["♥5", "♦5", "♣5", "♠6", "♥6"],
+            vec!["♦6", "♣6", "♠7", "♥7", "♦7"],
+        );
+        let p = pctx_of(&st, Seat::E);
+        assert!(wilds_could_form_bomb_or_sf(&p, &["♦K".to_string()]));
+        // 对照：拆掉三张同点后（33+百搭 补不成 4 炸）→ 判假
+        assert!(!wilds_could_form_bomb_or_sf(
+            &p,
+            &["♦K".to_string(), "♠3".to_string()]
+        ));
+        let mut st2 = mk_playing_state(
+            Seat::E,
+            vec!["♠5", "♠6", "♠7", "♠8", "♥2", "♦K"],
+            None,
+        );
+        fill_seats(
+            &mut st2,
+            vec!["♠4", "♥4", "♦4", "♣4", "♠9"],
+            vec!["♥9", "♦9", "♣9", "♠10", "♥10"],
+            vec!["♦10", "♣10", "♠J", "♥J", "♦J"],
+        );
+        let p2 = pctx_of(&st2, Seat::E);
+        assert!(wilds_could_form_bomb_or_sf(&p2, &["♦K".to_string()]));
     }
 
     // ══ JS 行为测试 ⑥：双百搭矩阵（残局 −10 轻罚 / 其余 −60、−600、裸出 −200）══
