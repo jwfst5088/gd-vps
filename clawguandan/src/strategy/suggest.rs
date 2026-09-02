@@ -2379,6 +2379,9 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
     } else if min_opp_remaining == 2 {
         if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Pair)) {
             score -= OPP_LAST_TWO_PAIR_PENALTY; // 防对手对子直接走人
+            // 房规（用户 2026-09-03 补充）：万一要发对子，从大对子开始
+            //（primary 越大罚越轻——大牌对压得住对手的小对，防走概率最大化）
+            score += play_combo.primary as f32 * FEED_RANK_TILT;
         }
         if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Single)) {
             score += OPP_TWO_SINGLE_NUDGE; // 拆对发单张/散单——对手两张接不走单张
