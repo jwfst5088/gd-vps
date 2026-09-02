@@ -275,13 +275,14 @@ fn evaluate_params_from_logs(params: &AdvancedBotParams, logs: &[GameLogEntry]) 
     let mut ns_wins = 0u32;
     let mut ns_first_out = 0u32;
     let mut ns_residual_sum: usize = 0;
+    let mut ns_level_delta_sum: i32 = 0;
     let mut played = 0u32;
 
     let matches_to_run = std::cmp::min(logs.len() as u32, 50);
     for _ in 0..matches_to_run {
         let engine = GameEngine::new(GameConfig { rng_seed: rand::random(), randomize_deals: false });
         match run_single_match_from_log(&engine, params) {
-            Ok(Some((winner, first_out_team, ns_residual))) => {
+            Ok(Some((winner, first_out_team, ns_level_delta, ns_residual))) => {
                 played += 1;
                 if winner == TeamId::Sn {
                     ns_wins += 1;
@@ -289,13 +290,15 @@ fn evaluate_params_from_logs(params: &AdvancedBotParams, logs: &[GameLogEntry]) 
                 if first_out_team == TeamId::Sn {
                     ns_first_out += 1;
                 }
+                ns_level_delta_sum += ns_level_delta;
                 ns_residual_sum += ns_residual;
             }
             _ => {
                 played += 1;
-                // 失败比赛按最差情况计：NS两人满手牌未清(27)
+                // 失败比赛按最差情况计：NS两人满手牌未清(27)、升级行按被双上(−3)计
                 // 避免失败比赛被当作0张残牌而人为抬高clear_rate评分
                 ns_residual_sum += 27;
+                ns_level_delta_sum -= 3;
             }
         }
     }
@@ -306,20 +309,21 @@ fn evaluate_params_from_logs(params: &AdvancedBotParams, logs: &[GameLogEntry]) 
         return 0.5;
     }
 
-    let win_rate = ns_wins as f32 / played as f32;
+    let _win_rate = ns_wins as f32 / played as f32; // 保留统计（升级期望已覆盖胜负信息）
     let first_out_rate = ns_first_out as f32 / played as f32;
     let avg_endgame_residual = ns_residual_sum as f32 / played as f32;
-    // 与 optimizer.rs::eval_to_score 保持一致：胜率0.5 + 头游0.2 + 残局清牌0.3
+    // 与 optimizer.rs::eval_to_score 保持一致（路线图①）：升级期望0.5 + 头游0.2 + 残局清牌0.3
+    let level_ev = ((ns_level_delta_sum as f32 / played as f32) + 3.0) / 6.0;
     let clear_rate = (1.0 - (avg_endgame_residual / 27.0).clamp(0.0, 1.0)).max(0.0);
-    win_rate * 0.5 + first_out_rate * 0.2 + clear_rate * 0.3
+    level_ev * 0.5 + first_out_rate * 0.2 + clear_rate * 0.3
 }
 
 fn run_single_match_from_log(
     engine: &GameEngine,
     _params: &AdvancedBotParams,
-) -> Result<Option<(TeamId, TeamId, usize)>, String> {
+) -> Result<Option<(TeamId, TeamId, i32, usize)>, String> {
     use crate::game::card::HandLevel;
-    
+
     let mut state = engine.init_table(format!("learn_{}", uuid::Uuid::new_v4()));
     let first_drawer = Seat::S;
     engine
@@ -331,14 +335,29 @@ fn run_single_match_from_log(
 
     if outcome.final_phase == GamePhase::Scoring {
         if let Some(winner) = state.winner_team {
-            let first_out_team = state.hand
+            let finishing = state
+                .hand
                 .as_ref()
-                .and_then(|h| h.finishing_order.first().copied())
+                .map(|h| h.finishing_order.clone())
+                .unwrap_or_default();
+            let first_out_team = finishing.first().copied()
                 .map(|seat| match seat {
                     Seat::E | Seat::W => TeamId::Ew,
                     Seat::S | Seat::N => TeamId::Sn,
                 })
                 .unwrap_or(winner);
+            // 升级行：头游队为胜方；胜方二游也是本队 → 双上+3，否则单上+2；负方取负。
+            let ns_level_delta = match (finishing.first(), finishing.get(1)) {
+                (Some(f1), Some(f2)) => {
+                    let (t1, t2) = (
+                        match f1 { Seat::E | Seat::W => TeamId::Ew, _ => TeamId::Sn },
+                        match f2 { Seat::E | Seat::W => TeamId::Ew, _ => TeamId::Sn },
+                    );
+                    let gain = if t2 == t1 { 3i32 } else { 2 };
+                    if t1 == TeamId::Sn { gain } else { -gain }
+                }
+                _ => 0,
+            };
             // NS队结束时剩余手牌总数(S+N)：衡量残局剩牌表现
             let ns_residual = state
                 .hand
@@ -348,7 +367,7 @@ fn run_single_match_from_log(
                         + h.hands.get(&Seat::N).map(|v| v.len()).unwrap_or(0)
                 })
                 .unwrap_or(0);
-            Ok(Some((winner, first_out_team, ns_residual)))
+            Ok(Some((winner, first_out_team, ns_level_delta, ns_residual)))
         } else {
             Ok(None)
         }
