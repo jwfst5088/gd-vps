@@ -161,6 +161,11 @@ const BANNED_SCORE: f32 = 99999.0;
 /// 房规（用户 2026-09-03）：百搭优先用于炸弹/同花顺——手中余牌与剩余百搭仍可组成
 /// 炸弹/同花顺时，把百搭用进更低级组合的冻结惩罚（房规禁令不入训练面）。
 const WILD_CONSERVATION_PENALTY: f32 = 150.0;
+/// 房规（用户 2026-09-02 反孤儿条款）：出牌后剩余手牌全是百搭 → 百搭将沦为最后
+/// 孤张（被迫单出/孤注一掷）→ 重罚该出牌，倒逼把百搭并入当前组合一起走。
+/// CF scoreLeadPlay 原有领出侧单百搭 −800 同源；本次统一为 all-wild 口径并
+/// 补齐领出+跟牌两侧（冻结不入训练面）。
+const WILD_STRAND_PENALTY: f32 = 800.0;
 
 // ── 房规（用户 2026-09-03）：残局报牌防走/送队友（领出侧，冻结不入训练面）──
 // 原弱化版（+40/−50/−20）被其他分项淹没导致"房规失效"，本次按用户口径原位加强。
@@ -284,6 +289,24 @@ fn wilds_could_form_bomb_or_sf(p: &PlayContext, play_cards: &[String]) -> bool {
         }
     }
     false
+}
+
+/// 房规（用户 2026-09-02 反孤儿条款）：出牌后剩余手牌是否全为百搭。
+/// 全为百搭 = 百搭即将沦为最后孤张（无任何天然牌可搭伙）→ 触发 WILD_STRAND_PENALTY。
+fn leftover_all_wild(p: &PlayContext, play_cards: &[String]) -> bool {
+    let mut to_remove: Vec<String> = play_cards.to_vec();
+    let mut any_left = false;
+    for c in &p.my_hand {
+        if let Some(pos) = to_remove.iter().position(|r| r == c) {
+            to_remove.remove(pos);
+        } else {
+            any_left = true;
+            if !p.meta_for(c).map(|m| m.is_wild).unwrap_or(false) {
+                return false;
+            }
+        }
+    }
+    any_left
 }
 
 // ── Hand combo analysis (JS analyzeHandCombos L1215-1320) ──────────────
@@ -1528,6 +1551,20 @@ fn find_best_play_follow<'a>(
                 && !follow_breaks_bomb(c)
                 && c.combo.kind == top.combination.kind
         });
+    // 反孤儿条款（2026-09-02）：所有天然同型平跟都会把百搭打成最后孤张（出牌后
+    // 剩余全百搭）→ 解除"能跟就不烧"对含百搭候选的排除，让救孤候选参与计分
+    // （配合 WILD_STRAND_PENALTY：天然平跟 −800 vs 救孤候选轻罚 → 救孤胜出）。
+    // 炸弹不随此豁免（能跟就普通跟的硬规则不变），只有百搭候选获得救孤通道。
+    let natural_follow_strands_wild = has_same_type_follow
+        && candidates
+            .iter()
+            .filter(|c| {
+                c.combo.class() == CombinationClass::Ordinary
+                    && !cand_has_wild(c)
+                    && !follow_breaks_bomb(c)
+                    && c.combo.kind == top.combination.kind
+            })
+            .all(|c| leftover_all_wild(p, &c.cards));
 
     // Score each possible play and pick the best one (ties → first in order, JS stable sort)
     let mut best: Option<(f32, &Candidate)> = None;
@@ -1543,9 +1580,12 @@ fn find_best_play_follow<'a>(
         }
         // 房规（用户 2026-09-03）：能跟就不烧——有天然同型平跟时，非清空候选里的
         // 炸弹与含百搭候选全部排除（唯一豁免 = 直接清空手牌）。
+        // 反孤儿豁免（2026-09-02）：天然平跟全部会把百搭打成孤张时，含百搭候选解除
+        // 排除（救孤通道）；炸弹仍排除（能普通跟就不炸的硬规则不变）。
         if has_same_type_follow
             && cand.cards.len() < my_remaining
-            && (cand.combo.class() == CombinationClass::Bomb || cand_has_wild(cand))
+            && (cand.combo.class() == CombinationClass::Bomb
+                || (cand_has_wild(cand) && !natural_follow_strands_wild))
         {
             continue;
         }
@@ -2157,6 +2197,13 @@ fn score_follow(
         score -= WILD_CONSERVATION_PENALTY;
     }
 
+    // ── 房规（用户 2026-09-02 反孤儿条款，跟牌侧）：出牌后剩余全百搭 → 重罚 ──
+    // 与领出侧同规：百搭将沦为最后孤张（被迫单出）时，倒逼把百搭并入当前组合。
+    // 救孤候选自己剩余含天然牌 → 不触发（天然平跟触发 −800 → 救孤胜出）。
+    if play_cards.len() < my_remaining && leftover_all_wild(p, play_cards) {
+        score -= WILD_STRAND_PENALTY;
+    }
+
     // ── 三带二不能带两张级牌 (JS 1089-1096) ──
     if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::FullHouse))
         && play_cards.len() >= 5
@@ -2733,6 +2780,12 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
         && wilds_could_form_bomb_or_sf(p, play_cards)
     {
         score -= WILD_CONSERVATION_PENALTY;
+    }
+
+    // ── 房规（用户 2026-09-02 反孤儿条款，领出侧）：出牌后剩余全百搭 → 重罚 ──
+    // CF scoreLeadPlay 原有单百搭 −800 同源；统一为 all-wild 口径（双百搭余牌同样算孤）。
+    if play_cards.len() < my_remaining && leftover_all_wild(p, play_cards) {
+        score -= WILD_STRAND_PENALTY;
     }
 
     // ── 三带二不能带两张级牌 (JS 1875-1884) ──
@@ -4093,6 +4146,37 @@ mod tests {
             );
         } else {
             panic!("Expected Play action, got {:?}", picked);
+        }
+    }
+
+    #[test]
+    fn wild_pair_rescues_strand_when_natural_follow_exists() {
+        // 反孤儿条款（2026-09-02，用户实战报告"百搭最后出的"）：跟牌场景天然平跟
+        // 会把百搭打成最后孤张时，救孤候选必须能突破"能跟就不烧"的排除。
+        // E 持 [♠K,♥K,♥2]（残局3张）跟 N 的对9：出 KK → 剩 [♥2] 孤张（WILD_STRAND_PENALTY
+        // −800）；出 K+♥2 对 → 剩 [♠K] 非孤。修复前"能跟就不烧"直接排除 K+♥2 → 百搭
+        // 一路 defer 到最后孤张单出。修复后救孤候选参与计分并胜出。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♠K", "♥K", "♥2"],
+            Some((Seat::N, vec!["♠9", "♥9"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♦9", "♣9", "♣4", "♥4", "♦4", "♠4", "♣6", "♥6", "♦6"],
+            vec!["♣6", "♠10", "♥10", "♦10", "♣10", "♠3", "♥3", "♦3", "♣3"],
+            vec!["♠Q", "♥Q", "♦Q", "♣Q", "♠J", "♥J", "♦J", "♣J", "♠8"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { cards, .. } => {
+                assert!(
+                    cards.len() == 2 && cards.contains(&"♥2".to_string()),
+                    "天然平跟会留百搭孤张时必须带百搭出对救孤（反孤儿条款），got {:?}",
+                    picked
+                );
+            }
+            other => panic!("Expected Play (K+百搭对子救孤), got {:?}", other),
         }
     }
 
