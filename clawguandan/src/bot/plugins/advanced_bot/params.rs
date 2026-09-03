@@ -357,7 +357,22 @@ impl AdvancedBotParams {
         // 40 个打分常数（12-51，路线图②扩大参数面；默认=引擎现值）。
         // 3 个 u8 阈值（冲刺/残局/队友冲刺）不参与变异——训练不可漂移房规。
         // 禁令/豁免/阈值全部冻结，可训练的只有打分量级。
-        let idx = rng.random_range(0..52);
+        //
+        // 死维度跳过（2026-09-02 全量活性审计，训练质量修复）：下列维度在 live 计分
+        // 路径（strategy/suggest.rs + advanced_bot/play_policy.rs，即自对弈评估实际
+        // 执行的代码）中无任何读取点——变异它们 = 行为完全不变，评估分差全为噪声，
+        // 采纳即污染冠军记录（best_score 虚增而真实棋力不变）：
+        //   1  first_out_weight   —— live 高级bot从未读取（仅老 rule_bot/scoring.rs 在用）
+        //   9  pass_stall_penalty —— live 从未读取（CF bot-advanced.js 同样只有定义）
+        //   12 bomb_keep_single   —— 2026-09-02 房规"中盘烧最后一炸=硬禁令"取代原
+        //                            −200 软罚后失去唯一读取点（键位保留稳定 JSON 格式）
+        // 拒绝抽样：52 维均匀抽、命中死维重抽 → 等价于在 49 个存活维上均匀分布。
+        // （match 臂保留全部 52 维映射作为文档；死维臂实际不可达。）
+        const DEAD_MUTATE_DIMS: [usize; 3] = [1, 9, 12];
+        let mut idx = rng.random_range(0..52);
+        while DEAD_MUTATE_DIMS.contains(&idx) {
+            idx = rng.random_range(0..52);
+        }
         macro_rules! m {
             ($field:ident, $lo:expr, $hi:expr) => {
                 cloned.$field = (cloned.$field + rng.random_range(-step_size..step_size)).clamp($lo, $hi)
@@ -366,7 +381,7 @@ impl AdvancedBotParams {
         match idx {
             // f32 参数：加随机浮点扰动，clamp 到合理范围
             0 => m!(team_win_weight, 0.1, 10.0),
-            1 => m!(first_out_weight, 0.1, 10.0),
+            1 => m!(first_out_weight, 0.1, 10.0), // 死维：抽样已跳过（live 未读取）
             2 => m!(second_out_weight, 0.1, 10.0),
             3 => m!(yield_to_partner_bias, 0.1, 10.0),
             4 => m!(bomb_conserve_bias, 0.1, 10.0),
@@ -374,12 +389,12 @@ impl AdvancedBotParams {
             6 => m!(endgame_clear_hand_bias, 0.1, 10.0),
             7 => m!(proactive_play_bias, 0.1, 10.0),
             8 => m!(low_card_dump_bias, 0.1, 10.0),
-            9 => m!(pass_stall_penalty, 0.1, 10.0),
+            9 => m!(pass_stall_penalty, 0.1, 10.0), // 死维：抽样已跳过（live 未读取）
             // 概率阈值参数（牌踪器已激活）：clamp 到 [0.1, 1.0]
             10 => m!(prob_threshold_for_bomb, 0.1, 1.0),
             11 => m!(prob_threshold_for_intercept, 0.1, 1.0),
             // 打分常数（量级，正数）：clamp 到 [1, 2000]
-            12 => m!(bomb_keep_single, 1.0, 2000.0),
+            12 => m!(bomb_keep_single, 1.0, 2000.0), // 死维：硬禁令取代后无读取点，抽样已跳过
             13 => m!(bomb_over_single, 1.0, 2000.0),
             14 => m!(bomb_over_pair, 1.0, 2000.0),
             15 => m!(wild_bomb_bonus, 1.0, 2000.0),
@@ -430,5 +445,41 @@ impl AdvancedBotParams {
 impl Default for AdvancedBotParams {
     fn default() -> Self {
         Self::default_balanced()
+    }
+}
+
+#[cfg(test)]
+mod dead_dim_tests {
+    use super::*;
+
+    /// 死维度回归锁（2026-09-02 活性审计）：mutate_random 不得触碰
+    /// live 计分无读取点的维度（1=first_out_weight, 9=pass_stall_penalty,
+    /// 12=bomb_keep_single）——否则变异=行为不变、评估分差全为噪声，
+    /// 噪声采纳会污染冠军记录。若未来某死维被接入 live 计分，
+    /// 应同步把它移出 DEAD_MUTATE_DIMS 并更新本测试。
+    #[test]
+    fn mutate_random_never_touches_dead_dims() {
+        let base = crate::strategy::suggest::js_trained_params();
+        // 哨兵值：与默认不同，一旦被变异立刻可见
+        let mut base = base;
+        base.first_out_weight = 7.777;
+        base.pass_stall_penalty = 7.777;
+        base.bomb_keep_single = 777.7;
+        let mut live_dim_hits = 0u32;
+        for _ in 0..3000 {
+            let m = base.mutate_random(0.5);
+            assert_eq!(m.first_out_weight, 7.777, "死维1被变异");
+            assert_eq!(m.pass_stall_penalty, 7.777, "死维9被变异");
+            assert_eq!(m.bomb_keep_single, 777.7, "死维12被变异");
+            if m.team_win_weight != base.team_win_weight
+                || m.bomb_conserve_bias != base.bomb_conserve_bias
+                || m.keep_bomb_bonus != base.keep_bomb_bonus
+                || m.dual_wild_penalty_mid != base.dual_wild_penalty_mid
+            {
+                live_dim_hits += 1;
+            }
+        }
+        // 3000 次抽样必须实际命中过存活维度（抽样器没退化成空转）
+        assert!(live_dim_hits > 0, "3000 次变异未命中任何存活维度");
     }
 }
