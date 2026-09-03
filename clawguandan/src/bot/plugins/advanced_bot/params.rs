@@ -51,8 +51,10 @@ pub const D_UPGRADED_BOMB_WILD_MID: f32 = 300.0; // 天然炸弹贴百搭升档�
 pub const D_UPGRADED_BOMB_WILD_END: f32 = 160.0; // 升档残局轻罚
 pub const D_WILD_ON_LEVEL_MID: f32 = 250.0; // 百搭落级牌中盘重罚
 pub const D_WILD_ON_LEVEL_END: f32 = 20.0; // 百搭落级牌残局轻罚
-pub const D_WILD_PLAIN_PAIR_MID: f32 = 300.0; // 百搭配普通单张成普通对中盘重罚
-pub const D_WILD_PAIR_PENALTY_END: f32 = 15.0; // 百搭配对子残局轻罚
+// 用户 2026-09-03 调令：百搭配单张成对 300→800（压到反孤儿罚同线，仅救孤候选豁免）、
+// 残局 15→100。与 CF 同步，js_trained_params 显式钉住防训练回落。
+pub const D_WILD_PLAIN_PAIR_MID: f32 = 800.0; // 百搭配普通单张成普通对中盘重罚
+pub const D_WILD_PAIR_PENALTY_END: f32 = 100.0; // 百搭配对子残局罚
 pub const D_BARE_DUAL_WILD_EXTRA: f32 = 200.0; // 裸出双百搭额外加重
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

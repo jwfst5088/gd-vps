@@ -147,6 +147,10 @@ pub(crate) fn js_trained_params() -> AdvancedBotParams {
         wild_bomb_bonus: 250.0,
         upgraded_bomb_wild_mid: 300.0,
         upgraded_bomb_wild_end: 160.0,
+        // 用户 2026-09-03 调令：百搭配单张成对 300→800 / 残局 15→100（救孤候选经
+        // score_follow_ex 的 wild_rescue_lift 豁免）。显式钉住防训练冠军同步回落。
+        wild_plain_pair_mid: 800.0,
+        wild_pair_penalty_end: 100.0,
         ..crate::bot::plugins::advanced_bot::params::AdvancedBotParams::scoring_defaults()
     }
 }
@@ -1707,7 +1711,30 @@ fn find_best_play_follow<'a>(
                 continue;
             }
         }
-        let s = score_follow(cand.cards, &cand.combo, top, p);
+        // 房规（用户 2026-09-03 加大）：百搭配单张成普通对——中盘（手牌>6）非救孤/非清空
+        // 直接排除候选（宁可过牌也不烧百搭凑对；−800 罚留作兜底计分）。残局保留候选但
+        // score_follow_ex 内 −100 重罚。级牌对不在此类（wild_on_level 已另行重罚）。
+        if p.my_remaining > 6
+            && cand.cards.len() < my_remaining
+            && cand_has_wild(cand)
+            && matches!(cand.combo.kind, CombinationKind::Ordinary(OrdinaryKind::Pair))
+            && !natural_follow_strands_wild
+        {
+            let nat_rank = cand.cards.iter().find_map(|s| {
+                let m = p.meta_for(s)?;
+                if m.is_wild || m.is_joker {
+                    None
+                } else {
+                    Some(m.rank)
+                }
+            });
+            if let Some(pr) = nat_rank {
+                if pr != p.level_rank {
+                    continue;
+                }
+            }
+        }
+        let s = score_follow_ex(cand.cards, &cand.combo, top, p, natural_follow_strands_wild);
         if best.map_or(true, |(bs, _)| s > bs) {
             best = Some((s, cand));
         }
@@ -1821,6 +1848,19 @@ fn score_follow(
     play_combo: &Combination,
     top: &PlayState,
     p: &PlayContext,
+) -> f32 {
+    score_follow_ex(play_cards, play_combo, top, p, false)
+}
+
+/// wild_rescue_lift = 反孤儿救孤旗（natural_follow_strands_wild）：所有天然同型平跟
+/// 都会把百搭打成最后孤张时，含百搭候选走救孤通道——百搭配单张成对的罚分豁免，
+/// 否则 −800 配对罚与天然平跟的 −800 孤张罚同线打平，救孤胜负沦为候选顺序。
+fn score_follow_ex(
+    play_cards: &[String],
+    play_combo: &Combination,
+    top: &PlayState,
+    p: &PlayContext,
+    wild_rescue_lift: bool,
 ) -> f32 {
     let kind = &play_combo.kind;
     let mut score = BASE_FOLLOW_SCORE; // JS L734 base score
@@ -2181,8 +2221,10 @@ fn score_follow(
         ) {
             // 合理使用，不罚
         } else if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Pair)) {
-            // 房规：百搭配普通单张成普通对 = 又弱又废，重罚
-            if !finishing_play {
+            // 房规（用户 2026-09-03 加大）：百搭配普通单张成普通对 = 又弱又废——
+            // 中盘 −800（压到反孤儿罚同线，仅救孤候选经 wild_rescue_lift 豁免）、
+            // 残局 −100。级牌对已由上方统一罚。
+            if !finishing_play && !wild_rescue_lift {
                 let pair_naturals: Vec<CardMeta> = play_cards
                     .iter()
                     .filter_map(|c| p.meta_for(c))
@@ -4235,6 +4277,30 @@ mod tests {
         } else {
             panic!("Expected Play action, got {:?}", picked);
         }
+    }
+
+    #[test]
+    fn wild_pair_midgame_excluded_without_natural_follow() {
+        // 房规（用户 2026-09-03 加大）：百搭配单张成对——中盘（手牌>6）无天然对可跟时
+        // 百搭对候选直接排除 → 宁可过牌也不烧百搭凑对（残局保留候选走 −100 罚）。
+        // E 持 7 张（无天然对，唯一能压对9的跟法 = ♠K+♥2 百搭对）→ 必须过牌。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♥2", "♠K", "♠3", "♠7", "♠8", "♠9", "♠10"],
+            Some((Seat::N, vec!["♠9", "♥9"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♣3", "♠4", "♥4", "♦4", "♣6", "♥6", "♦8", "♣8", "♦J"],
+            vec!["♦3", "♣7", "♥7", "♦9", "♣9", "♠J", "♥J", "♦Q", "♣Q"],
+            vec!["♠5", "♥5", "♦6", "♠8", "♥10", "♦10", "♣10", "♥Q", "♦K"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        assert!(
+            matches!(picked, PlayerAction::Pass),
+            "中盘百搭配单张成对必须被排除（过牌不烧百搭），got {:?}",
+            picked
+        );
     }
 
     #[test]
