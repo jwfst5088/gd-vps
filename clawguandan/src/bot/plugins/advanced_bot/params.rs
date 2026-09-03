@@ -14,7 +14,7 @@ pub const D_BOMB_KEEP_SINGLE: f32 = 200.0; // 炸弹保留：手里只剩1炸 �
 // （last_bomb_penalty 已于 2026-09-03 升级为禁令级房规，不再参数化）
 pub const D_BOMB_OVER_SINGLE: f32 = 300.0; // 炸压单张
 pub const D_BOMB_OVER_PAIR: f32 = 200.0; // 炸压对子
-pub const D_WILD_BOMB_BONUS: f32 = 100.0; // 百搭成炸/同花顺
+pub const D_WILD_BOMB_BONUS: f32 = 250.0; // 百搭成炸/同花顺（用户 2026-09-03 调令 100→250，与 js_trained_params/CF 三处一致）
 pub const D_WILD_RUN_BONUS: f32 = 30.0; // 百搭成顺/钢板/木板
 pub const D_ENDGAME_SINGLE_REMOVAL: f32 = 400.0; // 残局移除单张
 pub const D_ENDGAME_SMALL_SINGLE_REMOVAL: f32 = 300.0; // 残局移除小单张
@@ -44,8 +44,11 @@ pub const D_LEAD_PRIMARY_STEP_ENDGAME: f32 = 1.5; // 残局 primary 每点罚
 pub const D_SOLVER_JUNK_BONUS: f32 = 15.0; // 求解器同墩甩废单倾向 每张
 pub const D_DUAL_WILD_PENALTY_MID: f32 = 600.0; // 中盘双百搭同出重罚
 pub const D_DUAL_WILD_PENALTY_END: f32 = 60.0; // 残局双百搭同出罚
-pub const D_UPGRADED_BOMB_WILD_MID: f32 = 150.0; // 天然炸弹贴百搭升档中盘重罚
-pub const D_UPGRADED_BOMB_WILD_END: f32 = 10.0; // 升档残局轻罚
+// 用户 2026-09-03 调令：wild_bomb_bonus 100→250（百搭"拼成"炸弹/同花顺重奖），
+// 升档浪费罚同步 +150 配平——贴百搭升档（百搭非必要）净效应与调令前分毫不差：
+// 中盘 +250−300=−50（原 +100−150）、残局 +250−160=+90（原 +100−10）。
+pub const D_UPGRADED_BOMB_WILD_MID: f32 = 300.0; // 天然炸弹贴百搭升档中盘重罚
+pub const D_UPGRADED_BOMB_WILD_END: f32 = 160.0; // 升档残局轻罚
 pub const D_WILD_ON_LEVEL_MID: f32 = 250.0; // 百搭落级牌中盘重罚
 pub const D_WILD_ON_LEVEL_END: f32 = 20.0; // 百搭落级牌残局轻罚
 pub const D_WILD_PLAIN_PAIR_MID: f32 = 300.0; // 百搭配普通单张成普通对中盘重罚

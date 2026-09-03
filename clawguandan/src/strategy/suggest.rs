@@ -139,6 +139,14 @@ pub(crate) fn js_trained_params() -> AdvancedBotParams {
         prob_threshold_for_intercept: 0.4,
         enable_reason_trace: false, // 与 CF/参数文件一致（true 仅多一条调试打印）
         keep_bomb_bonus: 499.99548, // 2026-09-02 16:06 训练首个采纳变异（57键新冠军，bestScore 0.6665）
+        // 用户 2026-09-03 调令：加大"百搭组成炸弹/同花顺"奖励力度（100→250，与 CF 同步）。
+        // 250 压过所有次级百搭信号（保留罚 −150 / 顺子 +30 / 配对 −300），且低于清空 +10000。
+        // 语义边界（用户裁决）：奖励只作用于百搭"拼成"炸/同花顺（百搭必要）；天然炸贴百搭
+        // 升档仍属浪费——升档罚同步 +150 配平（mid 300 / end 160），升档净效应不变。
+        // 三键显式钉住（同 keep_bomb_bonus）防训练冠军同步时回落。
+        wild_bomb_bonus: 250.0,
+        upgraded_bomb_wild_mid: 300.0,
+        upgraded_bomb_wild_end: 160.0,
         ..crate::bot::plugins::advanced_bot::params::AdvancedBotParams::scoring_defaults()
     }
 }
