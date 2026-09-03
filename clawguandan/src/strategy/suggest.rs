@@ -174,6 +174,14 @@ const WILD_CONSERVATION_PENALTY: f32 = 150.0;
 /// CF scoreLeadPlay 原有领出侧单百搭 −800 同源；本次统一为 all-wild 口径并
 /// 补齐领出+跟牌两侧（冻结不入训练面）。
 const WILD_STRAND_PENALTY: f32 = 800.0;
+/// 房规（用户 2026-09-03）：百搭同花顺拆牌质量评估——
+/// ① 拆完剩余牌可组成新的杂顺子 → +450 重奖（抵消空出炸弹罚；领出侧另加
+///    keep_bomb_bonus 抵"留炸到残局"倾向——"SF 先手 + 剩顺后续"两墩计划成立）；
+/// ② 拆完剩余散单张 ≥3 → −250 惩罚（同花顺拆出一手烂剩牌）。
+/// 杂顺窗口与 movegen 一致（2 作低：2-6 … 10-A）；百搭/王不参与检测与散张计数。
+/// （冻结不入训练面；仅作用于百搭同花顺候选，跟牌侧同受 B1 守卫约束。）
+const SF_LEFTOVER_STRAIGHT_BONUS: f32 = 450.0;
+const SF_LEFTOVER_SINGLES_PENALTY: f32 = 250.0;
 
 // ── 房规（用户 2026-09-03）：残局报牌防走/送队友（领出侧，冻结不入训练面）──
 // 原弱化版（+40/−50/−20）被其他分项淹没导致"房规失效"，本次按用户口径原位加强。
@@ -315,6 +323,48 @@ fn leftover_all_wild(p: &PlayContext, play_cards: &[String]) -> bool {
         }
     }
     any_left
+}
+
+/// 房规（用户 2026-09-03）：百搭同花顺拆牌质量——
+/// 返回 (剩余可组杂顺数, 去顺后散单张数)。百搭/王不计入；级牌天然牌按普通点数参与。
+/// 杂顺窗口与 movegen 一致（2 作低：2-6 … 10-A，各 5 连点数）。
+fn sf_leftover_straights_and_singles(p: &PlayContext, play_cards: &[String]) -> (usize, usize) {
+    let mut to_remove: Vec<String> = play_cards.to_vec();
+    let mut rank_cnt: HashMap<u8, usize> = HashMap::new();
+    for c in &p.my_hand {
+        if let Some(pos) = to_remove.iter().position(|r| r == c) {
+            to_remove.remove(pos);
+            continue;
+        }
+        let Some(m) = p.meta_for(c) else { continue };
+        if m.is_wild || m.is_joker {
+            continue;
+        }
+        if let Some(nv) = m.natural {
+            *rank_cnt.entry(nv).or_default() += 1;
+        }
+    }
+    let mut straights = 0usize;
+    loop {
+        let mut found = false;
+        for lo in 2u8..=10u8 {
+            if (lo..lo + 5).all(|r| rank_cnt.get(&r).copied().unwrap_or(0) >= 1) {
+                for r in lo..lo + 5 {
+                    if let Some(n) = rank_cnt.get_mut(&r) {
+                        *n -= 1;
+                    }
+                }
+                straights += 1;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            break;
+        }
+    }
+    let singles = rank_cnt.values().filter(|&&n| n == 1).count();
+    (straights, singles)
 }
 
 // ── Hand combo analysis (JS analyzeHandCombos L1215-1320) ──────────────
@@ -1924,6 +1974,20 @@ fn score_follow(
             let b1_exempt = is_endgame || p.min_opp_remaining <= 6 || !not_clearing;
             if !(counter_bomb && !b1_exempt) {
                 score += p.params.wild_bomb_bonus; // 逢人配配炸弹/同花顺：重奖！
+                // 房规（用户 2026-09-03）：百搭同花顺拆牌质量——剩牌组新杂顺 +450 /
+                // 去顺后散单张≥3 −250。置于 B1 同一守卫内：B1 压制时不给拆牌奖励。
+                if matches!(kind, CombinationKind::Bomb(BombKind::StraightFlush))
+                    && not_clearing
+                {
+                    let (lo_straights, lo_singles) =
+                        sf_leftover_straights_and_singles(p, play_cards);
+                    if lo_straights > 0 {
+                        score += SF_LEFTOVER_STRAIGHT_BONUS;
+                    }
+                    if lo_singles >= 3 {
+                        score -= SF_LEFTOVER_SINGLES_PENALTY;
+                    }
+                }
             }
         } else {
             match kind {
@@ -2610,6 +2674,22 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
     if has_wildcard {
         if is_bomb || matches!(kind, CombinationKind::Bomb(BombKind::StraightFlush)) {
             score += p.params.wild_bomb_bonus; // 逢人配配炸弹/同花顺：重奖！
+            // 房规（用户 2026-09-03）：百搭同花顺拆牌质量——
+            // ① 拆完剩牌可组新杂顺 → +450 抵空出炸弹罚，另加 keep_bomb_bonus 抵
+            //    "留炸到残局"倾向（"SF 先手 + 剩顺后续"是完整两墩计划，不属浪费炸）；
+            // ② 拆完去顺后散单张≥3 → −250（拆出一手烂剩牌，不如出杂顺/百搭顺）。
+            if matches!(kind, CombinationKind::Bomb(BombKind::StraightFlush))
+                && play_cards.len() < my_remaining
+            {
+                let (lo_straights, lo_singles) =
+                    sf_leftover_straights_and_singles(p, play_cards);
+                if lo_straights > 0 {
+                    score += SF_LEFTOVER_STRAIGHT_BONUS + p.params.keep_bomb_bonus;
+                }
+                if lo_singles >= 3 {
+                    score -= SF_LEFTOVER_SINGLES_PENALTY;
+                }
+            }
         } else {
             match kind {
                 CombinationKind::Ordinary(OrdinaryKind::Straight)
@@ -4154,6 +4234,79 @@ mod tests {
             );
         } else {
             panic!("Expected Play action, got {:?}", picked);
+        }
+    }
+
+    #[test]
+    fn wild_sf_with_straight_leftover_beats_plain_run_lead() {
+        // 房规（用户 2026-09-03）：百搭同花顺拆牌质量①——拆完剩余牌可组新杂顺 →
+        // +450 恰好抵消空出炸弹罚，"SF 先手 + 剩顺后续"两墩计划成立 → SF 领出胜出
+        // （旧语义被空出炸弹罚 −450 压到杂顺之后）。
+        // 手 [♥2,♠4,♠5,♠6,♠7,♦8,♦9,♦10,♦J,♦Q] 领出：SF=♠4-7+♥2，剩 ♦8-Q 杂顺。
+        // W 剩 6 张 = 对手冲刺 → 豁免"中盘最后一炸禁令"（否则唯一炸 SF 被禁无法比较）。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♥2", "♠4", "♠5", "♠6", "♠7", "♦8", "♦9", "♦10", "♦J", "♦Q"],
+            None,
+        );
+        fill_seats(
+            &mut state,
+            vec!["♣3", "♠7", "♥7", "♦7", "♣7", "♠9", "♥9", "♦9", "♣9"],
+            vec!["♦3", "♣3", "♠6", "♥6", "♦6", "♣6", "♠8", "♥8", "♦8"],
+            vec!["♠A", "♥A", "♦A", "♣3", "♣5", "♣10"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { cards, wild_targets } => {
+                let combo = CombinationParser::parse(cards, wild_targets.as_deref(), ctx())
+                    .expect("candidate must parse");
+                assert!(
+                    matches!(combo.class(), CombinationClass::Bomb)
+                        && cards.len() == 5
+                        && cards.contains(&"♥2".to_string())
+                        && cards.contains(&"♠4".to_string())
+                        && cards.contains(&"♠7".to_string()),
+                    "百搭SF剩顺两墩计划必须胜出杂顺领出（拆牌质量奖励），got {:?}",
+                    picked
+                );
+            }
+            other => panic!("Expected Play (wild SF), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn wild_sf_with_many_single_leftover_avoided() {
+        // 房规（用户 2026-09-03）：百搭同花顺拆牌质量②——拆完去顺后散单张 ≥3 →
+        // −250 惩罚。手 [♥2,♠4-7,♠K,♥K,♦K,♣K,♦3,♣9,♠J] 领出：SF 拆完剩
+        // KKKK+♦3+♣9+♠J（3 散单）→ 不得领出该 SF（KKKK/小牌保留炸弹等更优）。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♥2", "♠4", "♠5", "♠6", "♠7", "♠K", "♥K", "♦K", "♣K", "♦3", "♣9", "♠J"],
+            None,
+        );
+        fill_seats(
+            &mut state,
+            vec!["♣3", "♠7", "♥7", "♦7", "♣7", "♠9", "♥9", "♦9", "♣9"],
+            vec!["♦3", "♣3", "♠6", "♥6", "♦6", "♣6", "♠8", "♥8", "♦8"],
+            vec!["♠A", "♥A", "♦A", "♣5", "♣10", "♠2", "♥3", "♦4", "♣8"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { cards, wild_targets } => {
+                let combo = CombinationParser::parse(cards, wild_targets.as_deref(), ctx())
+                    .expect("candidate must parse");
+                let is_wild_sf = cards.len() == 5
+                    && cards.contains(&"♥2".to_string())
+                    && cards.contains(&"♠4".to_string())
+                    && cards.contains(&"♠7".to_string())
+                    && matches!(combo.class(), CombinationClass::Bomb);
+                assert!(
+                    !is_wild_sf,
+                    "SF 拆完散单≥3 必须被惩罚回避（不得领出该百搭同花顺），got {:?}",
+                    picked
+                );
+            }
+            other => panic!("Expected Play action, got {:?}", other),
         }
     }
 
