@@ -1490,9 +1490,10 @@ fn find_best_play_follow<'a>(
     let is_endgame = my_remaining <= 6;
     let is_opp_sprinting = p.enemy_sprinting;
 
-    // 房规 B1（2026-08-30 收紧）：反炸 + 有免百搭候选 → 跳过含百搭的炸（非清空）。
-    // 原"残局/对手冲刺"豁免移除：同样赢下这一轮，免百搭方案零成本，烧百搭=浪费。
-    // 唯一豁免=该含百搭炸能直接清空手牌（len == remaining）。
+    // 房规 B1（2026-08-30 收紧；2026-09-02 扩面）：有免百搭炸可压 → 跳过含百搭的炸（非清空）。
+    // 2026-09-02 实战（CF 局）：敌领 777，我持 8888+♥2 → 出了 8888+♥2 五炸（wild_bomb_bonus
+    // +100 反而压过天然 8888）——原守卫只在顶牌是炸弹时生效，普通顶牌漏防。
+    // 现推广到任意顶牌：天然炸已经压得住就不烧百搭。唯一豁免=该含百搭炸能直接清空手牌。
     let top_is_bomb = top.combination.class() == CombinationClass::Bomb;
     let cand_has_wild = |c: &Candidate| {
         c.cards
@@ -1531,11 +1532,9 @@ fn find_best_play_follow<'a>(
     // Score each possible play and pick the best one (ties → first in order, JS stable sort)
     let mut best: Option<(f32, &Candidate)> = None;
     for cand in candidates {
-        // 房规 B1（2026-08-30 收紧）：反炸 + 有免百搭候选 → 跳过含百搭的炸（非清空）。
-        // 原"残局/对手冲刺"豁免移除：同样赢下这一轮，免百搭方案零成本，烧百搭=浪费。
-        // 唯一豁免=该含百搭炸能直接清空手牌（len == remaining）。
-        if top_is_bomb
-            && has_wildfree_bomb
+        // 房规 B1（2026-08-30 收紧；2026-09-02 扩面）：有免百搭炸可压 → 跳过含百搭的炸（非清空），
+        // 任意顶牌适用（原仅限顶牌=炸弹，普通顶牌漏防——见上方实战案例）。唯一豁免=清空手牌。
+        if has_wildfree_bomb
             && cand.combo.class() == CombinationClass::Bomb
             && cand_has_wild(cand)
             && cand.cards.len() < my_remaining
@@ -3320,7 +3319,10 @@ mod tests {
 
         // ① 跟牌 KKK+33（三张=级牌→允许炸；小fh跟不了）：唯一用法比较 → 百搭配炸弹 555+♥2。
         // （领出场景下 555+88 可拼天然三带二，不属"百搭使用优先级"范畴，故用跟牌设计。）
-        let n_hand = ["♠5", "♥5", "♦5", "♥2", "♠9", "♥9", "♦9", "♣9", "♠3"];
+        // 2026-09-02 场景修正：原手含天然 9999，B1 扩面（有免百搭炸可压就不烧百搭）
+        // 会正确改出 9999——为继续单测"百搭使用优先级"（炸弹>三带二），移除天然炸并改
+        // 残局（6张，避开中盘"出炸后0炸"守卫），让百搭炸弹成为唯一炸弹候选。
+        let n_hand = ["♠5", "♥5", "♦5", "♥2", "♠3", "♠Q"];
         let mut state = mk_playing_state(
             Seat::N,
             n_hand.to_vec(),
@@ -4826,6 +4828,43 @@ mod tests {
     }
 
     #[test]
+    fn wildfree_bomb_beats_ordinary_top_without_burning_wild() {
+        // 房规 B1 扩面（2026-09-02）：任意顶牌——有免百搭炸可压就不烧百搭。
+        // 实战案例（CF 局）：敌领 777，我持 8888+♥2 → 出了 8888+♥2 五炸
+        // （wild_bomb_bonus +100 曾使含百搭炸反超天然炸），必须选天然 8888。
+        // 场景设为残局（6张）：房规A（三张<Q中盘禁炸）在残局豁免，从而精确
+        // 隔离 B1 扩面语义；打完剩 2 张 ≤2 也不触发残局留炸禁令。
+        let mut state = mk_playing_state(
+            Seat::E,
+            vec!["♠8", "♥8", "♦8", "♣8", "♠5", "♥2"],
+            Some((Seat::N, vec!["♠7", "♥7", "♦7"])),
+        );
+        fill_seats(
+            &mut state,
+            vec!["♣4", "♥4", "♦4", "♠4", "♣6", "♥6", "♦6", "♣6", "♠3"],
+            vec!["♥7", "♦7", "♣7", "♠10", "♥10", "♦10", "♣10", "♠3", "♥3"],
+            vec!["♦3", "♣3", "♠J", "♥J", "♦J", "♣J", "♠Q", "♥Q", "♦Q"],
+        );
+        let picked = suggest_next_action(&state, Seat::E).unwrap();
+        match &picked {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(
+                    cards.len(),
+                    4,
+                    "必须出 4 张天然炸 8888，got {:?}",
+                    picked
+                );
+                assert!(
+                    !cards.contains(&"♥2".to_string()),
+                    "有免百搭炸可压 777 时不得烧百搭升档（房规B1扩面），got {:?}",
+                    picked
+                );
+            }
+            other => panic!("Expected Play (wild-free bomb), got {:?}", other),
+        }
+    }
+
+    #[test]
     fn counter_bomb_prefers_wildfree_candidate() {
         // 用户房规 B1（2026-08-30）：反炸有免百搭候选时，不选含百搭的炸。
         // 敌领 4K；我有 4A（免百搭）与 5555+♥2（五张含百搭）都能压 → 必须选 4A。
@@ -4929,9 +4968,11 @@ mod tests {
     }
 
     #[test]
-    fn endgame_upgraded_wild_bomb_beats_natural_bomb() {
-        // JS 语义：残局 +100 百搭进炸弹奖励压过 −10 升档轻罚 → 5555+百搭(5炸)
-        // 胜过纯天然 5555（对手三张顶、无更优替牌）。
+    fn endgame_prefers_natural_bomb_over_wild_upgrade() {
+        // 语义更新（2026-09-02，用户实战裁决"为什么加百搭"）：旧版"+100 百搭奖励压过
+        // −10 升档轻罚 → 残局宁烧百搭升档 5 炸"已被房规 B1 扩面统一取代——
+        // 有免百搭炸可压（任意顶牌/任意阶段）就不烧百搭，唯一豁免=清空。
+        // 残局顶 999 三张，持 5555+♥2+♠K → 必须天然 5555，百搭留给 ♠K 组合/后续。
         let mut state = mk_playing_state(
             Seat::E,
             vec!["♠5", "♥5", "♦5", "♣5", "♥2", "♠K"],
@@ -4946,18 +4987,14 @@ mod tests {
         let picked = suggest_next_action(&state, Seat::E).unwrap();
         match &picked {
             PlayerAction::Play { cards, wild_targets } => {
-                let combo = CombinationParser::parse(cards, wild_targets.as_deref(), ctx())
-                    .expect("candidate must parse");
-                let uses_wild = wild_targets.as_deref().map_or(false, |t| !t.is_empty());
                 assert!(
-                    matches!(combo.class(), CombinationClass::Bomb)
-                        && cards.len() == 5
-                        && uses_wild,
-                    "endgame must prefer the upgraded wild bomb (wild bonus +100 vs −10), got {:?}",
+                    cards.len() == 4 && !cards.contains(&"♥2".to_string()),
+                    "有天然5555可压999时不得烧百搭升档5炸（房规B1扩面），got {:?}",
                     picked
                 );
+                let _ = wild_targets;
             }
-            other => panic!("Expected Play (upgraded wild bomb), got {:?}", other),
+            other => panic!("Expected Play (natural 5555), got {:?}", other),
         }
     }
 
