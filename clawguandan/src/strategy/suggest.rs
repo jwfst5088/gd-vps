@@ -3343,15 +3343,16 @@ mod tests {
         let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♠9", "♥9", "♦9", "♥2", "♠K"]
             .iter().map(|s| s.to_string()).collect();
         assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 1);
-        // ③ 1天然炸 + 1百搭 + 同花4连 → 潜在同花顺不计入 → 总数 1（旧=2）
-        let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♠6", "♠7", "♠8", "♠9", "♥2"]
+        // ③ 1天然炸(级牌K炸避免与♠6-9相连) + 1百搭 + 同花4连 → 潜在同花顺不计入 → 总数 1（旧=2）
+        //    注意：若炸为♠5555，♠5会与♠6-9连成真实天然同花顺→总数2（见⑤）
+        let hand: Vec<String> = ["♠K", "♥K", "♦K", "♣K", "♠6", "♠7", "♠8", "♠9", "♥2"]
             .iter().map(|s| s.to_string()).collect();
         assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 1);
         // ④ 1天然炸 + 1百搭 + 同花仅3连 → 总数 1
-        let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♠9", "♠10", "♠J", "♥2"]
+        let hand: Vec<String> = ["♠K", "♥K", "♦K", "♣K", "♠9", "♠10", "♠J", "♥2"]
             .iter().map(|s| s.to_string()).collect();
         assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 1);
-        // ⑤ 天然同花顺计入总数
+        // ⑤ 天然同花顺计入总数（♠5与♠6-10天然连成同花顺）
         let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♠6", "♠7", "♠8", "♠9", "♠10"]
             .iter().map(|s| s.to_string()).collect();
         assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 2); // 5555 + 天然同花顺
@@ -3625,7 +3626,8 @@ mod tests {
             other => panic!("expected wild bomb, got {other:?}"),
         }
 
-        // ② 百搭配顺子优先于百搭配三带二（手牌无天然顺子可用，5678+♥2 唯一顺子）。
+        // ② 2026-09-06 框架：领出侧不烧百搭——手牌存在百搭成炸潜质（55/66+♥2）且炸弹
+        //    绝对禁领出 → 百搭保留成炸，改领天然单张（旧期望"百搭顺子领出"已被取代）。
         let n_hand2 = ["♠5", "♥5", "♠6", "♥6", "♠7", "♠8", "♥2", "♠Q", "♠K"];
         let mut state = mk_playing_state(
             Seat::N,
@@ -3636,10 +3638,12 @@ mod tests {
         let act = suggest_next_action(&state, Seat::N).unwrap();
         match act {
             PlayerAction::Play { cards, .. } => {
-                assert_eq!(cards.len(), 5, "wild straight must be led, got {cards:?}");
-                assert!(cards.contains(&"♥2".to_string()), "straight must use wild, got {cards:?}");
+                assert!(
+                    !cards.contains(&"♥2".to_string()),
+                    "wild must stay for bomb potential, got {cards:?}"
+                );
             }
-            other => panic!("expected wild straight lead, got {other:?}"),
+            other => panic!("expected natural lead without wild, got {other:?}"),
         }
     }
 
@@ -3868,10 +3872,15 @@ mod tests {
             Some((Seat::E, fh_top.clone())),
         );
         fill(&mut state, &["♠5", "♥5", "♦5", "♠6", "♥2", "♠3", "♥4"], &["♠9"]);
+        // ③ 冲刺拦截：E剩1张 → 2026-09-06 阶梯：天然压不过三带二顶 → 百搭升第1级
+        //    出百搭炸（555+♥2）拦截（旧期望"百搭配对三带二放行"被阶梯取代）。
         let act = suggest_next_action(&state, Seat::N).unwrap();
         match act {
-            PlayerAction::Play { cards, .. } => assert_eq!(cards.len(), 5, "sprint exempts ban, got {cards:?}"),
-            other => panic!("sprint must allow wild-pair FH, got {other:?}"),
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 4, "sprint ladder: wild bomb intercepts, got {cards:?}");
+                assert!(cards.contains(&"♥2".to_string()), "bomb must use wild, got {cards:?}");
+            }
+            other => panic!("sprint must allow wild-bomb intercept, got {other:?}"),
         }
 
         // ④ 适当惩罚（非禁止）：55+♥2拼三张+66天然对 → 唯一能压 → 照常出。
@@ -4408,12 +4417,10 @@ mod tests {
     }
 
     #[test]
-    fn wild_sf_with_straight_leftover_beats_plain_run_lead() {
-        // 房规（用户 2026-09-03）：百搭同花顺拆牌质量①——拆完剩余牌可组新杂顺 →
-        // +450 恰好抵消空出炸弹罚，"SF 先手 + 剩顺后续"两墩计划成立 → SF 领出胜出
-        // （旧语义被空出炸弹罚 −450 压到杂顺之后）。
-        // 手 [♥2,♠4,♠5,♠6,♠7,♦8,♦9,♦10,♦J,♦Q] 领出：SF=♠4-7+♥2，剩 ♦8-Q 杂顺。
-        // W 剩 6 张 = 对手冲刺 → 豁免"中盘最后一炸禁令"（否则唯一炸 SF 被禁无法比较）。
+    fn wild_sf_lead_banned_by_absolute_rule_plain_run_leads() {
+        // 2026-09-06 领出绝对禁令：炸弹/同花顺（含百搭SF）非清空一律不领出 →
+        // 改领天然杂顺（旧期望"SF领出拆牌质量奖励胜出"被绝对禁令取代）。
+        // 手 [♥2,♠4,♠5,♠6,♠7,♦8,♦9,♦10,♦J,♦Q]：SF=♠4-7+♥2，天然杂顺 ♦8-Q / ♠4-7+♦8。
         let mut state = mk_playing_state(
             Seat::E,
             vec!["♥2", "♠4", "♠5", "♠6", "♠7", "♦8", "♦9", "♦10", "♦J", "♦Q"],
@@ -4431,16 +4438,18 @@ mod tests {
                 let combo = CombinationParser::parse(cards, wild_targets.as_deref(), ctx())
                     .expect("candidate must parse");
                 assert!(
-                    matches!(combo.class(), CombinationClass::Bomb)
-                        && cards.len() == 5
-                        && cards.contains(&"♥2".to_string())
-                        && cards.contains(&"♠4".to_string())
-                        && cards.contains(&"♠7".to_string()),
-                    "百搭SF剩顺两墩计划必须胜出杂顺领出（拆牌质量奖励），got {:?}",
+                    !(matches!(combo.class(), CombinationClass::Bomb)
+                        && cards.contains(&"♥2".to_string())),
+                    "领出绝对禁令：百搭SF不得领出（非清空），got {:?}",
+                    picked
+                );
+                assert!(
+                    !cards.contains(&"♥2".to_string()),
+                    "领出侧不烧百搭：领出候选不应含百搭，got {:?}",
                     picked
                 );
             }
-            other => panic!("Expected Play (wild SF), got {:?}", other),
+            other => panic!("Expected Play (natural lead), got {:?}", other),
         }
     }
 
@@ -5196,8 +5205,10 @@ mod tests {
     }
 
     #[test]
-    fn two_bombs_counter_allowed_when_post_play_bombs_remain() {
-        // 用户房规对照：两颗独立炸（天然 5555 + 百搭拼 666）中盘反炸 4 炸后仍剩 1 颗 → 允许出。
+    fn two_bombs_counter_blocked_when_only_one_natural_bomb() {
+        // 2026-09-06 天然口径对照：手 [♠5,♥5,♦5,♣5,♠6,♥6,♦6,♥2] 的账面"两颗炸"
+        // 中只有 5555 是天然炸——666+♥2 是潜在炸不独立计数 → 反炸后天然炸=0 →
+        // 守卫①（唯一炸保留）触发 → 中盘 Pass 保炸（与 seq20 裁决同语义）。
         let mut state = mk_playing_state(
             Seat::E,
             vec!["♠5", "♥5", "♦5", "♣5", "♠6", "♥6", "♦6", "♥2"],
@@ -5210,10 +5221,11 @@ mod tests {
             vec!["♣Q", "♥Q", "♦Q", "♠K", "♣K", "♦K", "♠A", "♥A", "♦A"],
         );
         let picked = suggest_next_action(&state, Seat::E).unwrap();
-        match &picked {
-            PlayerAction::Play { .. } => {}
-            other => panic!("两颗独立炸中盘反炸（打完剩 1 颗）应允许，got {:?}", other),
-        }
+        assert_eq!(
+            picked,
+            PlayerAction::Pass,
+            "5555=唯一天然炸，中盘反炸后天然炸=0 → Pass 保炸"
+        );
     }
 
     #[test]
