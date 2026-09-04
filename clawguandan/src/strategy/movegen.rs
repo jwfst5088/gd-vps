@@ -179,6 +179,36 @@ fn enumerate_wild_products(
     rec(pool, &mut buf, 0, &mut count, MAX_WILD_PRODUCT, &mut fmut);
 }
 
+/// 百搭目标池按点数去重：同点数异花色的目标对非同花顺牌型完全等价
+/// （组合解析只看点数），逐花色展开只产出重复候选。王（无点数）各自保留。
+/// 同花顺花色变体不在此池——由调用方在可能拼同花时用全量池补齐。
+fn rank_dedup_pool(pool: &[String]) -> Vec<String> {
+    let mut seen_ranks: HashSet<Rank> = HashSet::new();
+    let mut out = Vec::with_capacity(pool.len());
+    for s in pool {
+        if let Ok(c) = parse_card_symbol(s) {
+            if seen_ranks.insert(c.rank) {
+                out.push(s.clone());
+            }
+        }
+    }
+    out
+}
+
+/// k=5 组合能否拼成同花顺：某花色自然牌数 + 百搭数 ≥ 5（同花顺恰 5 张，
+/// 其余牌型只看点数、花色无关 → 只有此情形需要花色级目标展开）。
+fn may_form_straight_flush(cards: &[String], wild_count: usize, ctx: RuleContext) -> bool {
+    let mut suit_count: HashMap<Suit, usize> = HashMap::new();
+    for c in cards {
+        if let Ok(pc) = parse_card_symbol(c) {
+            if !is_wild(pc, ctx) && pc.suit != Suit::Joker {
+                *suit_count.entry(pc.suit).or_default() += 1;
+            }
+        }
+    }
+    suit_count.values().any(|&v| v + wild_count >= 5)
+}
+
 /// Ascending natural-rank windows of length `k` over `vals` (deduped in place),
 /// including the A-low wrap (e.g. straight A2345, tube AA2233, plate AAA222).
 fn natural_windows(mut vals: Vec<u8>, k: usize) -> Vec<Vec<u8>> {
@@ -462,7 +492,14 @@ fn enumerate_playing(
             if wild_count == 0 {
                 push_play_unique(&mut out, &mut seen, cards, None, ctx, top);
             } else {
-                enumerate_wild_products(&pool, wild_count, |targets| {
+                // 百搭目标按点数去重（对齐 CF generatePlaysOfType 的"按型生成"口径）：
+                // 同点数异花色的目标对非同花顺牌型完全等价（解析只看点数），
+                // 逐花色展开只产出重复候选。全部点数变体（如百搭配顺的低顺/高顺）
+                // 仍然保留——去重的只是纯花色重复。
+                // 27 张手牌点数池 ≈13 → 双百搭 13²=169 < 256，此前 52²=2704 被
+                // MAX_WILD_PRODUCT 截断 256 反而丢点数变体；去重后不再截断。
+                let rank_pool = rank_dedup_pool(&pool);
+                enumerate_wild_products(&rank_pool, wild_count, |targets| {
                     push_play_unique(
                         &mut out,
                         &mut seen,
@@ -473,6 +510,21 @@ fn enumerate_playing(
                     );
                     true
                 });
+                // 同花顺保护：k=5 且某花色自然牌数+百搭数 ≥5 → 可能拼同花顺，
+                // 花色影响成败 → 用全量池（含花色变体）补齐同花顺候选。
+                if k == 5 && may_form_straight_flush(&cards, wild_count, ctx) {
+                    enumerate_wild_products(&pool, wild_count, |targets| {
+                        push_play_unique(
+                            &mut out,
+                            &mut seen,
+                            cards.clone(),
+                            Some(targets.to_vec()),
+                            ctx,
+                            top,
+                        );
+                        true
+                    });
+                }
             }
             true
         });
