@@ -271,19 +271,20 @@ mod trainer_repro_tests {
         let mut none_count = 0;
         let mut err_count = 0;
         for seed in 1..=10u64 {
+            let t0 = std::time::Instant::now();
             let engine = GameEngine::new(GameConfig { rng_seed: seed, randomize_deals: false });
             match run_single_match(&engine, 2000) {
                 Ok(Some((w, f, d, res))) => {
                     completed += 1;
-                    println!("seed {seed}: OK winner={w:?} first_out={f:?} delta={d} residual={res}");
+                    println!("seed {seed}: OK winner={w:?} first_out={f:?} delta={d} residual={res} ({:.1}s)", t0.elapsed().as_secs_f32());
                 }
                 Ok(None) => {
                     none_count += 1;
-                    println!("seed {seed}: Ok(None) —— 相位Scoring但无winner，或非Scoring相位");
+                    println!("seed {seed}: Ok(None) ({:.1}s) —— 相位Scoring但无winner，或非Scoring相位", t0.elapsed().as_secs_f32());
                 }
                 Err(e) => {
                     err_count += 1;
-                    println!("seed {seed}: Err: {e}");
+                    println!("seed {seed}: Err: {e} ({:.1}s)", t0.elapsed().as_secs_f32());
                 }
             }
         }
