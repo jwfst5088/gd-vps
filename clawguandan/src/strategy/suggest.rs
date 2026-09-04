@@ -537,38 +537,14 @@ fn analyze_hand_combos(hand: &[String], ctx: RuleContext) -> HandCombos {
         }
     }
 
-    // 房规（用户 2026-08-30）：潜在炸/同花顺按百搭张数认定——
-    // 1 张百搭最多记 1 个潜在（三同张拼炸 或 同花4连拼同花顺），2 张最多记 2 个；
-    // 潜在合计 = min(候选数, 百搭张数)。天然炸 + 天然同花顺不占百搭额度，直接计入
-    // 炸弹总数（同花顺要计入炸弹总数）。
-    let mut wild_sf_candidates = 0usize;
-    if wild_count >= 1 {
-        for ranks in suit_to_ranks.values_mut() {
-            ranks.sort_unstable();
-            ranks.dedup();
-            let mut run = 1usize;
-            for i in 1..=ranks.len() {
-                if i < ranks.len() && ranks[i] - ranks[i - 1] == 1 {
-                    run += 1;
-                    continue;
-                }
-                // 极大连续段恰好 4 张 → 可由 1 张百搭补成同花顺；≥5 已是天然同花顺
-                if run == 4 {
-                    wild_sf_candidates += 1;
-                }
-                run = 1;
-            }
-        }
-    }
-    let wild_assisted_bombs = if wild_count >= 1 {
-        (rank_to_count.values().filter(|&&c| c == 3).count() + wild_sf_candidates)
-            .min(wild_count)
-    } else {
-        0
-    };
-
+    // （2026-09-06 裁决后潜在炸/潜在同花顺不再计入 bomb_count，原 wild_sf_candidates
+    // 统计段已删除；潜在结构判断由 hand_has_wild_bomb_or_sf 独立承担。）
+    // 房规（用户 2026-09-06 裁决）：bomb_count 只数天然炸——天然4+同点炸、天然同花顺、四王。
+    // 百搭潜在炸（三同张拼炸/4连拼同花顺）不消耗天然炸储备，不计入：
+    // 潜在炸计入曾使守卫①（唯一炸保留）与"烧最后一炸"硬禁令全部失效
+    // （实战 seq20：J×4 天然炸 + A×3/Q×3 潜在 → bomb_count=2 → JJJJ 被烧）。
+    // 潜在炸的存在性判断由 hand_has_wild_bomb_or_sf/wilds_could_form_bomb_or_sf 独立承担。
     let bomb_count = bomb_ranks.len()
-        + wild_assisted_bombs
         + straight_flush_count
         + usize::from(red_joker_count == 2 && black_joker_count == 2);
 
@@ -1388,6 +1364,13 @@ fn pick_playing(
             if cand.combo.class() != CombinationClass::Bomb
                 && best_non_bomb.map_or(true, |(bs, _)| s > bs)
             {
+                // 整手皆炸豁免判据（2026-09-06）：只认"非拆炸禁令"的非炸候选——
+                // 纯炸手（如 3333+4444）的拆炸单/对/三不算数，此时炸候选解禁（与 CF 同规）。
+                if classify_bomb_split(&cand.cards, &p.my_hand, &cand.combo.kind, p.my_remaining)
+                    == BombSplitVerdict::Banned
+                {
+                    continue;
+                }
                 best_non_bomb = Some((s, cand));
             }
         }
@@ -1401,34 +1384,16 @@ fn pick_playing(
                 .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)),
         };
         let (_, best_cand) = best.expect("candidates non-empty");
-        // ── 房规（用户）：中盘主动出炸后，剩余手牌重新清点炸弹数（含潜在炸）——
-        //    剩 0 → 改出非炸最优牌；无非炸候选（整手皆炸）时维持原炸（打完仍剩其余炸）。
-        //    豁免：残局（≤6 张）、对手冲刺（≤6 张）、清空出牌。
+        // ── 房规（用户 2026-09-06 绝对版）：炸弹/同花顺（天然+百搭+四王一律同规）
+        //    绝对禁止领出，唯一豁免：①打出即清空手牌 ②整手皆炸/顺（best_non_bomb
+        //    只认非拆炸候选，纯炸手时为 None → 炸候选解禁）。
+        //    残局的炸弹由此自然留作最后一张收尾清空；中盘绝不空耗炸弹领出。
+        //    （取代旧"重算换牌"：旧逻辑手里还有别的炸时允许领出，用户裁决为违规。）
         {
-            let is_endgame = p.my_remaining <= 6;
-            let is_opp_sprinting = p.enemy_sprinting;
-            if best_cand.combo.class() == CombinationClass::Bomb
-                && !is_endgame
-                && !is_opp_sprinting
-                && best_cand.cards.len() < p.my_remaining
-            {
-                // 2026-09-06：含百搭的炸 + 手牌存在百搭成炸/顺结构 → 百搭优先成炸，
-                // 不受 recount 拦截（与 CF wildBombLead 同规）。
-                let wild_bomb_lead = best_cand
-                    .cards
-                    .iter()
-                    .any(|s| p.meta_for(s).map(|m| m.is_wild).unwrap_or(false))
-                    && hand_has_wild_bomb_or_sf(&p);
-                let rest: Vec<String> = p
-                    .my_hand
-                    .iter()
-                    .filter(|c| !best_cand.cards.contains(*c))
-                    .cloned()
-                    .collect();
-                if analyze_hand_combos(&rest, ctx).bomb_count == 0 && !wild_bomb_lead {
-                    if let Some((_, alt)) = best_non_bomb {
-                        return Ok(alt.action.clone());
-                    }
+            let is_clearing_lead = best_cand.cards.len() >= p.my_remaining;
+            if best_cand.combo.class() == CombinationClass::Bomb && !is_clearing_lead {
+                if let Some((_, alt)) = best_non_bomb {
+                    return Ok(alt.action.clone());
                 }
             }
         }
@@ -1713,6 +1678,21 @@ fn find_best_play_follow<'a>(
             && !matches!(c.combo.kind, CombinationKind::Bomb(BombKind::StraightFlush))
             && cand_has_wild(c)
     });
+    // 2026-09-06 阶梯扩展：含百搭的钢板/木板/杂顺候选（阶梯第2级）——存在时，含百搭
+    // 三带二（第3级）跟牌排除（天然压不过顶牌时，百搭只用在更高一级墩型上）。
+    let has_wild_mid_rung_candidate = candidates.iter().any(|c| {
+        matches!(
+            c.combo.kind,
+            CombinationKind::Ordinary(OrdinaryKind::Straight)
+                | CombinationKind::Ordinary(OrdinaryKind::Tube)
+                | CombinationKind::Ordinary(OrdinaryKind::Plate)
+        ) && cand_has_wild(c)
+    });
+    // 2026-09-06 必要性门判据：存在任何无百搭候选（candidates 里的候选全部能压顶；
+    // 拆炸候选不算——那是被禁的打法，不是真替代）。
+    let has_wildfree_follow = candidates
+        .iter()
+        .any(|c| !cand_has_wild(c) && !follow_breaks_bomb(c));
 
     // Score each possible play and pick the best one (ties → first in order, JS stable sort)
     let mut best: Option<(f32, &Candidate)> = None;
@@ -1721,6 +1701,16 @@ fn find_best_play_follow<'a>(
         // 任意顶牌适用（原仅限顶牌=炸弹，普通顶牌漏防——见上方实战案例）。唯一豁免=清空手牌。
         if has_wildfree_bomb
             && cand.combo.class() == CombinationClass::Bomb
+            && cand_has_wild(cand)
+            && cand.cards.len() < my_remaining
+        {
+            continue;
+        }
+        // 房规（用户 2026-09-06 必要性门）：中盘跟牌时，天然（无百搭）候选能压顶 →
+        // 所有含百搭候选一律排除——天然牌能赢的墩绝不烧百搭（百搭是非常珍贵的）。
+        // 豁免：残局（≤6）、清空手牌。天然炸被留炸守卫拦时引擎自会过牌，不在此强制。
+        if has_wildfree_follow
+            && p.my_remaining > 6
             && cand_has_wild(cand)
             && cand.cards.len() < my_remaining
         {
@@ -1799,12 +1789,14 @@ fn find_best_play_follow<'a>(
         }
         // 房规（用户 2026-09-06）：百搭优先成炸/同花顺——候选中存在"能压当前顶牌"的
         // 含百搭真炸弹时，含百搭的三带二跟牌直接排除（同墩内炸弹完胜三带二）。
+        // 2026-09-06 阶梯扩展：存在能压顶的含百搭钢板/木板/杂顺（第2级）时同样排除
+        // 含百搭三带二（第3级）——天然压不过顶牌时，百搭只用在更高一级墩型上。
         // 仅候选级判定 + 残局（≤6张）不适用（双百搭残局豁免体系优先）。
         // 豁免：清空手牌 或 拦截对手冲刺。与 CF 跟牌侧同规。
         if p.my_remaining > 6
             && matches!(cand.combo.kind, CombinationKind::Ordinary(OrdinaryKind::FullHouse))
             && cand_has_wild(cand)
-            && has_wild_bomb_candidate
+            && (has_wild_bomb_candidate || has_wild_mid_rung_candidate)
             && cand.cards.len() < my_remaining
             && !is_opp_sprinting
         {
@@ -3338,27 +3330,28 @@ mod tests {
     }
 
     #[test]
-    fn bomb_count_counts_wild_potentials_by_wild_cap() {
-        // 房规（用户 2026-08-30）：潜在炸/同花顺按百搭张数封顶（1百搭最多记1个潜在，
-        // 2张最多2个）；天然炸 + 天然同花顺不占额度直接计入（同花顺要计入炸弹总数）。
+    fn bomb_count_counts_natural_bombs_only() {
+        // 房规（用户 2026-09-06 裁决）：bomb_count 只数天然炸——天然4+同点、天然同花顺、四王。
+        // 百搭潜在炸（三同张拼炸/4连拼同花顺）不消耗天然炸储备，一律不计入。
+        // （旧"潜在按百搭封顶计入"语义已废除——潜在计入曾使守卫①与烧最后一炸禁令失效。）
         let ctx = ctx();
-        // ① 1天然炸 + 1百搭 + 无候选（无三同张/无同花4连）→ 潜在 0 → 总数 1
+        // ① 1天然炸 + 1百搭 + 无候选 → 总数 1
         let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♥2", "♠9", "♥9", "♠4", "♥4"]
             .iter().map(|s| s.to_string()).collect();
         assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 1);
-        // ② 1天然炸 + 1百搭 + 1组三同张 → 潜在 min(1,1)=1 → 总数 2
+        // ② 1天然炸 + 1百搭 + 1组三同张 → 潜在不计入 → 总数 1（旧=2）
         let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♠9", "♥9", "♦9", "♥2", "♠K"]
             .iter().map(|s| s.to_string()).collect();
-        assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 2);
-        // ③ 1天然炸 + 1百搭 + 同花4连（♠6-9 极大段恰4）→ 潜在同花顺 1 → 总数 2
+        assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 1);
+        // ③ 1天然炸 + 1百搭 + 同花4连 → 潜在同花顺不计入 → 总数 1（旧=2）
         let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♠6", "♠7", "♠8", "♠9", "♥2"]
             .iter().map(|s| s.to_string()).collect();
-        assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 2);
-        // ④ 1天然炸 + 1百搭 + 同花仅3连（♠9-11，与炸点5不相连）→ 不构成潜在同花顺 → 总数 1
+        assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 1);
+        // ④ 1天然炸 + 1百搭 + 同花仅3连 → 总数 1
         let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♠9", "♠10", "♠J", "♥2"]
             .iter().map(|s| s.to_string()).collect();
         assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 1);
-        // ⑤ 同花4连属天然5连一部分 → 不重复记潜在；天然同花顺计入总数
+        // ⑤ 天然同花顺计入总数
         let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♠6", "♠7", "♠8", "♠9", "♠10"]
             .iter().map(|s| s.to_string()).collect();
         assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 2); // 5555 + 天然同花顺
