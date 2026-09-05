@@ -15,8 +15,7 @@
 //!   `calculateGameWinProb`) are ACTIVE: 牌踪器（rank 级剩余牌统计）已激活，
 //!   公式与 JS HandTracker/ProbabilisticReasoner 1:1；受 `hand_tracker_enabled` 开关控制。
 //! - Seat remaining counts are read directly from `state.hand.hands` (`len`);
-//!   `min_opp_remaining` = min of the two ACTIVE opponents (finished = 0 cards excluded);
-//!   teammate = `Seat::teammate`.
+//!   `min_opp_remaining` = min of the two opponents; teammate = `Seat::teammate`.
 //!
 //! The old Rust-only rules (tier 0/1 wild slots, stall penalty, endgame tidiness bonus,
 //! level-empty-single penalty, redundant-wild penalty, dedicated clearing fast path, …)
@@ -140,18 +139,6 @@ pub(crate) fn js_trained_params() -> AdvancedBotParams {
         prob_threshold_for_intercept: 0.4,
         enable_reason_trace: false, // 与 CF/参数文件一致（true 仅多一条调试打印）
         keep_bomb_bonus: 499.99548, // 2026-09-02 16:06 训练首个采纳变异（57键新冠军，bestScore 0.6665）
-        // 用户 2026-09-03 调令：加大"百搭组成炸弹/同花顺"奖励力度（100→250，与 CF 同步）。
-        // 250 压过所有次级百搭信号（保留罚 −150 / 顺子 +30 / 配对 −300），且低于清空 +10000。
-        // 语义边界（用户裁决）：奖励只作用于百搭"拼成"炸/同花顺（百搭必要）；天然炸贴百搭
-        // 升档仍属浪费——升档罚同步 +150 配平（mid 300 / end 160），升档净效应不变。
-        // 三键显式钉住（同 keep_bomb_bonus）防训练冠军同步时回落。
-        wild_bomb_bonus: 250.0,
-        upgraded_bomb_wild_mid: 300.0,
-        upgraded_bomb_wild_end: 160.0,
-        // 用户 2026-09-03 调令：百搭配单张成对 300→800 / 残局 15→100（救孤候选经
-        // score_follow_ex 的 wild_rescue_lift 豁免）。显式钉住防训练冠军同步回落。
-        wild_plain_pair_mid: 800.0,
-        wild_pair_penalty_end: 100.0,
         ..crate::bot::plugins::advanced_bot::params::AdvancedBotParams::scoring_defaults()
     }
 }
@@ -174,19 +161,6 @@ const BANNED_SCORE: f32 = 99999.0;
 /// 房规（用户 2026-09-03）：百搭优先用于炸弹/同花顺——手中余牌与剩余百搭仍可组成
 /// 炸弹/同花顺时，把百搭用进更低级组合的冻结惩罚（房规禁令不入训练面）。
 const WILD_CONSERVATION_PENALTY: f32 = 150.0;
-/// 房规（用户 2026-09-02 反孤儿条款）：出牌后剩余手牌全是百搭 → 百搭将沦为最后
-/// 孤张（被迫单出/孤注一掷）→ 重罚该出牌，倒逼把百搭并入当前组合一起走。
-/// CF scoreLeadPlay 原有领出侧单百搭 −800 同源；本次统一为 all-wild 口径并
-/// 补齐领出+跟牌两侧（冻结不入训练面）。
-const WILD_STRAND_PENALTY: f32 = 800.0;
-/// 房规（用户 2026-09-03）：百搭同花顺拆牌质量评估——
-/// ① 拆完剩余牌可组成新的杂顺子 → +450 重奖（抵消空出炸弹罚；领出侧另加
-///    keep_bomb_bonus 抵"留炸到残局"倾向——"SF 先手 + 剩顺后续"两墩计划成立）；
-/// ② 拆完剩余散单张 ≥3 → −250 惩罚（同花顺拆出一手烂剩牌）。
-/// 杂顺窗口与 movegen 一致（2 作低：2-6 … 10-A）；百搭/王不参与检测与散张计数。
-/// （冻结不入训练面；仅作用于百搭同花顺候选，跟牌侧同受 B1 守卫约束。）
-const SF_LEFTOVER_STRAIGHT_BONUS: f32 = 450.0;
-const SF_LEFTOVER_SINGLES_PENALTY: f32 = 250.0;
 
 // ── 房规（用户 2026-09-03）：残局报牌防走/送队友（领出侧，冻结不入训练面）──
 // 原弱化版（+40/−50/−20）被其他分项淹没导致"房规失效"，本次按用户口径原位加强。
@@ -312,112 +286,6 @@ fn wilds_could_form_bomb_or_sf(p: &PlayContext, play_cards: &[String]) -> bool {
     false
 }
 
-/// 房规（用户 2026-09-06）：手牌（出牌前）是否已存在"百搭可完成"的炸弹/同花顺。
-/// 炸弹：任一非级牌点数天然牌 ≥3 张（+1 百搭 = 4 炸）；
-/// 同花顺：某花色 5 连窗（lo 3..=10）中同花自然牌 ≥4（缺位 ≤1 由百搭补）。
-/// 用于"百搭配三带二禁令"：手牌能组百搭炸/顺时，百搭不再进三带二。与 CF handHasWildBombOrSF 1:1。
-fn hand_has_wild_bomb_or_sf(p: &PlayContext) -> bool {
-    let mut has_wild = false;
-    let mut rank_counts: HashMap<Rank, usize> = HashMap::new();
-    let mut suit_ranks: HashMap<Suit, HashSet<u8>> = HashMap::new();
-    for c in &p.my_hand {
-        let Some(m) = p.meta_for(c) else { continue };
-        if m.is_wild {
-            has_wild = true;
-            continue;
-        }
-        if is_joker_sym(c) {
-            continue;
-        }
-        if m.rank != p.level_rank {
-            *rank_counts.entry(m.rank).or_default() += 1;
-        }
-        if let (Some(nv), Ok(card)) = (m.natural, parse_card_symbol(c)) {
-            suit_ranks.entry(card.suit).or_default().insert(nv);
-        }
-    }
-    if !has_wild {
-        return false;
-    }
-    if rank_counts.values().any(|&n| n >= 3) {
-        return true;
-    }
-    for ranks in suit_ranks.values() {
-        for lo in 3..=10u8 {
-            let have = (lo..lo + 5).filter(|r| ranks.contains(r)).count();
-            if have >= 4 {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// 房规（用户 2026-09-02 反孤儿条款）：出牌后剩余手牌是否全为百搭。
-/// 全为百搭 = 百搭即将沦为最后孤张（无任何天然牌可搭伙）→ 触发 WILD_STRAND_PENALTY。
-/// 2026-09-06 扩口径：剩余=百搭∪王 且仍含百搭 同样算孤（王与百搭互不成墩，百搭必被
-/// 拖到最后单出——实战 seq1028/1041：W 出 99 留 [♥A+🃏B] 百搭苟到最终张）。
-fn leftover_all_wild(p: &PlayContext, play_cards: &[String]) -> bool {
-    let mut to_remove: Vec<String> = play_cards.to_vec();
-    let mut any_wild_left = false;
-    for c in &p.my_hand {
-        if let Some(pos) = to_remove.iter().position(|r| r == c) {
-            to_remove.remove(pos);
-        } else {
-            let is_wild = p.meta_for(c).map(|m| m.is_wild).unwrap_or(false);
-            if is_wild {
-                any_wild_left = true;
-            } else if !is_joker_sym(c) {
-                // 剩余含天然牌 → 百搭有搭伙对象，不算孤张
-                return false;
-            }
-        }
-    }
-    any_wild_left
-}
-
-/// 房规（用户 2026-09-03）：百搭同花顺拆牌质量——
-/// 返回 (剩余可组杂顺数, 去顺后散单张数)。百搭/王不计入；级牌天然牌按普通点数参与。
-/// 杂顺窗口与 movegen 一致（2 作低：2-6 … 10-A，各 5 连点数）。
-fn sf_leftover_straights_and_singles(p: &PlayContext, play_cards: &[String]) -> (usize, usize) {
-    let mut to_remove: Vec<String> = play_cards.to_vec();
-    let mut rank_cnt: HashMap<u8, usize> = HashMap::new();
-    for c in &p.my_hand {
-        if let Some(pos) = to_remove.iter().position(|r| r == c) {
-            to_remove.remove(pos);
-            continue;
-        }
-        let Some(m) = p.meta_for(c) else { continue };
-        if m.is_wild || m.is_joker {
-            continue;
-        }
-        if let Some(nv) = m.natural {
-            *rank_cnt.entry(nv).or_default() += 1;
-        }
-    }
-    let mut straights = 0usize;
-    loop {
-        let mut found = false;
-        for lo in 2u8..=10u8 {
-            if (lo..lo + 5).all(|r| rank_cnt.get(&r).copied().unwrap_or(0) >= 1) {
-                for r in lo..lo + 5 {
-                    if let Some(n) = rank_cnt.get_mut(&r) {
-                        *n -= 1;
-                    }
-                }
-                straights += 1;
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            break;
-        }
-    }
-    let singles = rank_cnt.values().filter(|&&n| n == 1).count();
-    (straights, singles)
-}
-
 // ── Hand combo analysis (JS analyzeHandCombos L1215-1320) ──────────────
 
 #[derive(Clone, Debug, Default)]
@@ -538,14 +406,38 @@ fn analyze_hand_combos(hand: &[String], ctx: RuleContext) -> HandCombos {
         }
     }
 
-    // （2026-09-06 裁决后潜在炸/潜在同花顺不再计入 bomb_count，原 wild_sf_candidates
-    // 统计段已删除；潜在结构判断由 hand_has_wild_bomb_or_sf 独立承担。）
-    // 房规（用户 2026-09-06 裁决）：bomb_count 只数天然炸——天然4+同点炸、天然同花顺、四王。
-    // 百搭潜在炸（三同张拼炸/4连拼同花顺）不消耗天然炸储备，不计入：
-    // 潜在炸计入曾使守卫①（唯一炸保留）与"烧最后一炸"硬禁令全部失效
-    // （实战 seq20：J×4 天然炸 + A×3/Q×3 潜在 → bomb_count=2 → JJJJ 被烧）。
-    // 潜在炸的存在性判断由 hand_has_wild_bomb_or_sf/wilds_could_form_bomb_or_sf 独立承担。
+    // 房规（用户 2026-08-30）：潜在炸/同花顺按百搭张数认定——
+    // 1 张百搭最多记 1 个潜在（三同张拼炸 或 同花4连拼同花顺），2 张最多记 2 个；
+    // 潜在合计 = min(候选数, 百搭张数)。天然炸 + 天然同花顺不占百搭额度，直接计入
+    // 炸弹总数（同花顺要计入炸弹总数）。
+    let mut wild_sf_candidates = 0usize;
+    if wild_count >= 1 {
+        for ranks in suit_to_ranks.values_mut() {
+            ranks.sort_unstable();
+            ranks.dedup();
+            let mut run = 1usize;
+            for i in 1..=ranks.len() {
+                if i < ranks.len() && ranks[i] - ranks[i - 1] == 1 {
+                    run += 1;
+                    continue;
+                }
+                // 极大连续段恰好 4 张 → 可由 1 张百搭补成同花顺；≥5 已是天然同花顺
+                if run == 4 {
+                    wild_sf_candidates += 1;
+                }
+                run = 1;
+            }
+        }
+    }
+    let wild_assisted_bombs = if wild_count >= 1 {
+        (rank_to_count.values().filter(|&&c| c == 3).count() + wild_sf_candidates)
+            .min(wild_count)
+    } else {
+        0
+    };
+
     let bomb_count = bomb_ranks.len()
+        + wild_assisted_bombs
         + straight_flush_count
         + usize::from(red_joker_count == 2 && black_joker_count == 2);
 
@@ -874,8 +766,6 @@ struct PlayContext {
     meta: HashMap<String, CardMeta>,
     /// 房规（2026-08-30）：本轮顶牌之后队友是否已 Pass（残局拆对豁免条件之一）
     teammate_passed_top: bool,
-    /// 房规（2026-09-06 让牌门·记忆解除）：紧邻上一墩对手同型领出且队友在其中 Pass
-    teammate_passed_same_type_prev: bool,
     /// 牌踪器：本座（actor）
     actor_seat: Seat,
     /// 牌踪器：各座剩余张数（JS tracker.seatRemainingCounts）
@@ -904,17 +794,7 @@ fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayCo
         .filter(|s| **s != actor && **s != teammate_seat)
         .map(|s| hand.remaining_count(*s))
         .collect();
-    // 活跃对手口径（与下方冲刺判定同规，用户 2026-08-30 房规）：已走完对手（剩 0 张）
-    // 不计入 min——否则 min 被拉到 0，报牌房规整体失效（==1 不发单张 / ==2 不发对子）。
-    // 实战 t_391eb7a6 act90：对手 S 剩 1 + N 已走完 → 旧口径 min=0 → W 领最小单张 ♦3
-    // 被对手最后一张 ♦Q 接走三游。
-    // 对手全部走完时取 usize::MAX——对局应已结束，任何 ≤N 判定都不应再触发。
-    let min_opp_remaining = opp_counts
-        .iter()
-        .copied()
-        .filter(|&c| c > 0)
-        .min()
-        .unwrap_or(usize::MAX);
+    let min_opp_remaining = opp_counts.iter().min().copied().unwrap_or(0);
     // 房规（用户 2026-08-30，同步 CF）：冲刺判定只看"活跃"对手——剩 0 张（已走完）不计入。
     let enemy_rem_active: Vec<usize> = opp_counts.iter().copied().filter(|&c| c > 0).collect();
     let enemy_sprinting = enemy_rem_active.iter().any(|&c| c <= 6);
@@ -982,55 +862,6 @@ fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayCo
         .take_while(|e| e.action_type != HistoryActionKind::Play)
         .any(|e| e.action_type == HistoryActionKind::Pass && e.seat == teammate_seat);
 
-    // 房规（用户 2026-09-06 让牌门·记忆解除）：紧邻上一墩若也是对手领出的同类型、
-    // 且队友在其中过过牌（"队友吃不了"已证实）→ 本次不再让牌，炸弹可直接夺发牌权。
-    // 从当前顶牌（history 末尾第一条 Play，与 teammate_passed_top 同一前提）向回走：
-    // 搭档出牌或对手不同型出牌即停（不满足"接着再发同样的牌型"）；
-    // 区间内既见对手同型出牌又见队友 Pass → 解除。
-    let teammate_passed_same_type_prev = {
-        let top_kind: Option<CombinationKind> = match hand.trick.top_play.as_ref() {
-            Some(tp) if !matches!(tp.combination.kind, CombinationKind::Bomb(_)) => {
-                Some(tp.combination.kind)
-            }
-            _ => None,
-        };
-        if let Some(top_kind) = top_kind {
-            let mut saw_opp_same_type = false;
-            let mut mate_pass = false;
-            let mut past_top = false;
-            // 回溯深度上限：判定只需"当前墩 + 紧邻上一墩"（一墩≤4出+若干pass）。
-            // 自弈 2000 手长局中每次决策全量回溯 parse 是 O(n²) 性能回归——上限 60 条。
-            let mut looked = 0usize;
-            for e in hand.history.iter().rev() {
-                looked += 1;
-                if looked > 60 {
-                    break;
-                }
-                if e.action_type == HistoryActionKind::Play {
-                    if !past_top {
-                        past_top = true; // 当前顶牌条目本身，跳过
-                        continue;
-                    }
-                    if e.seat == actor || e.seat == teammate_seat {
-                        break; // 搭档出过牌 → 停
-                    }
-                    let same = CombinationParser::parse(&e.cards, e.wild_targets.as_deref(), ctx)
-                        .map(|c| c.kind == top_kind)
-                        .unwrap_or(false);
-                    if !same {
-                        break; // 隔了别的牌型 → 停
-                    }
-                    saw_opp_same_type = true;
-                } else if e.action_type == HistoryActionKind::Pass && e.seat == teammate_seat {
-                    mate_pass = true;
-                }
-            }
-            saw_opp_same_type && mate_pass
-        } else {
-            false
-        }
-    };
-
     PlayContext {
         ctx,
         level_rank,
@@ -1050,7 +881,6 @@ fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayCo
         has_level_card_or_joker,
         meta,
         teammate_passed_top,
-        teammate_passed_same_type_prev,
         actor_seat,
         seat_remaining,
         enemy_seats,
@@ -1392,20 +1222,6 @@ fn pick_playing(
                     continue;
                 }
             }
-            // 房规（用户 2026-09-06）：百搭优先成炸/同花顺——手牌已存在百搭可完成的
-            // 炸弹/同花顺时，含百搭的三带二不领出（豁免=清空手牌 或 拦截对手冲刺）。
-            // 与 CF 领出侧同规（手牌级判定）。
-            if matches!(cand.combo.kind, CombinationKind::Ordinary(OrdinaryKind::FullHouse))
-                && cand
-                    .cards
-                    .iter()
-                    .any(|s| p.meta_for(s).map(|m| m.is_wild).unwrap_or(false))
-                && hand_has_wild_bomb_or_sf(&p)
-                && cand.cards.len() < p.my_remaining
-                && !p.enemy_sprinting
-            {
-                continue;
-            }
             // 房规（用户 2026-09-03）：双百搭同出候选仅残局（手牌≤6张）才枚举——领出路径
             // 硬门槛（2026-09-03 审计补，与跟牌过滤及 CF movegen 门槛一致）。
             // 清空手牌的牌不受限。
@@ -1427,13 +1243,6 @@ fn pick_playing(
             if cand.combo.class() != CombinationClass::Bomb
                 && best_non_bomb.map_or(true, |(bs, _)| s > bs)
             {
-                // 整手皆炸豁免判据（2026-09-06）：只认"非拆炸禁令"的非炸候选——
-                // 纯炸手（如 3333+4444）的拆炸单/对/三不算数，此时炸候选解禁（与 CF 同规）。
-                if classify_bomb_split(&cand.cards, &p.my_hand, &cand.combo.kind, p.my_remaining)
-                    == BombSplitVerdict::Banned
-                {
-                    continue;
-                }
                 best_non_bomb = Some((s, cand));
             }
         }
@@ -1447,48 +1256,27 @@ fn pick_playing(
                 .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)),
         };
         let (_, best_cand) = best.expect("candidates non-empty");
-        // ── 房规（用户 2026-09-06 绝对版）：炸弹/同花顺（天然+百搭+四王一律同规）
-        //    绝对禁止领出，唯一豁免：①打出即清空手牌 ②整手皆炸/顺（best_non_bomb
-        //    只认非拆炸候选，纯炸手时为 None → 炸候选解禁）。
-        //    残局的炸弹由此自然留作最后一张收尾清空；中盘绝不空耗炸弹领出。
-        //    （取代旧"重算换牌"：旧逻辑手里还有别的炸时允许领出，用户裁决为违规。）
+        // ── 房规（用户）：中盘主动出炸后，剩余手牌重新清点炸弹数（含潜在炸）——
+        //    剩 0 → 改出非炸最优牌；无非炸候选（整手皆炸）时维持原炸（打完仍剩其余炸）。
+        //    豁免：残局（≤6 张）、对手冲刺（≤6 张）、清空出牌。
         {
-            let is_clearing_lead = best_cand.cards.len() >= p.my_remaining;
-            if best_cand.combo.class() == CombinationClass::Bomb && !is_clearing_lead {
-                if let Some((_, alt)) = best_non_bomb {
-                    return Ok(alt.action.clone());
-                }
-            }
-        }
-        // ── 房规后处理（用户 2026-09-05，实战 t_391eb7a6 act90）：对手剩 1 张（活跃口径）
-        //    且评分选中了单张领出 → 在单张候选中改领最大单张（"必须发单张要从大牌发"）。
-        //    非单张优先已由 score_lead 报牌阻尼（-400）保证；此处只修正单张之间的排序——
-        //    残局"小牌先行/留大牌"等多重 primary 负相关启发会压过 tilt，评分内不可靠。
-        //    清空手牌不受本条约束（走人优先）。
-        if p.min_opp_remaining == 1
-            && matches!(
-                best_cand.combo.kind,
-                CombinationKind::Ordinary(OrdinaryKind::Single)
-            )
-            && best_cand.cards.len() < p.my_remaining
-        {
-            if let Some(big) = candidates
-                .iter()
-                .filter(|c| {
-                    matches!(
-                        c.combo.kind,
-                        CombinationKind::Ordinary(OrdinaryKind::Single)
-                    ) && c.cards.len() < p.my_remaining
-                })
-                .max_by(|a, b| {
-                    a.combo
-                        .primary
-                        .partial_cmp(&b.combo.primary)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+            let is_endgame = p.my_remaining <= 6;
+            let is_opp_sprinting = p.enemy_sprinting;
+            if best_cand.combo.class() == CombinationClass::Bomb
+                && !is_endgame
+                && !is_opp_sprinting
+                && best_cand.cards.len() < p.my_remaining
             {
-                if big.combo.primary > best_cand.combo.primary {
-                    return Ok(big.action.clone());
+                let rest: Vec<String> = p
+                    .my_hand
+                    .iter()
+                    .filter(|c| !best_cand.cards.contains(*c))
+                    .cloned()
+                    .collect();
+                if analyze_hand_combos(&rest, ctx).bomb_count == 0 {
+                    if let Some((_, alt)) = best_non_bomb {
+                        return Ok(alt.action.clone());
+                    }
                 }
             }
         }
@@ -1510,16 +1298,6 @@ fn pick_playing(
     }
 
     let p = build_play_context(hand, actor, ctx);
-
-    // ── 用户 2026-09-06：队友快走完（剩余 ≤6）时，队友的顶牌一律不压——
-    // 我每压一墩，队友就少走一墩。唯一豁免：我此手打完即清空（夺游优先）。
-    // 记牌器对队友剩余张数是精确公开信息。与 CF decideAdvancedPlay 同规。──
-    if top.seat == p.teammate_seat && p.teammate_remaining > 0 && p.teammate_remaining <= 6 {
-        let can_clear = candidates.iter().any(|c| c.cards.len() >= p.my_remaining);
-        if !can_clear {
-            return Ok(pass.clone());
-        }
-    }
 
     // ── JS decideAdvancedPlay：pass/play 启发式（概率项置 0，确定性项全保留）──
     if decide_follow(top, &p, actor) == FollowDecision::Pass {
@@ -1712,10 +1490,9 @@ fn find_best_play_follow<'a>(
     let is_endgame = my_remaining <= 6;
     let is_opp_sprinting = p.enemy_sprinting;
 
-    // 房规 B1（2026-08-30 收紧；2026-09-02 扩面）：有免百搭炸可压 → 跳过含百搭的炸（非清空）。
-    // 2026-09-02 实战（CF 局）：敌领 777，我持 8888+♥2 → 出了 8888+♥2 五炸（wild_bomb_bonus
-    // +100 反而压过天然 8888）——原守卫只在顶牌是炸弹时生效，普通顶牌漏防。
-    // 现推广到任意顶牌：天然炸已经压得住就不烧百搭。唯一豁免=该含百搭炸能直接清空手牌。
+    // 房规 B1（2026-08-30 收紧）：反炸 + 有免百搭候选 → 跳过含百搭的炸（非清空）。
+    // 原"残局/对手冲刺"豁免移除：同样赢下这一轮，免百搭方案零成本，烧百搭=浪费。
+    // 唯一豁免=该含百搭炸能直接清空手牌（len == remaining）。
     let top_is_bomb = top.combination.class() == CombinationClass::Bomb;
     let cand_has_wild = |c: &Candidate| {
         c.cards
@@ -1750,85 +1527,16 @@ fn find_best_play_follow<'a>(
                 && !follow_breaks_bomb(c)
                 && c.combo.kind == top.combination.kind
         });
-    // 反孤儿条款（2026-09-02）：所有天然同型平跟都会把百搭打成最后孤张（出牌后
-    // 剩余全百搭）→ 解除"能跟就不烧"对含百搭候选的排除，让救孤候选参与计分
-    // （配合 WILD_STRAND_PENALTY：天然平跟 −800 vs 救孤候选轻罚 → 救孤胜出）。
-    // 炸弹不随此豁免（能跟就普通跟的硬规则不变），只有百搭候选获得救孤通道。
-    let natural_follow_strands_wild = has_same_type_follow
-        && candidates
-            .iter()
-            .filter(|c| {
-                c.combo.class() == CombinationClass::Ordinary
-                    && !cand_has_wild(c)
-                    && !follow_breaks_bomb(c)
-                    && c.combo.kind == top.combination.kind
-            })
-            .all(|c| leftover_all_wild(p, &c.cards));
-
-    // 2026-09-06：候选中是否存在"含百搭的真炸弹"（bomb4+，不含同花顺——
-    // class()==Bomb 把 SF 也算 Bomb，但 SF 压三带二属过度击杀另有重罚，
-    // 不应触发三带二禁令）。用于百搭三带二禁令的跟牌侧判定（候选级）。
-    let has_wild_bomb_candidate = candidates.iter().any(|c| {
-        c.combo.class() == CombinationClass::Bomb
-            && !matches!(c.combo.kind, CombinationKind::Bomb(BombKind::StraightFlush))
-            && cand_has_wild(c)
-    });
-    // 2026-09-06 阶梯扩展：含百搭的钢板/木板/杂顺候选（阶梯第2级）——存在时，含百搭
-    // 三带二（第3级）跟牌排除（天然压不过顶牌时，百搭只用在更高一级墩型上）。
-    let has_wild_mid_rung_candidate = candidates.iter().any(|c| {
-        matches!(
-            c.combo.kind,
-            CombinationKind::Ordinary(OrdinaryKind::Straight)
-                | CombinationKind::Ordinary(OrdinaryKind::Tube)
-                | CombinationKind::Ordinary(OrdinaryKind::Plate)
-        ) && cand_has_wild(c)
-    });
-    // 2026-09-06 必要性门判据：存在任何无百搭候选（candidates 里的候选全部能压顶；
-    // 拆炸候选不算——那是被禁的打法，不是真替代）。
-    let has_wildfree_follow = candidates
-        .iter()
-        .any(|c| !cand_has_wild(c) && !follow_breaks_bomb(c));
 
     // Score each possible play and pick the best one (ties → first in order, JS stable sort)
     let mut best: Option<(f32, &Candidate)> = None;
     for cand in candidates {
-        // 房规 B1（2026-08-30 收紧；2026-09-02 扩面）：有免百搭炸可压 → 跳过含百搭的炸（非清空），
-        // 任意顶牌适用（原仅限顶牌=炸弹，普通顶牌漏防——见上方实战案例）。唯一豁免=清空手牌。
-        if has_wildfree_bomb
+        // 房规 B1（2026-08-30 收紧）：反炸 + 有免百搭候选 → 跳过含百搭的炸（非清空）。
+        // 原"残局/对手冲刺"豁免移除：同样赢下这一轮，免百搭方案零成本，烧百搭=浪费。
+        // 唯一豁免=该含百搭炸能直接清空手牌（len == remaining）。
+        if top_is_bomb
+            && has_wildfree_bomb
             && cand.combo.class() == CombinationClass::Bomb
-            && cand_has_wild(cand)
-            && cand.cards.len() < my_remaining
-        {
-            continue;
-        }
-        // 房规（用户 2026-09-06 让牌门·B 裁决）：对手领普通牌型、我无天然同型可跟、
-        // 队友本墩未表态且还有牌 → 天然炸/天然同花顺候选先让（过牌）——给队友天然
-        // 吃下或用炸夺取发牌权的机会；我让牌后本墩炸权归属后手搭档（四座同规对称）。
-        // 豁免：清空手牌、对手冲刺、残局(≤6)。
-        // B 裁决：含百搭的炸不受让（天然炸=盾、百搭炸=子弹——S@1009 裁决保住）。
-        // 解除：①队友已表态(teammate_passed_top) ②队友在紧邻上一墩同型对手领出中
-        // 过过牌(teammate_passed_same_type_prev)——让过一次已证实队友吃不了，
-        // 对手接着再发同型就不让了，直接炸。
-        if !top_is_bomb
-            && top.seat != p.actor_seat
-            && top.seat != p.teammate_seat
-            && !has_same_type_follow
-            && cand.combo.class() == CombinationClass::Bomb
-            && !cand_has_wild(cand)
-            && !p.teammate_passed_top
-            && !p.teammate_passed_same_type_prev
-            && p.teammate_remaining > 0
-            && cand.cards.len() < my_remaining
-            && !is_opp_sprinting
-            && p.my_remaining > 6
-        {
-            continue;
-        }
-        // 房规（用户 2026-09-06 必要性门）：中盘跟牌时，天然（无百搭）候选能压顶 →
-        // 所有含百搭候选一律排除——天然牌能赢的墩绝不烧百搭（百搭是非常珍贵的）。
-        // 豁免：残局（≤6）、清空手牌。天然炸被留炸守卫拦时引擎自会过牌，不在此强制。
-        if has_wildfree_follow
-            && p.my_remaining > 6
             && cand_has_wild(cand)
             && cand.cards.len() < my_remaining
         {
@@ -1836,12 +1544,9 @@ fn find_best_play_follow<'a>(
         }
         // 房规（用户 2026-09-03）：能跟就不烧——有天然同型平跟时，非清空候选里的
         // 炸弹与含百搭候选全部排除（唯一豁免 = 直接清空手牌）。
-        // 反孤儿豁免（2026-09-02）：天然平跟全部会把百搭打成孤张时，含百搭候选解除
-        // 排除（救孤通道）；炸弹仍排除（能普通跟就不炸的硬规则不变）。
         if has_same_type_follow
             && cand.cards.len() < my_remaining
-            && (cand.combo.class() == CombinationClass::Bomb
-                || (cand_has_wild(cand) && !natural_follow_strands_wild))
+            && (cand.combo.class() == CombinationClass::Bomb || cand_has_wild(cand))
         {
             continue;
         }
@@ -1905,45 +1610,7 @@ fn find_best_play_follow<'a>(
                 continue;
             }
         }
-        // 房规（用户 2026-09-06）：百搭优先成炸/同花顺——候选中存在"能压当前顶牌"的
-        // 含百搭真炸弹时，含百搭的三带二跟牌直接排除（同墩内炸弹完胜三带二）。
-        // 2026-09-06 阶梯扩展：存在能压顶的含百搭钢板/木板/杂顺（第2级）时同样排除
-        // 含百搭三带二（第3级）——天然压不过顶牌时，百搭只用在更高一级墩型上。
-        // 仅候选级判定 + 残局（≤6张）不适用（双百搭残局豁免体系优先）。
-        // 豁免：清空手牌 或 拦截对手冲刺。与 CF 跟牌侧同规。
-        if p.my_remaining > 6
-            && matches!(cand.combo.kind, CombinationKind::Ordinary(OrdinaryKind::FullHouse))
-            && cand_has_wild(cand)
-            && (has_wild_bomb_candidate || has_wild_mid_rung_candidate)
-            && cand.cards.len() < my_remaining
-            && !is_opp_sprinting
-        {
-            continue;
-        }
-        // 房规（用户 2026-09-03 加大）：百搭配单张成普通对——中盘（手牌>6）非救孤/非清空
-        // 直接排除候选（宁可过牌也不烧百搭凑对；−800 罚留作兜底计分）。残局保留候选但
-        // score_follow_ex 内 −100 重罚。级牌对不在此类（wild_on_level 已另行重罚）。
-        if p.my_remaining > 6
-            && cand.cards.len() < my_remaining
-            && cand_has_wild(cand)
-            && matches!(cand.combo.kind, CombinationKind::Ordinary(OrdinaryKind::Pair))
-            && !natural_follow_strands_wild
-        {
-            let nat_rank = cand.cards.iter().find_map(|s| {
-                let m = p.meta_for(s)?;
-                if m.is_wild || m.is_joker {
-                    None
-                } else {
-                    Some(m.rank)
-                }
-            });
-            if let Some(pr) = nat_rank {
-                if pr != p.level_rank {
-                    continue;
-                }
-            }
-        }
-        let s = score_follow_ex(cand.cards, &cand.combo, top, p, natural_follow_strands_wild);
+        let s = score_follow(cand.cards, &cand.combo, top, p);
         if best.map_or(true, |(bs, _)| s > bs) {
             best = Some((s, cand));
         }
@@ -1953,21 +1620,12 @@ fn find_best_play_follow<'a>(
     };
     let best_cards = best.cards;
     let best_is_bomb = best.combo.class() == CombinationClass::Bomb;
-    // 2026-09-06：最优解=含百搭的炸 且 手牌本就存在百搭可完成的炸/同花顺
-    // （用户"百搭优先成炸/顺"——此刻不出，百搭只会漏进低级组合或苟成孤张；
-    //   天然炸的保留/禁炸逻辑不变）。豁免 ①/①b/⑥ 三个守卫。
-    let best_is_wild_bomb = best_is_bomb
-        && best_cards
-            .iter()
-            .any(|s| p.meta_for(s).map(|m| m.is_wild).unwrap_or(false));
-    let wild_priority_case = best_is_wild_bomb && hand_has_wild_bomb_or_sf(p);
 
     // ① 炸弹保留：非残局、非对手冲刺、手里炸弹总数 = 1 个时，不出炸弹，直接过。
     //    （用户房规改自 JS 647-655：JS 为 bombCount<=2，现为 =1——
     //      2 个炸弹不再拦；"手里 ≥3 个炸可用"的豁免由条件 =1 自然排除）
     //    （2026-09-03 审计补：出炸直接清空手牌=赢牌，不受保留限制。）
     if best_is_bomb
-        && !wild_priority_case
         && !is_endgame
         && !is_opp_sprinting
         && p.combos.bomb_count == 1
@@ -1980,8 +1638,7 @@ fn find_best_play_follow<'a>(
     //    炸弹数（天然 4+ 同张、百搭拼 3 同张、同花顺候选全部重算）——剩 0 → 不出，
     //    保炸到残局。解决"潜在炸共用百搭导致账面虚增"（如 ♠6789+♥6789+♥2 账面 2 颗、
     //    打掉一颗后实际 0 颗）。豁免：残局（≤6 张）、对手冲刺（≤6 张）、炸完直接清空。
-    //    （2026-09-06：wild_priority_case 豁免同 ①。）
-    if best_is_bomb && !wild_priority_case && !is_endgame && !is_opp_sprinting && best_cards.len() < my_remaining {
+    if best_is_bomb && !is_endgame && !is_opp_sprinting && best_cards.len() < my_remaining {
         let rest: Vec<String> = p
             .my_hand
             .iter()
@@ -2038,10 +1695,8 @@ fn find_best_play_follow<'a>(
     //    房规扩展（用户 2026-08-30）：12 以下（普通点数 <Q，即 J 及以下）的三带二同样不炸；
     //    Q/K/A/级牌 的三带二仍可炸。豁免照旧：残局（≤6）、对手冲刺（≤6）。
     //    （2026-09-03 审计补：出炸直接清空手牌=赢牌不是浪费，本守卫不拦清空炸。）
-    //    （2026-09-06：wild_priority_case 豁免——百搭优先成炸。）
     //    注：primary 为 level_order_value 尺度（Q=11, K=12, A=13, 级牌=14），故 <Q ⇔ primary<11。
     if best_is_bomb
-        && !wild_priority_case
         && !is_endgame
         && !is_opp_sprinting
         && best_cards.len() < my_remaining
@@ -2069,19 +1724,6 @@ fn score_follow(
     play_combo: &Combination,
     top: &PlayState,
     p: &PlayContext,
-) -> f32 {
-    score_follow_ex(play_cards, play_combo, top, p, false)
-}
-
-/// wild_rescue_lift = 反孤儿救孤旗（natural_follow_strands_wild）：所有天然同型平跟
-/// 都会把百搭打成最后孤张时，含百搭候选走救孤通道——百搭配单张成对的罚分豁免，
-/// 否则 −800 配对罚与天然平跟的 −800 孤张罚同线打平，救孤胜负沦为候选顺序。
-fn score_follow_ex(
-    play_cards: &[String],
-    play_combo: &Combination,
-    top: &PlayState,
-    p: &PlayContext,
-    wild_rescue_lift: bool,
 ) -> f32 {
     let kind = &play_combo.kind;
     let mut score = BASE_FOLLOW_SCORE; // JS L734 base score
@@ -2153,16 +1795,10 @@ fn score_follow_ex(
         // 豁免：①对手冲刺（任一对手剩≤6，拦截优先）②打完后剩≤2张（下一手即可清空）。
         // 清空本身（len>=remaining）不进本分支；2 炸用第 1 炸不受影响（bomb_count==2）。
         let rest_cards_after_bomb_mid = my_remaining.saturating_sub(play_cards.len());
-        // 2026-09-06 S@1009 裁决镜像（CF 端同规）：含百搭的炸不受"烧最后一炸"硬禁
-        // ——天然炸=盾（省着用），百搭炸=子弹（天然压不过时必须能出，如 4444+♥A）。
-        let play_has_wild = play_cards
-            .iter()
-            .any(|s| p.meta_for(s).map(|m| m.is_wild).unwrap_or(false));
         if !is_endgame
             && min_opp_remaining > 6
             && combos.bomb_count < 2
             && rest_cards_after_bomb_mid > 2
-            && !play_has_wild
         {
             score -= BANNED_SCORE; // 中盘烧最后一炸 = 硬禁令（至少留 1 炸到残局）
         }
@@ -2241,20 +1877,6 @@ fn score_follow_ex(
             let b1_exempt = is_endgame || p.min_opp_remaining <= 6 || !not_clearing;
             if !(counter_bomb && !b1_exempt) {
                 score += p.params.wild_bomb_bonus; // 逢人配配炸弹/同花顺：重奖！
-                // 房规（用户 2026-09-03）：百搭同花顺拆牌质量——剩牌组新杂顺 +450 /
-                // 去顺后散单张≥3 −250。置于 B1 同一守卫内：B1 压制时不给拆牌奖励。
-                if matches!(kind, CombinationKind::Bomb(BombKind::StraightFlush))
-                    && not_clearing
-                {
-                    let (lo_straights, lo_singles) =
-                        sf_leftover_straights_and_singles(p, play_cards);
-                    if lo_straights > 0 {
-                        score += SF_LEFTOVER_STRAIGHT_BONUS;
-                    }
-                    if lo_singles >= 3 {
-                        score -= SF_LEFTOVER_SINGLES_PENALTY;
-                    }
-                }
             }
         } else {
             match kind {
@@ -2448,10 +2070,8 @@ fn score_follow_ex(
         ) {
             // 合理使用，不罚
         } else if matches!(kind, CombinationKind::Ordinary(OrdinaryKind::Pair)) {
-            // 房规（用户 2026-09-03 加大）：百搭配普通单张成普通对 = 又弱又废——
-            // 中盘 −800（压到反孤儿罚同线，仅救孤候选经 wild_rescue_lift 豁免）、
-            // 残局 −100。级牌对已由上方统一罚。
-            if !finishing_play && !wild_rescue_lift {
+            // 房规：百搭配普通单张成普通对 = 又弱又废，重罚
+            if !finishing_play {
                 let pair_naturals: Vec<CardMeta> = play_cards
                     .iter()
                     .filter_map(|c| p.meta_for(c))
@@ -2536,13 +2156,6 @@ fn score_follow_ex(
         && wilds_could_form_bomb_or_sf(p, play_cards)
     {
         score -= WILD_CONSERVATION_PENALTY;
-    }
-
-    // ── 房规（用户 2026-09-02 反孤儿条款，跟牌侧）：出牌后剩余全百搭 → 重罚 ──
-    // 与领出侧同规：百搭将沦为最后孤张（被迫单出）时，倒逼把百搭并入当前组合。
-    // 救孤候选自己剩余含天然牌 → 不触发（天然平跟触发 −800 → 救孤胜出）。
-    if play_cards.len() < my_remaining && leftover_all_wild(p, play_cards) {
-        score -= WILD_STRAND_PENALTY;
     }
 
     // ── 三带二不能带两张级牌 (JS 1089-1096) ──
@@ -2822,10 +2435,7 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
     }
 
     // ── 残局散牌处理：重奖移除单张的出牌 (JS 1638-1686) ──
-    // 报牌豁免（房规）：对手剩 ≤2 张（活跃口径）时禁止清小单奖励——
-    // 此时发单张正喂对手最后几张走人，房规"对手剩1不发单张/必须发从大牌发"
-    // 必须优先于清牌启发（实战 t_391eb7a6 act90：+700 清单奖励压过 -400 报牌阻尼）。
-    if my_remaining <= 6 && !is_bomb && p.min_opp_remaining > 2 {
+    if my_remaining <= 6 && !is_bomb {
         let mut singles_removed = 0usize;
         let mut small_singles_removed = 0usize;
         for card in play_cards {
@@ -2946,22 +2556,6 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
     if has_wildcard {
         if is_bomb || matches!(kind, CombinationKind::Bomb(BombKind::StraightFlush)) {
             score += p.params.wild_bomb_bonus; // 逢人配配炸弹/同花顺：重奖！
-            // 房规（用户 2026-09-03）：百搭同花顺拆牌质量——
-            // ① 拆完剩牌可组新杂顺 → +450 抵空出炸弹罚，另加 keep_bomb_bonus 抵
-            //    "留炸到残局"倾向（"SF 先手 + 剩顺后续"是完整两墩计划，不属浪费炸）；
-            // ② 拆完去顺后散单张≥3 → −250（拆出一手烂剩牌，不如出杂顺/百搭顺）。
-            if matches!(kind, CombinationKind::Bomb(BombKind::StraightFlush))
-                && play_cards.len() < my_remaining
-            {
-                let (lo_straights, lo_singles) =
-                    sf_leftover_straights_and_singles(p, play_cards);
-                if lo_straights > 0 {
-                    score += SF_LEFTOVER_STRAIGHT_BONUS + p.params.keep_bomb_bonus;
-                }
-                if lo_singles >= 3 {
-                    score -= SF_LEFTOVER_SINGLES_PENALTY;
-                }
-            }
         } else {
             match kind {
                 CombinationKind::Ordinary(OrdinaryKind::Straight)
@@ -3140,12 +2734,6 @@ fn score_lead(play_cards: &[String], play_combo: &Combination, p: &PlayContext) 
         && wilds_could_form_bomb_or_sf(p, play_cards)
     {
         score -= WILD_CONSERVATION_PENALTY;
-    }
-
-    // ── 房规（用户 2026-09-02 反孤儿条款，领出侧）：出牌后剩余全百搭 → 重罚 ──
-    // CF scoreLeadPlay 原有单百搭 −800 同源；统一为 all-wild 口径（双百搭余牌同样算孤）。
-    if play_cards.len() < my_remaining && leftover_all_wild(p, play_cards) {
-        score -= WILD_STRAND_PENALTY;
     }
 
     // ── 三带二不能带两张级牌 (JS 1875-1884) ──
@@ -3457,29 +3045,27 @@ mod tests {
     }
 
     #[test]
-    fn bomb_count_counts_natural_bombs_only() {
-        // 房规（用户 2026-09-06 裁决）：bomb_count 只数天然炸——天然4+同点、天然同花顺、四王。
-        // 百搭潜在炸（三同张拼炸/4连拼同花顺）不消耗天然炸储备，一律不计入。
-        // （旧"潜在按百搭封顶计入"语义已废除——潜在计入曾使守卫①与烧最后一炸禁令失效。）
+    fn bomb_count_counts_wild_potentials_by_wild_cap() {
+        // 房规（用户 2026-08-30）：潜在炸/同花顺按百搭张数封顶（1百搭最多记1个潜在，
+        // 2张最多2个）；天然炸 + 天然同花顺不占额度直接计入（同花顺要计入炸弹总数）。
         let ctx = ctx();
-        // ① 1天然炸 + 1百搭 + 无候选 → 总数 1
+        // ① 1天然炸 + 1百搭 + 无候选（无三同张/无同花4连）→ 潜在 0 → 总数 1
         let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♥2", "♠9", "♥9", "♠4", "♥4"]
             .iter().map(|s| s.to_string()).collect();
         assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 1);
-        // ② 1天然炸 + 1百搭 + 1组三同张 → 潜在不计入 → 总数 1（旧=2）
+        // ② 1天然炸 + 1百搭 + 1组三同张 → 潜在 min(1,1)=1 → 总数 2
         let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♠9", "♥9", "♦9", "♥2", "♠K"]
             .iter().map(|s| s.to_string()).collect();
-        assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 1);
-        // ③ 1天然炸(级牌K炸避免与♠6-9相连) + 1百搭 + 同花4连 → 潜在同花顺不计入 → 总数 1（旧=2）
-        //    注意：若炸为♠5555，♠5会与♠6-9连成真实天然同花顺→总数2（见⑤）
-        let hand: Vec<String> = ["♠K", "♥K", "♦K", "♣K", "♠6", "♠7", "♠8", "♠9", "♥2"]
+        assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 2);
+        // ③ 1天然炸 + 1百搭 + 同花4连（♠6-9 极大段恰4）→ 潜在同花顺 1 → 总数 2
+        let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♠6", "♠7", "♠8", "♠9", "♥2"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 2);
+        // ④ 1天然炸 + 1百搭 + 同花仅3连（♠9-11，与炸点5不相连）→ 不构成潜在同花顺 → 总数 1
+        let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♠9", "♠10", "♠J", "♥2"]
             .iter().map(|s| s.to_string()).collect();
         assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 1);
-        // ④ 1天然炸 + 1百搭 + 同花仅3连 → 总数 1
-        let hand: Vec<String> = ["♠K", "♥K", "♦K", "♣K", "♠9", "♠10", "♠J", "♥2"]
-            .iter().map(|s| s.to_string()).collect();
-        assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 1);
-        // ⑤ 天然同花顺计入总数（♠5与♠6-10天然连成同花顺）
+        // ⑤ 同花4连属天然5连一部分 → 不重复记潜在；天然同花顺计入总数
         let hand: Vec<String> = ["♠5", "♥5", "♦5", "♣5", "♠6", "♠7", "♠8", "♠9", "♠10"]
             .iter().map(|s| s.to_string()).collect();
         assert_eq!(analyze_hand_combos(&hand, ctx).bomb_count, 2); // 5555 + 天然同花顺
@@ -3734,10 +3320,7 @@ mod tests {
 
         // ① 跟牌 KKK+33（三张=级牌→允许炸；小fh跟不了）：唯一用法比较 → 百搭配炸弹 555+♥2。
         // （领出场景下 555+88 可拼天然三带二，不属"百搭使用优先级"范畴，故用跟牌设计。）
-        // 2026-09-02 场景修正：原手含天然 9999，B1 扩面（有免百搭炸可压就不烧百搭）
-        // 会正确改出 9999——为继续单测"百搭使用优先级"（炸弹>三带二），移除天然炸并改
-        // 残局（6张，避开中盘"出炸后0炸"守卫），让百搭炸弹成为唯一炸弹候选。
-        let n_hand = ["♠5", "♥5", "♦5", "♥2", "♠3", "♠Q"];
+        let n_hand = ["♠5", "♥5", "♦5", "♥2", "♠9", "♥9", "♦9", "♣9", "♠3"];
         let mut state = mk_playing_state(
             Seat::N,
             n_hand.to_vec(),
@@ -3753,8 +3336,7 @@ mod tests {
             other => panic!("expected wild bomb, got {other:?}"),
         }
 
-        // ② 2026-09-06 框架：领出侧不烧百搭——手牌存在百搭成炸潜质（55/66+♥2）且炸弹
-        //    绝对禁领出 → 百搭保留成炸，改领天然单张（旧期望"百搭顺子领出"已被取代）。
+        // ② 百搭配顺子优先于百搭配三带二（手牌无天然顺子可用，5678+♥2 唯一顺子）。
         let n_hand2 = ["♠5", "♥5", "♠6", "♥6", "♠7", "♠8", "♥2", "♠Q", "♠K"];
         let mut state = mk_playing_state(
             Seat::N,
@@ -3765,12 +3347,10 @@ mod tests {
         let act = suggest_next_action(&state, Seat::N).unwrap();
         match act {
             PlayerAction::Play { cards, .. } => {
-                assert!(
-                    !cards.contains(&"♥2".to_string()),
-                    "wild must stay for bomb potential, got {cards:?}"
-                );
+                assert_eq!(cards.len(), 5, "wild straight must be led, got {cards:?}");
+                assert!(cards.contains(&"♥2".to_string()), "straight must use wild, got {cards:?}");
             }
-            other => panic!("expected natural lead without wild, got {other:?}"),
+            other => panic!("expected wild straight lead, got {other:?}"),
         }
     }
 
@@ -3966,9 +3546,7 @@ mod tests {
             }
         };
 
-        // ① 禁止：555天然+6+♥2(凑对6)+3+4 → 三带二被禁 → 天然压不过小FH →
-        //    百搭升第1级出 555+♥2 百搭炸（2026-09-06 裁决链：wild_priority 豁免守卫⑥ +
-        //    烧最后一炸百搭豁免 S@1009；CF 端同构行为一致）。核心断言：不出 wild-pair FH。
+        // ① 禁止：555天然+6+♥2(凑对6)+3+4 → 三带二被禁 → 555+♥2的4张炸被小三带二禁炸 → 过牌。
         let mut state = mk_playing_state(
             Seat::N,
             vec!["♠5", "♥5", "♦5", "♠6", "♥2", "♠3", "♥4"],
@@ -3976,13 +3554,10 @@ mod tests {
         );
         fill(&mut state, &["♠5", "♥5", "♦5", "♠6", "♥2", "♠3", "♥4"], &e9);
         let act = suggest_next_action(&state, Seat::N).unwrap();
-        match act {
-            PlayerAction::Play { cards, .. } => {
-                assert_eq!(cards.len(), 4, "wild-pair FH banned → wild bomb 555+♥2, got {cards:?}");
-                assert!(cards.iter().any(|c| c == "♥2"), "must be the wild bomb, got {cards:?}");
-            }
-            other => panic!("expected wild-bomb play (FH still banned), got {other:?}"),
-        }
+        assert!(
+            matches!(act, PlayerAction::Pass),
+            "wild-pair FH must be banned → pass, got {act:?}"
+        );
 
         // ② 清空豁免：5张手恰好=该三带二 → 放行。
         let mut state = mk_playing_state(
@@ -4004,15 +3579,10 @@ mod tests {
             Some((Seat::E, fh_top.clone())),
         );
         fill(&mut state, &["♠5", "♥5", "♦5", "♠6", "♥2", "♠3", "♥4"], &["♠9"]);
-        // ③ 冲刺拦截：E剩1张 → 2026-09-06 阶梯：天然压不过三带二顶 → 百搭升第1级
-        //    出百搭炸（555+♥2）拦截（旧期望"百搭配对三带二放行"被阶梯取代）。
         let act = suggest_next_action(&state, Seat::N).unwrap();
         match act {
-            PlayerAction::Play { cards, .. } => {
-                assert_eq!(cards.len(), 4, "sprint ladder: wild bomb intercepts, got {cards:?}");
-                assert!(cards.contains(&"♥2".to_string()), "bomb must use wild, got {cards:?}");
-            }
-            other => panic!("sprint must allow wild-bomb intercept, got {other:?}"),
+            PlayerAction::Play { cards, .. } => assert_eq!(cards.len(), 5, "sprint exempts ban, got {cards:?}"),
+            other => panic!("sprint must allow wild-pair FH, got {other:?}"),
         }
 
         // ④ 适当惩罚（非禁止）：55+♥2拼三张+66天然对 → 唯一能压 → 照常出。
@@ -4062,10 +3632,7 @@ mod tests {
         let s9 = ["♠9", "♥9", "♦9", "♣9", "♠8", "♥8", "♦8", "♣8", "♠7"];
 
         // ① 禁止：3级牌+百搭+单张 → 级牌三带二被过滤；
-        //    次优=222+♥2 百搭炸——但天然级牌三张不计入"百搭优先成炸"资源
-        //    （hand_has_wild_bomb_or_sf 排除级牌，与 CF handHasWildBombOrSF 同规）→
-        //    wild_priority 不成立 → ①b 重算（炸后剩0炸）→ Pass 保炸。
-        //    CF 端同构 probe 实测一致（pass）。核心断言：不出级牌三带二。
+        //    次优=3级牌+百搭的4张炸 → ①炸弹保留（中盘7张、唯一炸、无冲刺）→ 过牌。
         let mut state = mk_playing_state(
             Seat::N,
             vec!["♠2", "♦2", "♣2", "♥2", "♠5", "♥4", "♠6"],
@@ -4081,7 +3648,7 @@ mod tests {
         let act = suggest_next_action(&state, Seat::N).unwrap();
         assert!(
             matches!(act, PlayerAction::Pass),
-            "level FH banned + ①b keep-bomb → pass, got {act:?}"
+            "level-triple wild FH must be banned → pass, got {act:?}"
         );
 
         // ② 清空豁免：5张手牌恰好就是级牌三带二 → 放行。
@@ -4128,9 +3695,7 @@ mod tests {
         }
 
         // ④ 房规更新（2026-09-03）：三张天然+百搭凑对子的三带二一律禁止（不分级牌与否）：
-        // wild-pair FH 仍被禁；天然压不过小FH → 百搭升第1级出 AAA+♥2 百搭炸
-        // （wild_priority 豁免①b/⑥ + 烧最后一炸百搭豁免 S@1009；
-        //   CF 端同构 probe 实测 play [♠A,♥A,♦A,♥2]）。核心断言：不出 wild-pair FH。
+        // 非级牌 A 三张同样被禁 → 555…炸被小三带二禁炸过滤 → 过牌。
         let mut state = mk_playing_state(
             Seat::N,
             vec!["♠A", "♥A", "♦A", "♥2", "♠5", "♥4", "♠6"],
@@ -4144,13 +3709,10 @@ mod tests {
         );
         fill_e(&mut state, &s9);
         let act = suggest_next_action(&state, Seat::N).unwrap();
-        match act {
-            PlayerAction::Play { cards, .. } => {
-                assert_eq!(cards.len(), 4, "wild-pair FH banned → wild bomb AAA+♥2, got {cards:?}");
-                assert!(cards.iter().any(|c| c == "♥2"), "must be the wild bomb, got {cards:?}");
-            }
-            other => panic!("expected wild-bomb play (wild-pair FH still banned), got {other:?}"),
-        }
+        assert!(
+            matches!(act, PlayerAction::Pass),
+            "non-level natural-triple wild-pair FH also banned → pass, got {act:?}"
+        );
     }
 
     #[test]
@@ -4533,134 +4095,6 @@ mod tests {
     }
 
     #[test]
-    fn wild_pair_midgame_excluded_without_natural_follow() {
-        // 房规（用户 2026-09-03 加大）：百搭配单张成对——中盘（手牌>6）无天然对可跟时
-        // 百搭对候选直接排除 → 宁可过牌也不烧百搭凑对（残局保留候选走 −100 罚）。
-        // E 持 7 张（无天然对，唯一能压对9的跟法 = ♠K+♥2 百搭对）→ 必须过牌。
-        let mut state = mk_playing_state(
-            Seat::E,
-            vec!["♥2", "♠K", "♠3", "♠7", "♠8", "♠9", "♠10"],
-            Some((Seat::N, vec!["♠9", "♥9"])),
-        );
-        fill_seats(
-            &mut state,
-            vec!["♣3", "♠4", "♥4", "♦4", "♣6", "♥6", "♦8", "♣8", "♦J"],
-            vec!["♦3", "♣7", "♥7", "♦9", "♣9", "♠J", "♥J", "♦Q", "♣Q"],
-            vec!["♠5", "♥5", "♦6", "♠8", "♥10", "♦10", "♣10", "♥Q", "♦K"],
-        );
-        let picked = suggest_next_action(&state, Seat::E).unwrap();
-        assert!(
-            matches!(picked, PlayerAction::Pass),
-            "中盘百搭配单张成对必须被排除（过牌不烧百搭），got {:?}",
-            picked
-        );
-    }
-
-    #[test]
-    fn wild_sf_lead_banned_by_absolute_rule_plain_run_leads() {
-        // 2026-09-06 领出绝对禁令：炸弹/同花顺（含百搭SF）非清空一律不领出 →
-        // 改领天然杂顺（旧期望"SF领出拆牌质量奖励胜出"被绝对禁令取代）。
-        // 手 [♥2,♠4,♠5,♠6,♠7,♦8,♦9,♦10,♦J,♦Q]：SF=♠4-7+♥2，天然杂顺 ♦8-Q / ♠4-7+♦8。
-        let mut state = mk_playing_state(
-            Seat::E,
-            vec!["♥2", "♠4", "♠5", "♠6", "♠7", "♦8", "♦9", "♦10", "♦J", "♦Q"],
-            None,
-        );
-        fill_seats(
-            &mut state,
-            vec!["♣3", "♠7", "♥7", "♦7", "♣7", "♠9", "♥9", "♦9", "♣9"],
-            vec!["♦3", "♣3", "♠6", "♥6", "♦6", "♣6", "♠8", "♥8", "♦8"],
-            vec!["♠A", "♥A", "♦A", "♣3", "♣5", "♣10"],
-        );
-        let picked = suggest_next_action(&state, Seat::E).unwrap();
-        match &picked {
-            PlayerAction::Play { cards, wild_targets } => {
-                let combo = CombinationParser::parse(cards, wild_targets.as_deref(), ctx())
-                    .expect("candidate must parse");
-                assert!(
-                    !(matches!(combo.class(), CombinationClass::Bomb)
-                        && cards.contains(&"♥2".to_string())),
-                    "领出绝对禁令：百搭SF不得领出（非清空），got {:?}",
-                    picked
-                );
-                assert!(
-                    !cards.contains(&"♥2".to_string()),
-                    "领出侧不烧百搭：领出候选不应含百搭，got {:?}",
-                    picked
-                );
-            }
-            other => panic!("Expected Play (natural lead), got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn wild_sf_with_many_single_leftover_avoided() {
-        // 房规（用户 2026-09-03）：百搭同花顺拆牌质量②——拆完去顺后散单张 ≥3 →
-        // −250 惩罚。手 [♥2,♠4-7,♠K,♥K,♦K,♣K,♦3,♣9,♠J] 领出：SF 拆完剩
-        // KKKK+♦3+♣9+♠J（3 散单）→ 不得领出该 SF（KKKK/小牌保留炸弹等更优）。
-        let mut state = mk_playing_state(
-            Seat::E,
-            vec!["♥2", "♠4", "♠5", "♠6", "♠7", "♠K", "♥K", "♦K", "♣K", "♦3", "♣9", "♠J"],
-            None,
-        );
-        fill_seats(
-            &mut state,
-            vec!["♣3", "♠7", "♥7", "♦7", "♣7", "♠9", "♥9", "♦9", "♣9"],
-            vec!["♦3", "♣3", "♠6", "♥6", "♦6", "♣6", "♠8", "♥8", "♦8"],
-            vec!["♠A", "♥A", "♦A", "♣5", "♣10", "♠2", "♥3", "♦4", "♣8"],
-        );
-        let picked = suggest_next_action(&state, Seat::E).unwrap();
-        match &picked {
-            PlayerAction::Play { cards, wild_targets } => {
-                let combo = CombinationParser::parse(cards, wild_targets.as_deref(), ctx())
-                    .expect("candidate must parse");
-                let is_wild_sf = cards.len() == 5
-                    && cards.contains(&"♥2".to_string())
-                    && cards.contains(&"♠4".to_string())
-                    && cards.contains(&"♠7".to_string())
-                    && matches!(combo.class(), CombinationClass::Bomb);
-                assert!(
-                    !is_wild_sf,
-                    "SF 拆完散单≥3 必须被惩罚回避（不得领出该百搭同花顺），got {:?}",
-                    picked
-                );
-            }
-            other => panic!("Expected Play action, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn wild_pair_rescues_strand_when_natural_follow_exists() {
-        // 反孤儿条款（2026-09-02，用户实战报告"百搭最后出的"）：跟牌场景天然平跟
-        // 会把百搭打成最后孤张时，救孤候选必须能突破"能跟就不烧"的排除。
-        // E 持 [♠K,♥K,♥2]（残局3张）跟 N 的对9：出 KK → 剩 [♥2] 孤张（WILD_STRAND_PENALTY
-        // −800）；出 K+♥2 对 → 剩 [♠K] 非孤。修复前"能跟就不烧"直接排除 K+♥2 → 百搭
-        // 一路 defer 到最后孤张单出。修复后救孤候选参与计分并胜出。
-        let mut state = mk_playing_state(
-            Seat::E,
-            vec!["♠K", "♥K", "♥2"],
-            Some((Seat::N, vec!["♠9", "♥9"])),
-        );
-        fill_seats(
-            &mut state,
-            vec!["♦9", "♣9", "♣4", "♥4", "♦4", "♠4", "♣6", "♥6", "♦6"],
-            vec!["♣6", "♠10", "♥10", "♦10", "♣10", "♠3", "♥3", "♦3", "♣3"],
-            vec!["♠Q", "♥Q", "♦Q", "♣Q", "♠J", "♥J", "♦J", "♣J", "♠8"],
-        );
-        let picked = suggest_next_action(&state, Seat::E).unwrap();
-        match &picked {
-            PlayerAction::Play { cards, .. } => {
-                assert!(
-                    cards.len() == 2 && cards.contains(&"♥2".to_string()),
-                    "天然平跟会留百搭孤张时必须带百搭出对救孤（反孤儿条款），got {:?}",
-                    picked
-                );
-            }
-            other => panic!("Expected Play (K+百搭对子救孤), got {:?}", other),
-        }
-    }
-
-    #[test]
     fn endgame_wild_converts_to_straight_or_straight_flush() {
         // [♠5,♠6,♠7,♠8,♠9,♥2(级2百搭)] 残局（6张）领出：JS 百搭并入杂顺
         //（+30 且 +400/张 移除单张奖励）远胜同花顺（空出炸弹 −450）。
@@ -4970,62 +4404,6 @@ mod tests {
         match picked {
             PlayerAction::Play { cards, .. } => {
                 assert_eq!(cards.len(), 2, "对手剩1张时不得领单张, picked={cards:?}");
-            }
-            other => panic!("应领出, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn opp_last_card_active_opponent_min() {
-        // 回归（实战 t_391eb7a6 act90，2026-09-05）：对手 S 剩 1 张 + N 已走完（0 张）。
-        // 旧口径 min_opp_remaining=min(1,0)=0 → "对手剩1不发单张"失效 → 领最小单张被
-        // 对手最后一张接走。活跃对手口径下 min=1 → 规则必须生效：
-        // ① 有对子可领 → 领对子（对手剩1接不走对子）；
-        // ② 只剩单张 → 从大牌发（ primary 越大罚越轻）。
-        // 场景：W 领出；S 对手剩 1（♦Q）、N 对手已走完（0 张）、E 队友剩 5。
-
-        // ① 手牌 = 对8 + 两散单 → 不得领最小单张 ♦3，应领对 8
-        let mut st = mk_playing_state(Seat::W, vec!["♦3", "♠8", "♥8", "♣K"], None);
-        fill_seats(
-            &mut st,
-            vec![], // N 对手已走完（0 张）
-            vec!["♦Q"], // S 对手剩 1 张
-            vec!["♦3", "♠8", "♥8", "♣K"],
-        );
-        if let Some(hand) = st.hand.as_mut() {
-            hand.hands.insert(Seat::E, vec!["♠4", "♥4", "♦6", "♣6", "♠7"].into_iter().map(ToString::to_string).collect());
-        }
-        let picked = suggest_next_action(&st, Seat::W).unwrap();
-        match picked {
-            PlayerAction::Play { cards, .. } => {
-                assert!(
-                    !(cards.len() == 1 && cards[0] == "♦3"),
-                    "对手剩1张不得领最小单张, picked={cards:?}"
-                );
-                assert_eq!(cards.len(), 2, "应领对 8 压制, picked={cards:?}");
-            }
-            other => panic!("应领出, got {other:?}"),
-        }
-
-        // ② 手牌全散单 → 必须发单张时从大牌发（♥A，而非 ♦3）
-        let mut st2 = mk_playing_state(Seat::W, vec!["♦3", "♠7", "♣J", "♥A"], None);
-        fill_seats(
-            &mut st2,
-            vec![],
-            vec!["♦Q"],
-            vec!["♦3", "♠7", "♣J", "♥A"],
-        );
-        if let Some(hand) = st2.hand.as_mut() {
-            hand.hands.insert(Seat::E, vec!["♠4", "♥4", "♦6", "♣6", "♠7"].into_iter().map(ToString::to_string).collect());
-        }
-        let picked2 = suggest_next_action(&st2, Seat::W).unwrap();
-        match picked2 {
-            PlayerAction::Play { cards, .. } => {
-                assert_eq!(cards.len(), 1, "全散单只能领单张, picked={cards:?}");
-                assert!(
-                    cards[0] == "♥A",
-                    "必须发单张时要从大牌发, picked={cards:?}"
-                );
             }
             other => panic!("应领出, got {other:?}"),
         }
@@ -5364,12 +4742,6 @@ mod tests {
             vec!["♠10", "♥10", "♦10", "♣10", "♠J", "♥J", "♦J", "♣J", "♠Q"],
             vec!["♣Q", "♥Q", "♦Q", "♠K", "♣K", "♦K", "♠A", "♥A", "♦A"],
         );
-        // 让牌门（2026-09-06）：本用例专测守卫①边界（3颗炸中盘可炸）→
-        // 队友(W)补一条已表态 pass，解除让牌门。
-        if let Some(hand) = state.hand.as_mut() {
-            hand.history.push(history_entry(Seat::N, vec!["♠K", "♥K", "♦K", "♠9", "♦9"]));
-            hand.history.push(history_pass(Seat::W));
-        }
         let picked = suggest_next_action(&state, Seat::E).unwrap();
         match &picked {
             PlayerAction::Play { cards, .. } => {
@@ -5406,130 +4778,9 @@ mod tests {
         );
     }
 
-    // ══ 房规（2026-09-06 让牌门·B 裁决）测试 ══
-    // 对手领普通牌型 + 我无天然同型可跟 + 我有天然炸 + 队友未表态 → 让牌（过）；
-    // 队友表态/记忆解除 → 可炸；豁免=清空/冲刺/残局；百搭炸不受让。
-
-    fn yield_gate_state(actor_hand: Vec<&str>) -> TableGameState {
-        // actor=N，顶牌=W 领杂顺 ♦3♣4♠5♥6♦7（普通牌型），S/W/E 各 7 张（不冲刺）
-        let mut state = mk_playing_state(
-            Seat::N,
-            actor_hand,
-            Some((Seat::W, vec!["♦3", "♣4", "♠5", "♥6", "♦7"])),
-        );
-        if let Some(hand) = state.hand.as_mut() {
-            hand.hands.insert(Seat::S, vec!["♣8", "♥8", "♦8", "♣9", "♥9", "♦9", "♣10"].into_iter().map(ToString::to_string).collect());
-            hand.hands.insert(Seat::W, vec!["♠J", "♥J", "♦J", "♣Q", "♥Q", "♦Q", "♠K"].into_iter().map(ToString::to_string).collect());
-            hand.hands.insert(Seat::E, vec!["♣6", "♥6", "♦6", "♣7", "♥7", "♦7", "♠10"].into_iter().map(ToString::to_string).collect());
-        }
-        state
-    }
-
     #[test]
-    fn yield_gate_waits_for_teammate() {
-        // 双天然炸、无天然顺可跟、队友(S)未表态 → 让牌过
-        let mut state = yield_gate_state(vec!["♠3", "♥3", "♦3", "♣3", "♠4", "♥4", "♦4", "♣4", "♠9"]);
-        if let Some(hand) = state.hand.as_mut() {
-            // 时序（真实引擎不变量）：history 末尾 Play = 当前顶牌
-            hand.history.push(history_entry(Seat::W, vec!["♦3", "♣4", "♠5", "♥6", "♦7"]));
-        }
-        let picked = suggest_next_action(&state, Seat::N).unwrap();
-        assert_eq!(picked, PlayerAction::Pass, "队友未表态，天然炸先让（过牌），got {:?}", picked);
-    }
-
-    #[test]
-    fn yield_gate_released_when_teammate_passed() {
-        // 队友(S)本墩已 pass（已表态吃不了）→ 出炸夺发牌权
-        let mut state = yield_gate_state(vec!["♠3", "♥3", "♦3", "♣3", "♠4", "♥4", "♦4", "♣4", "♠9"]);
-        if let Some(hand) = state.hand.as_mut() {
-            hand.history.push(history_entry(Seat::W, vec!["♦3", "♣4", "♠5", "♥6", "♦7"]));
-            hand.history.push(history_pass(Seat::S));
-        }
-        let picked = suggest_next_action(&state, Seat::N).unwrap();
-        match picked {
-            PlayerAction::Play { cards, .. } => {
-                assert_eq!(cards.len(), 4, "队友已表态 → 出天然炸，got {cards:?}");
-            }
-            other => panic!("队友已表态应出炸，got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn yield_gate_memory_release_same_type_relead() {
-        // 上一墩：W 领同型杂顺、S/N/E 全过（队友吃过让牌机会）；本轮 W 再领同型
-        // → 不再让，直接炸
-        let mut state = yield_gate_state(vec!["♠3", "♥3", "♦3", "♣3", "♠4", "♥4", "♦4", "♣4", "♠9"]);
-        if let Some(hand) = state.hand.as_mut() {
-            hand.history.push(history_entry(Seat::W, vec!["♦3", "♣4", "♠5", "♥6", "♦7"]));
-            hand.history.push(history_pass(Seat::S));
-            hand.history.push(history_pass(Seat::N));
-            hand.history.push(history_pass(Seat::E));
-            hand.history.push(history_entry(Seat::W, vec!["♦3", "♣4", "♠5", "♥6", "♦7"]));
-        }
-        let picked = suggest_next_action(&state, Seat::N).unwrap();
-        match picked {
-            PlayerAction::Play { cards, .. } => {
-                assert_eq!(cards.len(), 4, "记忆解除：队友上墩已让过 → 出炸，got {cards:?}");
-            }
-            other => panic!("记忆解除应出炸，got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn yield_gate_no_release_when_type_differs() {
-        // 上一墩 W 领的是对子（不同型），本轮才领杂顺 → 无记忆解除 → 照旧让（过）
-        let mut state = yield_gate_state(vec!["♠3", "♥3", "♦3", "♣3", "♠4", "♥4", "♦4", "♣4", "♠9"]);
-        if let Some(hand) = state.hand.as_mut() {
-            hand.history.push(history_entry(Seat::W, vec!["♠5", "♥5"]));
-            hand.history.push(history_pass(Seat::S));
-            hand.history.push(history_pass(Seat::N));
-            hand.history.push(history_pass(Seat::E));
-            hand.history.push(history_entry(Seat::W, vec!["♦3", "♣4", "♠5", "♥6", "♦7"]));
-        }
-        let picked = suggest_next_action(&state, Seat::N).unwrap();
-        assert_eq!(picked, PlayerAction::Pass, "非接着再发同型 → 照旧让牌，got {:?}", picked);
-    }
-
-    #[test]
-    fn yield_gate_wild_bomb_not_subject() {
-        // B 裁决：含百搭的炸不受让——无天然炸、555+♥2 百搭炸照常出
-        let mut state = yield_gate_state(vec!["♠5", "♥5", "♦5", "♥2", "♠9", "♠J", "♦K"]);
-        if let Some(hand) = state.hand.as_mut() {
-            hand.history.push(history_entry(Seat::W, vec!["♦3", "♣4", "♠5", "♥6", "♦7"]));
-        }
-        let picked = suggest_next_action(&state, Seat::N).unwrap();
-        match picked {
-            PlayerAction::Play { cards, .. } => {
-                assert!(
-                    cards.len() == 4 && cards.iter().any(|c| c == "♥2"),
-                    "百搭炸不受让 → 出 555+♥2，got {cards:?}"
-                );
-            }
-            other => panic!("百搭炸不受让应出炸，got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn yield_gate_endgame_exempt() {
-        // 残局（≤6张）豁免让牌 → 出炸
-        let mut state = yield_gate_state(vec!["♠3", "♥3", "♦3", "♣3", "♠9", "♥K"]);
-        if let Some(hand) = state.hand.as_mut() {
-            hand.history.push(history_entry(Seat::W, vec!["♦3", "♣4", "♠5", "♥6", "♦7"]));
-        }
-        let picked = suggest_next_action(&state, Seat::N).unwrap();
-        match picked {
-            PlayerAction::Play { cards, .. } => {
-                assert_eq!(cards.len(), 4, "残局豁免 → 出炸，got {cards:?}");
-            }
-            other => panic!("残局豁免应出炸，got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn two_bombs_counter_blocked_when_only_one_natural_bomb() {
-        // 2026-09-06 天然口径对照：手 [♠5,♥5,♦5,♣5,♠6,♥6,♦6,♥2] 的账面"两颗炸"
-        // 中只有 5555 是天然炸——666+♥2 是潜在炸不独立计数 → 反炸后天然炸=0 →
-        // 守卫①（唯一炸保留）触发 → 中盘 Pass 保炸（与 seq20 裁决同语义）。
+    fn two_bombs_counter_allowed_when_post_play_bombs_remain() {
+        // 用户房规对照：两颗独立炸（天然 5555 + 百搭拼 666）中盘反炸 4 炸后仍剩 1 颗 → 允许出。
         let mut state = mk_playing_state(
             Seat::E,
             vec!["♠5", "♥5", "♦5", "♣5", "♠6", "♥6", "♦6", "♥2"],
@@ -5542,11 +4793,10 @@ mod tests {
             vec!["♣Q", "♥Q", "♦Q", "♠K", "♣K", "♦K", "♠A", "♥A", "♦A"],
         );
         let picked = suggest_next_action(&state, Seat::E).unwrap();
-        assert_eq!(
-            picked,
-            PlayerAction::Pass,
-            "5555=唯一天然炸，中盘反炸后天然炸=0 → Pass 保炸"
-        );
+        match &picked {
+            PlayerAction::Play { .. } => {}
+            other => panic!("两颗独立炸中盘反炸（打完剩 1 颗）应允许，got {:?}", other),
+        }
     }
 
     #[test]
@@ -5573,43 +4823,6 @@ mod tests {
             "12 以下的三带二中盘不许用炸（房规 A），got {:?}",
             picked
         );
-    }
-
-    #[test]
-    fn wildfree_bomb_beats_ordinary_top_without_burning_wild() {
-        // 房规 B1 扩面（2026-09-02）：任意顶牌——有免百搭炸可压就不烧百搭。
-        // 实战案例（CF 局）：敌领 777，我持 8888+♥2 → 出了 8888+♥2 五炸
-        // （wild_bomb_bonus +100 曾使含百搭炸反超天然炸），必须选天然 8888。
-        // 场景设为残局（6张）：房规A（三张<Q中盘禁炸）在残局豁免，从而精确
-        // 隔离 B1 扩面语义；打完剩 2 张 ≤2 也不触发残局留炸禁令。
-        let mut state = mk_playing_state(
-            Seat::E,
-            vec!["♠8", "♥8", "♦8", "♣8", "♠5", "♥2"],
-            Some((Seat::N, vec!["♠7", "♥7", "♦7"])),
-        );
-        fill_seats(
-            &mut state,
-            vec!["♣4", "♥4", "♦4", "♠4", "♣6", "♥6", "♦6", "♣6", "♠3"],
-            vec!["♥7", "♦7", "♣7", "♠10", "♥10", "♦10", "♣10", "♠3", "♥3"],
-            vec!["♦3", "♣3", "♠J", "♥J", "♦J", "♣J", "♠Q", "♥Q", "♦Q"],
-        );
-        let picked = suggest_next_action(&state, Seat::E).unwrap();
-        match &picked {
-            PlayerAction::Play { cards, .. } => {
-                assert_eq!(
-                    cards.len(),
-                    4,
-                    "必须出 4 张天然炸 8888，got {:?}",
-                    picked
-                );
-                assert!(
-                    !cards.contains(&"♥2".to_string()),
-                    "有免百搭炸可压 777 时不得烧百搭升档（房规B1扩面），got {:?}",
-                    picked
-                );
-            }
-            other => panic!("Expected Play (wild-free bomb), got {:?}", other),
-        }
     }
 
     #[test]
@@ -5716,11 +4929,9 @@ mod tests {
     }
 
     #[test]
-    fn endgame_prefers_natural_bomb_over_wild_upgrade() {
-        // 语义更新（2026-09-02，用户实战裁决"为什么加百搭"）：旧版"+100 百搭奖励压过
-        // −10 升档轻罚 → 残局宁烧百搭升档 5 炸"已被房规 B1 扩面统一取代——
-        // 有免百搭炸可压（任意顶牌/任意阶段）就不烧百搭，唯一豁免=清空。
-        // 残局顶 999 三张，持 5555+♥2+♠K → 必须天然 5555，百搭留给 ♠K 组合/后续。
+    fn endgame_upgraded_wild_bomb_beats_natural_bomb() {
+        // JS 语义：残局 +100 百搭进炸弹奖励压过 −10 升档轻罚 → 5555+百搭(5炸)
+        // 胜过纯天然 5555（对手三张顶、无更优替牌）。
         let mut state = mk_playing_state(
             Seat::E,
             vec!["♠5", "♥5", "♦5", "♣5", "♥2", "♠K"],
@@ -5735,14 +4946,18 @@ mod tests {
         let picked = suggest_next_action(&state, Seat::E).unwrap();
         match &picked {
             PlayerAction::Play { cards, wild_targets } => {
+                let combo = CombinationParser::parse(cards, wild_targets.as_deref(), ctx())
+                    .expect("candidate must parse");
+                let uses_wild = wild_targets.as_deref().map_or(false, |t| !t.is_empty());
                 assert!(
-                    cards.len() == 4 && !cards.contains(&"♥2".to_string()),
-                    "有天然5555可压999时不得烧百搭升档5炸（房规B1扩面），got {:?}",
+                    matches!(combo.class(), CombinationClass::Bomb)
+                        && cards.len() == 5
+                        && uses_wild,
+                    "endgame must prefer the upgraded wild bomb (wild bonus +100 vs −10), got {:?}",
                     picked
                 );
-                let _ = wild_targets;
             }
-            other => panic!("Expected Play (natural 5555), got {:?}", other),
+            other => panic!("Expected Play (upgraded wild bomb), got {:?}", other),
         }
     }
 
