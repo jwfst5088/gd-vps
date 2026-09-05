@@ -859,6 +859,9 @@ struct PlayContext {
     enemy_sprinting: bool,
     /// 活跃对手（剩 >0 张）的剩余张数（供带阈值参数的冲刺判定用）
     enemy_rem_active: Vec<usize>,
+    /// 房规（用户 2026-09-05）：任一活跃对手恰好剩 4 张——对手可能是一手整炸，
+    /// 我方不得用炸弹压牌（防对手 4 张炸回清空走人）。
+    opp_has_four: bool,
     /// 房规（用户 2026-09-03 修订）：当前顶牌是对手领出的 K 以下（level_order <12）
     /// 单张且我方无人接住（顶牌是对手的 = 我方没接管）→ ≥1 轮即解锁拆对跟单张。
     /// 其他牌型（三张/顺子/炸弹等）不计入、不触发。
@@ -918,6 +921,7 @@ fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayCo
     // 房规（用户 2026-08-30，同步 CF）：冲刺判定只看"活跃"对手——剩 0 张（已走完）不计入。
     let enemy_rem_active: Vec<usize> = opp_counts.iter().copied().filter(|&c| c > 0).collect();
     let enemy_sprinting = enemy_rem_active.iter().any(|&c| c <= 6);
+    let opp_has_four = enemy_rem_active.iter().any(|&c| c == 4);
 
     // 房规（用户 2026-09-03 修订）：当前顶牌是对手领出的 K 以下（level_order <12）
     // 单张/对子且我方无人接住（顶牌是对手的 = 我方没接管）→ ≥1 轮即触发解锁。
@@ -1043,6 +1047,7 @@ fn build_play_context(hand: &HandState, actor: Seat, ctx: RuleContext) -> PlayCo
         min_opp_remaining,
         enemy_sprinting,
         enemy_rem_active,
+        opp_has_four,
         unlock_single_follow_split,
         unlock_pair_follow_split,
         is_endgame,
@@ -1797,6 +1802,16 @@ fn find_best_play_follow<'a>(
         if has_wildfree_bomb
             && cand.combo.class() == CombinationClass::Bomb
             && cand_has_wild(cand)
+            && cand.cards.len() < my_remaining
+        {
+            continue;
+        }
+        // 房规（用户 2026-09-05）：对手剩 4 张（任一活跃对手，活跃口径）→ 不用炸弹压牌
+        // ——对手很可能是一手 4 张整炸，我方炸压正好被他压回清空走人。
+        // ④/⑤ 守卫只管单张/对子顶牌，本条管三张/三带二/顺子类顶牌。
+        // 豁免：打出即清空手牌（走人优先）。排除后无候选自然过牌；普通能跟则普通跟。
+        if p.opp_has_four
+            && cand.combo.class() == CombinationClass::Bomb
             && cand.cards.len() < my_remaining
         {
             continue;
@@ -5028,6 +5043,89 @@ mod tests {
                 );
             }
             other => panic!("应领出, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opp_four_cards_no_bomb_follow() {
+        // 房规（用户 2026-09-05）：任一活跃对手剩 4 张 → 不用炸弹压牌
+        // （防对手 4 张整炸压回清空走人）。④/⑤ 守卫只管单张/对子顶牌，
+        // 本条管三张/三带二/顺子类顶牌。豁免：清空手牌。
+        let top555 = || Some((Seat::N, vec!["♦5", "♣5", "♥5"]));
+
+        // ① 唯一候选=炸 4444 + 对手 N 剩 4 → 排除 → Pass
+        let mut st = mk_playing_state(
+            Seat::E,
+            vec!["♦4", "♠4", "♥4", "♣4", "♠8"],
+            top555(),
+        );
+        fill_seats(
+            &mut st,
+            vec!["♠6", "♥6", "♦6", "♣6"], // N 对手剩 4
+            vec!["♠9", "♥9", "♦9", "♣9", "♠10", "♥10", "♦10", "♣10", "♠J"],
+            vec!["♦J", "♣J", "♦Q", "♣Q", "♦K", "♣K", "♦A", "♣A", "♠2"],
+        );
+        let picked = suggest_next_action(&st, Seat::E).unwrap();
+        match picked {
+            PlayerAction::Pass => {}
+            other => panic!("对手剩4张不得用炸压(唯一候选炸→过), got {other:?}"),
+        }
+
+        // ② 有普通三张 888 可跟 → 出 888 不出炸
+        let mut st2 = mk_playing_state(
+            Seat::E,
+            vec!["♦4", "♠4", "♥4", "♣4", "♦8", "♥8", "♦8"],
+            top555(),
+        );
+        fill_seats(
+            &mut st2,
+            vec!["♠6", "♥6", "♦6", "♣6"],
+            vec!["♠9", "♥9", "♦9", "♣9", "♠10", "♥10", "♦10", "♣10", "♠J"],
+            vec!["♦J", "♣J", "♦Q", "♣Q", "♦K", "♣K", "♦A", "♣A", "♠2"],
+        );
+        let picked2 = suggest_next_action(&st2, Seat::E).unwrap();
+        match picked2 {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 3, "应普通三张跟, picked={cards:?}");
+                assert!(!cards.contains(&"♦4".to_string()), "不得出炸, picked={cards:?}");
+            }
+            other => panic!("应出普通三张, got {other:?}"),
+        }
+
+        // ③ 对照：对手剩 5 → 炸不受限（唯一候选=炸 → 出炸）
+        let mut st3 = mk_playing_state(
+            Seat::E,
+            vec!["♦4", "♠4", "♥4", "♣4", "♠8"],
+            top555(),
+        );
+        fill_seats(
+            &mut st3,
+            vec!["♠6", "♥6", "♦6", "♣6", "♠7"], // N 对手剩 5
+            vec!["♠9", "♥9", "♦9", "♣9", "♠10", "♥10", "♦10", "♣10", "♠J"],
+            vec!["♦J", "♣J", "♦Q", "♣Q", "♦K", "♣K", "♦A", "♣A", "♠2"],
+        );
+        let picked3 = suggest_next_action(&st3, Seat::E).unwrap();
+        match picked3 {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 4, "对手剩5炸不受限, picked={cards:?}");
+            }
+            other => panic!("对手剩5应可炸压, got {other:?}"),
+        }
+
+        // ④ 清空豁免：手牌=炸本身（4张）→ 打出即清空 → 允许出炸走人
+        let mut st4 = mk_playing_state(Seat::E, vec!["♦4", "♠4", "♥4", "♣4"], top555());
+        fill_seats(
+            &mut st4,
+            vec!["♠6", "♥6", "♦6", "♣6"],
+            vec!["♠9", "♥9", "♦9", "♣9", "♠10", "♥10", "♦10", "♣10", "♠J"],
+            vec!["♦J", "♣J", "♦Q", "♣Q", "♦K", "♣K", "♦A", "♣A", "♠2"],
+        );
+        let picked4 = suggest_next_action(&st4, Seat::E).unwrap();
+        match picked4 {
+            PlayerAction::Play { cards, .. } => {
+                assert_eq!(cards.len(), 4, "清空豁免应出炸走人, picked={cards:?}");
+            }
+            other => panic!("清空手牌应豁免出炸, got {other:?}"),
         }
     }
 
